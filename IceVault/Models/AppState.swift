@@ -141,12 +141,16 @@ final class AppState: ObservableObject {
     @Published private(set) var hasAvailableCredentials: Bool
     @Published private(set) var credentialSource: CredentialSource?
     @Published var authenticationPromptMessage: String?
+    @Published private(set) var ssoSessionStatus: SSOTokenStatus?
+    @Published private(set) var ssoSessionExpiresAt: Date?
 
     private let userDefaults: UserDefaults
     private let backupEngine: BackupEngine
     private let keychainService: KeychainService
     private let launchAgent: LaunchAgent
+    let ssoTokenMonitor: SSOTokenMonitor
     private var currentJobObserver: AnyCancellable?
+    private var ssoTokenMonitorObserver: AnyCancellable?
     private var backupTask: Task<Void, Never>?
 
     private static let settingsKey = "IceVault.settings"
@@ -157,18 +161,24 @@ final class AppState: ObservableObject {
         userDefaults: UserDefaults = .standard,
         backupEngine: BackupEngine = BackupEngine(),
         keychainService: KeychainService = KeychainService(),
-        launchAgent: LaunchAgent = LaunchAgent()
+        launchAgent: LaunchAgent = LaunchAgent(),
+        ssoTokenMonitor: SSOTokenMonitor? = nil
     ) {
         self.userDefaults = userDefaults
         self.backupEngine = backupEngine
         self.keychainService = keychainService
         self.launchAgent = launchAgent
+        self.ssoTokenMonitor = ssoTokenMonitor ?? SSOTokenMonitor(userDefaults: userDefaults)
         self.settings = Self.loadSettings(from: userDefaults, key: Self.settingsKey)
         self.history = Self.loadHistory(from: userDefaults, key: Self.historyKey)
         self.hasAvailableCredentials = false
         self.credentialSource = nil
         self.authenticationPromptMessage = nil
+        self.ssoSessionStatus = nil
+        self.ssoSessionExpiresAt = nil
 
+        bindSSOTokenMonitor()
+        configureSSOTokenMonitor()
         refreshCredentialState()
         saveSettings()
     }
@@ -215,6 +225,64 @@ final class AppState: ObservableObject {
             && !Self.trimmed(settings.sourcePath).isEmpty
     }
 
+    var usesSSOAuthentication: Bool {
+        settings.authenticationMethod == .ssoProfile
+    }
+
+    var isSSOSessionExpired: Bool {
+        if case .expired = ssoSessionStatus {
+            return true
+        }
+        return false
+    }
+
+    var isBackupBlockedBySSOExpiry: Bool {
+        usesSSOAuthentication && !ssoTokenMonitor.isSessionValid()
+    }
+
+    var ssoSessionStatusText: String? {
+        guard usesSSOAuthentication else {
+            return nil
+        }
+
+        switch ssoSessionStatus {
+        case .valid(let expiresAt):
+            return "Session valid (expires \(expiresAt.formatted(date: .abbreviated, time: .omitted)))"
+        case .expired:
+            return "Session expired ⚠️"
+        case .some(.missingToken):
+            return "Session missing - refresh login"
+        case .some(.missingProfile):
+            return "Session unavailable - check SSO profile"
+        case .none:
+            return "Session status unavailable"
+        }
+    }
+
+    var backupBlockedReason: String? {
+        guard usesSSOAuthentication, isBackupBlockedBySSOExpiry else {
+            return nil
+        }
+
+        let profileName = Self.trimmed(settings.ssoProfileName)
+        let resolvedProfileName = profileName.isEmpty ? "<name>" : profileName
+
+        switch ssoSessionStatus {
+        case .some(.missingProfile):
+            return "Backup paused: SSO profile '\(resolvedProfileName)' is missing from ~/.aws/config."
+        case .some(.missingToken):
+            return "Backup paused: run `aws sso login --profile \(resolvedProfileName)`."
+        case .some(.expired(let expiresAt)):
+            return "Backup paused: SSO session expired at \(expiresAt.formatted(date: .abbreviated, time: .shortened))."
+        case .valid, .none:
+            return "Backup paused: SSO login is required."
+        }
+    }
+
+    var canRefreshSSOLogin: Bool {
+        usesSSOAuthentication && !Self.trimmed(settings.ssoProfileName).isEmpty
+    }
+
     func updateSettings(_ newSettings: Settings) {
         var sanitized = newSettings
         sanitized.awsAccessKey = ""
@@ -226,6 +294,7 @@ final class AppState: ObservableObject {
         sanitized.sourcePath = Self.trimmed(sanitized.sourcePath)
         sanitized.customIntervalHours = min(max(sanitized.customIntervalHours, 1), 168)
         settings = sanitized
+        configureSSOTokenMonitor()
         refreshCredentialState()
     }
 
@@ -264,16 +333,31 @@ final class AppState: ObservableObject {
     }
 
     func ssoTokenStatus() -> SSOTokenStatus? {
-        guard settings.authenticationMethod == .ssoProfile else {
+        guard usesSSOAuthentication else {
             return nil
         }
 
-        let profileName = Self.trimmed(settings.ssoProfileName)
-        guard !profileName.isEmpty else {
-            return .missingProfile
-        }
+        ssoTokenMonitor.refreshNow()
+        return ssoSessionStatus
+    }
 
-        return GlacierClient.ssoTokenStatus(profileName: profileName)
+    func requestNotificationPermissionIfNeeded() {
+        ssoTokenMonitor.requestNotificationPermissionIfNeeded()
+    }
+
+    func refreshSSOSessionStatus() {
+        guard usesSSOAuthentication else {
+            return
+        }
+        ssoTokenMonitor.refreshNow()
+    }
+
+    func refreshSSOLogin() {
+        guard canRefreshSSOLogin else {
+            return
+        }
+        authenticationPromptMessage = nil
+        ssoTokenMonitor.refreshLogin()
     }
 
     func dismissAuthenticationPrompt() {
@@ -325,6 +409,8 @@ final class AppState: ObservableObject {
             return
         }
 
+        refreshSSOSessionStatus()
+
         authenticationPromptMessage = nil
         if let ssoPromptMessage = ssoReauthenticationPromptIfNeeded() {
             authenticationPromptMessage = ssoPromptMessage
@@ -358,6 +444,23 @@ final class AppState: ObservableObject {
         currentJobObserver = currentJob?.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
+    }
+
+    private func bindSSOTokenMonitor() {
+        ssoTokenMonitorObserver = ssoTokenMonitor.$status
+            .combineLatest(ssoTokenMonitor.$sessionExpiry)
+            .sink { [weak self] status, expiry in
+                guard let self else {
+                    return
+                }
+
+                self.ssoSessionStatus = status
+                self.ssoSessionExpiresAt = expiry
+
+                if self.settings.authenticationMethod == .ssoProfile {
+                    self.refreshCredentialState()
+                }
+            }
     }
 
     private func executeBackup(job: BackupJob) async {
@@ -399,7 +502,7 @@ final class AppState: ObservableObject {
     }
 
     private func ssoReauthenticationPromptIfNeeded() -> String? {
-        guard settings.authenticationMethod == .ssoProfile else {
+        guard usesSSOAuthentication else {
             return nil
         }
 
@@ -408,13 +511,14 @@ final class AppState: ObservableObject {
             return "SSO profile name is required. Set a profile and run `aws sso login --profile <name>`."
         }
 
-        switch GlacierClient.ssoTokenStatus(profileName: profileName) {
+        let tokenStatus: SSOTokenStatus = ssoSessionStatus ?? GlacierClient.ssoTokenStatus(profileName: profileName)
+        switch tokenStatus {
         case .missingProfile:
             return "SSO profile '\(profileName)' was not found in ~/.aws/config. Run `aws configure sso --profile \(profileName)`."
         case .missingToken:
             return "SSO login is required for profile '\(profileName)'. Run `aws sso login --profile \(profileName)`."
         case .expired(let expiresAt):
-            let formattedDate = expiresAt.formatted(date: .abbreviated, time: .shortened)
+            let formattedDate = expiresAt.formatted(date: Date.FormatStyle.DateStyle.abbreviated, time: Date.FormatStyle.TimeStyle.shortened)
             return "SSO session for '\(profileName)' expired at \(formattedDate). Run `aws sso login --profile \(profileName)`."
         case .valid:
             return nil
@@ -441,6 +545,15 @@ final class AppState: ObservableObject {
         let resolvedCredentials = resolveCredentials(preferredRegion: settings.awsRegion)
         hasAvailableCredentials = resolvedCredentials != nil
         credentialSource = resolvedCredentials?.credentialSource
+    }
+
+    private func configureSSOTokenMonitor() {
+        guard usesSSOAuthentication else {
+            ssoTokenMonitor.configure(profileName: nil)
+            return
+        }
+
+        ssoTokenMonitor.configure(profileName: settings.ssoProfileName)
     }
 
     private static func loadSettings(from userDefaults: UserDefaults, key: String) -> Settings {

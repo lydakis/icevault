@@ -11,6 +11,10 @@ struct IceVaultApp: App {
         _appState = StateObject(wrappedValue: runtimeAppState)
         let isHeadlessBackupMode = CommandLine.arguments.contains("--backup")
 
+        if !isHeadlessBackupMode {
+            runtimeAppState.requestNotificationPermissionIfNeeded()
+        }
+
         if isHeadlessBackupMode {
             NSApplication.shared.setActivationPolicy(.prohibited)
 

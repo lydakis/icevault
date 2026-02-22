@@ -24,6 +24,12 @@ struct MenuBarView: View {
                     .font(.headline)
             }
 
+            if let ssoSessionStatusText = appState.ssoSessionStatusText {
+                Text(ssoSessionStatusText)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(appState.isSSOSessionExpired ? .red : .secondary)
+            }
+
             if let job = appState.currentJob {
                 ProgressView(value: job.fileProgressFraction)
 
@@ -47,11 +53,29 @@ struct MenuBarView: View {
                     .foregroundStyle(appState.isConfigured ? .green : .secondary)
             }
 
+            if appState.usesSSOAuthentication {
+                Button("Refresh Login") {
+                    appState.refreshSSOLogin()
+                }
+                .buttonStyle(.bordered)
+                .disabled(!appState.canRefreshSSOLogin)
+            }
+
             Button("Backup Now") {
                 appState.startBackup()
             }
             .buttonStyle(.borderedProminent)
-            .disabled(appState.currentJob?.isRunning == true || !appState.isConfigured)
+            .disabled(
+                appState.currentJob?.isRunning == true
+                    || !appState.isConfigured
+                    || appState.isBackupBlockedBySSOExpiry
+            )
+
+            if let backupBlockedReason = appState.backupBlockedReason {
+                Text(backupBlockedReason)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
             if let authenticationPromptMessage = appState.authenticationPromptMessage {
                 Text(authenticationPromptMessage)
@@ -79,6 +103,9 @@ struct MenuBarView: View {
         }
         .padding(14)
         .frame(width: 340)
+        .onAppear {
+            appState.refreshSSOSessionStatus()
+        }
         .alert(
             "Authentication Required",
             isPresented: Binding(
