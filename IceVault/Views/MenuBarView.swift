@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 
 struct MenuBarView: View {
+    @Environment(\.openSettings) private var openSettings
     @Environment(\.openWindow) private var openWindow
     @EnvironmentObject private var appState: AppState
 
@@ -69,7 +70,7 @@ struct MenuBarView: View {
 
             HStack {
                 Button("Settings") {
-                    NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+                    openSettings()
                 }
                 Button("History") {
                     openWindow(id: "history")
@@ -90,7 +91,7 @@ struct MenuBarView: View {
             )
         ) {
             Button("Open Settings") {
-                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+                openSettings()
             }
             Button("OK", role: .cancel) {
                 appState.dismissAuthenticationPrompt()
