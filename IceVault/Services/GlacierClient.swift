@@ -131,6 +131,19 @@ final class GlacierClient {
         return normalizedKey
     }
 
+    func verifyBucketAccess(bucket: String) async throws {
+        let trimmedBucket = bucket.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedBucket.isEmpty else {
+            throw GlacierClientError.invalidBucket
+        }
+
+        _ = try await performS3Operation("headBucket") {
+            try await s3Client.headBucket(
+                input: HeadBucketInput(bucket: trimmedBucket)
+            )
+        }
+    }
+
     private func uploadSinglePartFile(
         fileURL: URL,
         bucket: String,

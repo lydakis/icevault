@@ -103,7 +103,8 @@ final class BackupJob: ObservableObject, Identifiable {
             id: id,
             startedAt: startedAt,
             completedAt: completedAt,
-            fileCount: max(filesTotal, filesUploaded),
+            filesUploaded: max(filesUploaded, 0),
+            bytesUploaded: max(bytesUploaded, 0),
             status: status,
             sourceRoot: sourceRoot,
             bucket: bucket,
@@ -116,13 +117,90 @@ struct BackupHistoryEntry: Identifiable, Codable {
     let id: UUID
     let startedAt: Date
     let completedAt: Date?
-    let fileCount: Int
+    let filesUploaded: Int
+    let bytesUploaded: Int64
     let status: BackupJob.Status
     let sourceRoot: String
     let bucket: String
     let error: String?
 
+    enum CodingKeys: String, CodingKey {
+        case id
+        case startedAt
+        case completedAt
+        case filesUploaded
+        case fileCount
+        case bytesUploaded
+        case status
+        case sourceRoot
+        case bucket
+        case error
+    }
+
+    init(
+        id: UUID,
+        startedAt: Date,
+        completedAt: Date?,
+        filesUploaded: Int,
+        bytesUploaded: Int64,
+        status: BackupJob.Status,
+        sourceRoot: String,
+        bucket: String,
+        error: String?
+    ) {
+        self.id = id
+        self.startedAt = startedAt
+        self.completedAt = completedAt
+        self.filesUploaded = max(filesUploaded, 0)
+        self.bytesUploaded = max(bytesUploaded, 0)
+        self.status = status
+        self.sourceRoot = sourceRoot
+        self.bucket = bucket
+        self.error = error
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        startedAt = try container.decode(Date.self, forKey: .startedAt)
+        completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt)
+
+        let legacyFileCount = try container.decodeIfPresent(Int.self, forKey: .fileCount) ?? 0
+        filesUploaded = max(
+            try container.decodeIfPresent(Int.self, forKey: .filesUploaded) ?? legacyFileCount,
+            0
+        )
+
+        bytesUploaded = max(try container.decodeIfPresent(Int64.self, forKey: .bytesUploaded) ?? 0, 0)
+        status = try container.decode(BackupJob.Status.self, forKey: .status)
+        sourceRoot = try container.decode(String.self, forKey: .sourceRoot)
+        bucket = try container.decode(String.self, forKey: .bucket)
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(startedAt, forKey: .startedAt)
+        try container.encodeIfPresent(completedAt, forKey: .completedAt)
+        try container.encode(filesUploaded, forKey: .filesUploaded)
+        try container.encode(filesUploaded, forKey: .fileCount)
+        try container.encode(bytesUploaded, forKey: .bytesUploaded)
+        try container.encode(status, forKey: .status)
+        try container.encode(sourceRoot, forKey: .sourceRoot)
+        try container.encode(bucket, forKey: .bucket)
+        try container.encodeIfPresent(error, forKey: .error)
+    }
+
+    var fileCount: Int {
+        filesUploaded
+    }
+
     var displayDate: Date {
         completedAt ?? startedAt
+    }
+
+    var duration: TimeInterval {
+        max((completedAt ?? startedAt).timeIntervalSince(startedAt), 0)
     }
 }

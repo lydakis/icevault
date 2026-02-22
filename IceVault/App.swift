@@ -5,7 +5,7 @@ struct IceVaultApp: App {
     @StateObject private var appState = AppState()
 
     var body: some Scene {
-        MenuBarExtra("IceVault", systemImage: appState.menuBarSystemImage) {
+        MenuBarExtra("IceVault", systemImage: "snowflake") {
             MenuBarView()
                 .environmentObject(appState)
         }

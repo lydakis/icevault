@@ -9,6 +9,42 @@ final class AppState: ObservableObject {
         var awsRegion: String = "us-east-1"
         var bucket: String = ""
         var sourcePath: String = ""
+
+        enum CodingKeys: String, CodingKey {
+            case awsRegion
+            case bucket
+            case sourcePath
+        }
+
+        init(
+            awsAccessKey: String = "",
+            awsSecretKey: String = "",
+            awsRegion: String = "us-east-1",
+            bucket: String = "",
+            sourcePath: String = ""
+        ) {
+            self.awsAccessKey = awsAccessKey
+            self.awsSecretKey = awsSecretKey
+            self.awsRegion = awsRegion
+            self.bucket = bucket
+            self.sourcePath = sourcePath
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            awsAccessKey = ""
+            awsSecretKey = ""
+            awsRegion = try container.decodeIfPresent(String.self, forKey: .awsRegion) ?? "us-east-1"
+            bucket = try container.decodeIfPresent(String.self, forKey: .bucket) ?? ""
+            sourcePath = try container.decodeIfPresent(String.self, forKey: .sourcePath) ?? ""
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(awsRegion, forKey: .awsRegion)
+            try container.encode(bucket, forKey: .bucket)
+            try container.encode(sourcePath, forKey: .sourcePath)
+        }
     }
 
     @Published var currentJob: BackupJob? {
@@ -29,8 +65,11 @@ final class AppState: ObservableObject {
         }
     }
 
+    @Published private(set) var hasStoredCredentials: Bool
+
     private let userDefaults: UserDefaults
     private let backupEngine: BackupEngine
+    private let keychainService: KeychainService
     private var currentJobObserver: AnyCancellable?
     private var backupTask: Task<Void, Never>?
 
@@ -39,17 +78,27 @@ final class AppState: ObservableObject {
 
     init(
         userDefaults: UserDefaults = .standard,
-        backupEngine: BackupEngine = BackupEngine()
+        backupEngine: BackupEngine = BackupEngine(),
+        keychainService: KeychainService = KeychainService()
     ) {
         self.userDefaults = userDefaults
         self.backupEngine = backupEngine
+        self.keychainService = keychainService
         self.settings = Self.loadSettings(from: userDefaults, key: Self.settingsKey)
         self.history = Self.loadHistory(from: userDefaults, key: Self.historyKey)
+        self.hasStoredCredentials = false
+
+        refreshCredentialState()
+        saveSettings()
     }
 
     var statusText: String {
         if let currentJob {
             return currentJob.status.displayName
+        }
+
+        if !isConfigured {
+            return "Not Configured"
         }
 
         if let last = history.first {
@@ -78,8 +127,48 @@ final class AppState: ObservableObject {
         history.first?.displayDate
     }
 
+    var isConfigured: Bool {
+        hasStoredCredentials
+            && !Self.trimmed(settings.awsRegion).isEmpty
+            && !Self.trimmed(settings.bucket).isEmpty
+            && !Self.trimmed(settings.sourcePath).isEmpty
+    }
+
     func updateSettings(_ newSettings: Settings) {
-        settings = newSettings
+        var sanitized = newSettings
+        sanitized.awsAccessKey = ""
+        sanitized.awsSecretKey = ""
+        sanitized.awsRegion = Self.trimmed(sanitized.awsRegion)
+        sanitized.bucket = Self.trimmed(sanitized.bucket)
+        sanitized.sourcePath = Self.trimmed(sanitized.sourcePath)
+        settings = sanitized
+    }
+
+    func loadStoredCredentials() throws -> AWSCredentials? {
+        try keychainService.loadCredentials()
+    }
+
+    func saveCredentials(accessKey: String, secretKey: String) throws {
+        try keychainService.save(accessKey: accessKey, secretKey: secretKey)
+        hasStoredCredentials = true
+    }
+
+    func deleteStoredCredentials() throws {
+        try keychainService.deleteCredentials()
+        hasStoredCredentials = false
+    }
+
+    func clearHistory() {
+        history = []
+    }
+
+    func testConnection(accessKey: String, secretKey: String, region: String, bucket: String) async throws {
+        let client = try GlacierClient(
+            accessKey: accessKey,
+            secretKey: secretKey,
+            region: region
+        )
+        try await client.verifyBucketAccess(bucket: bucket)
     }
 
     func startBackup() {
@@ -87,8 +176,8 @@ final class AppState: ObservableObject {
             return
         }
 
-        let sourceRoot = settings.sourcePath.isEmpty ? NSHomeDirectory() : settings.sourcePath
-        let bucket = settings.bucket.isEmpty ? "unset-bucket" : settings.bucket
+        let sourceRoot = Self.trimmed(settings.sourcePath)
+        let bucket = Self.trimmed(settings.bucket)
 
         let job = BackupJob(sourceRoot: sourceRoot, bucket: bucket, status: .scanning)
         currentJob = job
@@ -117,8 +206,26 @@ final class AppState: ObservableObject {
     }
 
     private func executeBackup(job: BackupJob) async {
+        var runtimeSettings = settings
+
         do {
-            try await backupEngine.run(job: job, settings: settings)
+            if let credentials = try keychainService.loadCredentials() {
+                runtimeSettings.awsAccessKey = credentials.accessKey
+                runtimeSettings.awsSecretKey = credentials.secretKey
+                hasStoredCredentials = true
+            } else {
+                runtimeSettings.awsAccessKey = ""
+                runtimeSettings.awsSecretKey = ""
+                hasStoredCredentials = false
+            }
+        } catch {
+            runtimeSettings.awsAccessKey = ""
+            runtimeSettings.awsSecretKey = ""
+            hasStoredCredentials = false
+        }
+
+        do {
+            try await backupEngine.run(job: job, settings: runtimeSettings)
         } catch {
             if !(error is CancellationError) && job.status != .failed {
                 job.markFailed(error.localizedDescription)
@@ -151,6 +258,14 @@ final class AppState: ObservableObject {
         userDefaults.set(data, forKey: Self.historyKey)
     }
 
+    private func refreshCredentialState() {
+        do {
+            hasStoredCredentials = try keychainService.loadCredentials() != nil
+        } catch {
+            hasStoredCredentials = false
+        }
+    }
+
     private static func loadSettings(from userDefaults: UserDefaults, key: String) -> Settings {
         guard
             let data = userDefaults.data(forKey: key),
@@ -171,5 +286,9 @@ final class AppState: ObservableObject {
         }
 
         return decoded
+    }
+
+    private static func trimmed(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
