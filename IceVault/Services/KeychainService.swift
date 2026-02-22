@@ -4,6 +4,20 @@ import KeychainAccess
 struct AWSCredentials: Equatable, Sendable {
     let accessKey: String
     let secretKey: String
+    let sessionToken: String?
+    let expiration: Date?
+
+    init(
+        accessKey: String,
+        secretKey: String,
+        sessionToken: String? = nil,
+        expiration: Date? = nil
+    ) {
+        self.accessKey = accessKey
+        self.secretKey = secretKey
+        self.sessionToken = sessionToken
+        self.expiration = expiration
+    }
 }
 
 enum KeychainServiceError: LocalizedError {

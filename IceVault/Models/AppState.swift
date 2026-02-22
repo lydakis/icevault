@@ -4,6 +4,24 @@ import Foundation
 @MainActor
 final class AppState: ObservableObject {
     struct Settings: Codable, Equatable {
+        enum AuthenticationMethod: String, Codable, CaseIterable, Identifiable {
+            case staticKeys
+            case ssoProfile
+
+            var id: String {
+                rawValue
+            }
+
+            var displayName: String {
+                switch self {
+                case .staticKeys:
+                    return "Static Keys"
+                case .ssoProfile:
+                    return "SSO Profile"
+                }
+            }
+        }
+
         enum ScheduleInterval: String, Codable, CaseIterable, Identifiable {
             case daily
             case weekly
@@ -27,7 +45,10 @@ final class AppState: ObservableObject {
 
         var awsAccessKey: String = ""
         var awsSecretKey: String = ""
+        var awsSessionToken: String = ""
         var awsRegion: String = "us-east-1"
+        var authenticationMethod: AuthenticationMethod = .staticKeys
+        var ssoProfileName: String = ""
         var bucket: String = ""
         var sourcePath: String = ""
         var scheduledBackupsEnabled: Bool = false
@@ -36,6 +57,8 @@ final class AppState: ObservableObject {
 
         enum CodingKeys: String, CodingKey {
             case awsRegion
+            case authenticationMethod
+            case ssoProfileName
             case bucket
             case sourcePath
             case scheduledBackupsEnabled
@@ -46,7 +69,10 @@ final class AppState: ObservableObject {
         init(
             awsAccessKey: String = "",
             awsSecretKey: String = "",
+            awsSessionToken: String = "",
             awsRegion: String = "us-east-1",
+            authenticationMethod: AuthenticationMethod = .staticKeys,
+            ssoProfileName: String = "",
             bucket: String = "",
             sourcePath: String = "",
             scheduledBackupsEnabled: Bool = false,
@@ -55,7 +81,10 @@ final class AppState: ObservableObject {
         ) {
             self.awsAccessKey = awsAccessKey
             self.awsSecretKey = awsSecretKey
+            self.awsSessionToken = awsSessionToken
             self.awsRegion = awsRegion
+            self.authenticationMethod = authenticationMethod
+            self.ssoProfileName = ssoProfileName
             self.bucket = bucket
             self.sourcePath = sourcePath
             self.scheduledBackupsEnabled = scheduledBackupsEnabled
@@ -67,7 +96,10 @@ final class AppState: ObservableObject {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             awsAccessKey = ""
             awsSecretKey = ""
+            awsSessionToken = ""
             awsRegion = try container.decodeIfPresent(String.self, forKey: .awsRegion) ?? "us-east-1"
+            authenticationMethod = try container.decodeIfPresent(AuthenticationMethod.self, forKey: .authenticationMethod) ?? .staticKeys
+            ssoProfileName = try container.decodeIfPresent(String.self, forKey: .ssoProfileName) ?? ""
             bucket = try container.decodeIfPresent(String.self, forKey: .bucket) ?? ""
             sourcePath = try container.decodeIfPresent(String.self, forKey: .sourcePath) ?? ""
             scheduledBackupsEnabled = try container.decodeIfPresent(Bool.self, forKey: .scheduledBackupsEnabled) ?? false
@@ -78,6 +110,8 @@ final class AppState: ObservableObject {
         func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encode(awsRegion, forKey: .awsRegion)
+            try container.encode(authenticationMethod, forKey: .authenticationMethod)
+            try container.encode(ssoProfileName, forKey: .ssoProfileName)
             try container.encode(bucket, forKey: .bucket)
             try container.encode(sourcePath, forKey: .sourcePath)
             try container.encode(scheduledBackupsEnabled, forKey: .scheduledBackupsEnabled)
@@ -106,6 +140,7 @@ final class AppState: ObservableObject {
 
     @Published private(set) var hasAvailableCredentials: Bool
     @Published private(set) var credentialSource: CredentialSource?
+    @Published var authenticationPromptMessage: String?
 
     private let userDefaults: UserDefaults
     private let backupEngine: BackupEngine
@@ -132,6 +167,7 @@ final class AppState: ObservableObject {
         self.history = Self.loadHistory(from: userDefaults, key: Self.historyKey)
         self.hasAvailableCredentials = false
         self.credentialSource = nil
+        self.authenticationPromptMessage = nil
 
         refreshCredentialState()
         saveSettings()
@@ -183,7 +219,9 @@ final class AppState: ObservableObject {
         var sanitized = newSettings
         sanitized.awsAccessKey = ""
         sanitized.awsSecretKey = ""
+        sanitized.awsSessionToken = ""
         sanitized.awsRegion = Self.trimmed(sanitized.awsRegion)
+        sanitized.ssoProfileName = Self.trimmed(sanitized.ssoProfileName)
         sanitized.bucket = Self.trimmed(sanitized.bucket)
         sanitized.sourcePath = Self.trimmed(sanitized.sourcePath)
         sanitized.customIntervalHours = min(max(sanitized.customIntervalHours, 1), 168)
@@ -219,8 +257,27 @@ final class AppState: ObservableObject {
 
         return GlacierClient.resolveCredentials(
             keychainCredentials: keychainCredentials,
+            authMethod: settings.authenticationMethod,
+            ssoProfileName: settings.ssoProfileName,
             preferredRegion: preferredRegion
         )
+    }
+
+    func ssoTokenStatus() -> SSOTokenStatus? {
+        guard settings.authenticationMethod == .ssoProfile else {
+            return nil
+        }
+
+        let profileName = Self.trimmed(settings.ssoProfileName)
+        guard !profileName.isEmpty else {
+            return .missingProfile
+        }
+
+        return GlacierClient.ssoTokenStatus(profileName: profileName)
+    }
+
+    func dismissAuthenticationPrompt() {
+        authenticationPromptMessage = nil
     }
 
     @discardableResult
@@ -247,10 +304,17 @@ final class AppState: ObservableObject {
         launchAgent.isInstalled(label: Self.launchAgentLabel)
     }
 
-    func testConnection(accessKey: String, secretKey: String, region: String, bucket: String) async throws {
+    func testConnection(
+        accessKey: String,
+        secretKey: String,
+        sessionToken: String? = nil,
+        region: String,
+        bucket: String
+    ) async throws {
         let client = try GlacierClient(
             accessKey: accessKey,
             secretKey: secretKey,
+            sessionToken: sessionToken,
             region: region
         )
         try await client.verifyBucketAccess(bucket: bucket)
@@ -258,6 +322,12 @@ final class AppState: ObservableObject {
 
     func startBackup() {
         guard currentJob == nil, backupTask == nil else {
+            return
+        }
+
+        authenticationPromptMessage = nil
+        if let ssoPromptMessage = ssoReauthenticationPromptIfNeeded() {
+            authenticationPromptMessage = ssoPromptMessage
             return
         }
 
@@ -296,6 +366,7 @@ final class AppState: ObservableObject {
         if let resolvedCredentials = resolveCredentials(preferredRegion: runtimeSettings.awsRegion) {
             runtimeSettings.awsAccessKey = resolvedCredentials.credentials.accessKey
             runtimeSettings.awsSecretKey = resolvedCredentials.credentials.secretKey
+            runtimeSettings.awsSessionToken = Self.trimmed(resolvedCredentials.credentials.sessionToken ?? "")
             if Self.trimmed(runtimeSettings.awsRegion).isEmpty, let detectedRegion = resolvedCredentials.region {
                 runtimeSettings.awsRegion = detectedRegion
             }
@@ -304,6 +375,7 @@ final class AppState: ObservableObject {
         } else {
             runtimeSettings.awsAccessKey = ""
             runtimeSettings.awsSecretKey = ""
+            runtimeSettings.awsSessionToken = ""
             hasAvailableCredentials = false
             credentialSource = nil
         }
@@ -324,6 +396,29 @@ final class AppState: ObservableObject {
             currentJob = nil
         }
         backupTask = nil
+    }
+
+    private func ssoReauthenticationPromptIfNeeded() -> String? {
+        guard settings.authenticationMethod == .ssoProfile else {
+            return nil
+        }
+
+        let profileName = Self.trimmed(settings.ssoProfileName)
+        guard !profileName.isEmpty else {
+            return "SSO profile name is required. Set a profile and run `aws sso login --profile <name>`."
+        }
+
+        switch GlacierClient.ssoTokenStatus(profileName: profileName) {
+        case .missingProfile:
+            return "SSO profile '\(profileName)' was not found in ~/.aws/config. Run `aws configure sso --profile \(profileName)`."
+        case .missingToken:
+            return "SSO login is required for profile '\(profileName)'. Run `aws sso login --profile \(profileName)`."
+        case .expired(let expiresAt):
+            let formattedDate = expiresAt.formatted(date: .abbreviated, time: .shortened)
+            return "SSO session for '\(profileName)' expired at \(formattedDate). Run `aws sso login --profile \(profileName)`."
+        case .valid:
+            return nil
+        }
     }
 
     private func saveSettings() {

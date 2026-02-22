@@ -18,7 +18,7 @@ enum BackupEngineError: LocalizedError {
 }
 
 final class BackupEngine: @unchecked Sendable {
-    typealias GlacierClientFactory = (_ accessKey: String, _ secretKey: String, _ region: String) throws -> GlacierClient
+    typealias GlacierClientFactory = (_ accessKey: String, _ secretKey: String, _ sessionToken: String?, _ region: String) throws -> GlacierClient
 
     private let scanner: FileScanner
     private let fileManager: FileManager
@@ -29,8 +29,13 @@ final class BackupEngine: @unchecked Sendable {
         scanner: FileScanner = FileScanner(),
         fileManager: FileManager = .default,
         database: DatabaseService? = try? DatabaseService(),
-        glacierClientFactory: @escaping GlacierClientFactory = { accessKey, secretKey, region in
-            try GlacierClient(accessKey: accessKey, secretKey: secretKey, region: region)
+        glacierClientFactory: @escaping GlacierClientFactory = { accessKey, secretKey, sessionToken, region in
+            try GlacierClient(
+                accessKey: accessKey,
+                secretKey: secretKey,
+                sessionToken: sessionToken,
+                region: region
+            )
         }
     ) {
         self.scanner = scanner
@@ -77,6 +82,7 @@ final class BackupEngine: @unchecked Sendable {
             let glacierClient = try glacierClientFactory(
                 settings.awsAccessKey,
                 settings.awsSecretKey,
+                settings.awsSessionToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : settings.awsSessionToken,
                 settings.awsRegion
             )
 

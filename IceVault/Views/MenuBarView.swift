@@ -52,6 +52,12 @@ struct MenuBarView: View {
             .buttonStyle(.borderedProminent)
             .disabled(appState.currentJob?.isRunning == true || !appState.isConfigured)
 
+            if let authenticationPromptMessage = appState.authenticationPromptMessage {
+                Text(authenticationPromptMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+
             if appState.currentJob?.isRunning == true {
                 Button("Cancel Backup") {
                     appState.cancelBackup()
@@ -72,6 +78,26 @@ struct MenuBarView: View {
         }
         .padding(14)
         .frame(width: 340)
+        .alert(
+            "Authentication Required",
+            isPresented: Binding(
+                get: { appState.authenticationPromptMessage != nil },
+                set: { shouldShow in
+                    if !shouldShow {
+                        appState.dismissAuthenticationPrompt()
+                    }
+                }
+            )
+        ) {
+            Button("Open Settings") {
+                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+            }
+            Button("OK", role: .cancel) {
+                appState.dismissAuthenticationPrompt()
+            }
+        } message: {
+            Text(appState.authenticationPromptMessage ?? "")
+        }
     }
 
     private var statusColor: Color {

@@ -3,8 +3,9 @@ import AWSSDKIdentity
 import Foundation
 import Smithy
 
-enum CredentialSource: String, Codable, CaseIterable, Sendable {
+enum CredentialSource: Equatable, Sendable {
     case keychain
+    case sso(profileName: String)
     case awsCLI
     case environment
 
@@ -12,6 +13,8 @@ enum CredentialSource: String, Codable, CaseIterable, Sendable {
         switch self {
         case .keychain:
             return "Keychain"
+        case .sso(let profileName):
+            return "SSO Profile (\(profileName))"
         case .awsCLI:
             return "~/.aws/credentials"
         case .environment:
@@ -23,6 +26,8 @@ enum CredentialSource: String, Codable, CaseIterable, Sendable {
         switch self {
         case .keychain:
             return "Using credentials from Keychain."
+        case .sso(let profileName):
+            return "Using temporary credentials from SSO profile '\(profileName)'."
         case .awsCLI:
             return "Using credentials from ~/.aws/credentials."
         case .environment:
@@ -31,10 +36,27 @@ enum CredentialSource: String, Codable, CaseIterable, Sendable {
     }
 }
 
+struct SSOProfileConfiguration: Equatable, Sendable {
+    let profileName: String
+    let startURL: String
+    let accountID: String
+    let roleName: String
+    let ssoRegion: String
+    let region: String?
+}
+
+enum SSOTokenStatus: Equatable, Sendable {
+    case missingProfile
+    case missingToken
+    case expired(expiresAt: Date)
+    case valid(expiresAt: Date)
+}
+
 struct ResolvedCredentials: Equatable, Sendable {
     let credentials: AWSCredentials
     let region: String?
     let credentialSource: CredentialSource
+    let expiration: Date?
 }
 
 enum GlacierClientError: LocalizedError {
@@ -89,6 +111,7 @@ final class GlacierClient {
     init(
         accessKey: String,
         secretKey: String,
+        sessionToken: String? = nil,
         region: String,
         fileManager: FileManager = .default
     ) throws {
@@ -105,7 +128,8 @@ final class GlacierClient {
 
         let credentialIdentity = AWSCredentialIdentity(
             accessKey: trimmedAccessKey,
-            secret: trimmedSecretKey
+            secret: trimmedSecretKey,
+            sessionToken: Self.trimmed(sessionToken).isEmpty ? nil : Self.trimmed(sessionToken)
         )
         let config = try S3Client.S3ClientConfig(
             awsCredentialIdentityResolver: StaticAWSCredentialIdentityResolver(credentialIdentity),
@@ -118,6 +142,8 @@ final class GlacierClient {
 
     static func resolveCredentials(
         keychainCredentials: AWSCredentials?,
+        authMethod: AppState.Settings.AuthenticationMethod,
+        ssoProfileName: String?,
         preferredRegion: String?,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         fileManager: FileManager = .default
@@ -125,28 +151,125 @@ final class GlacierClient {
         if let normalizedKeychainCredentials = normalized(credentials: keychainCredentials) {
             return ResolvedCredentials(
                 credentials: normalizedKeychainCredentials,
-                region: resolveRegion(preferredRegion: preferredRegion, environment: environment, fileManager: fileManager),
-                credentialSource: .keychain
+                region: resolveRegion(
+                    preferredRegion: preferredRegion,
+                    authMethod: authMethod,
+                    ssoProfileName: ssoProfileName,
+                    environment: environment,
+                    fileManager: fileManager
+                ),
+                credentialSource: .keychain,
+                expiration: normalizedKeychainCredentials.expiration
+            )
+        }
+
+        if authMethod == .ssoProfile,
+           let normalizedProfileName = normalizedProfileName(ssoProfileName),
+           let ssoCredentials = credentialsFromSSOProfile(
+               profileName: normalizedProfileName,
+               environment: environment,
+               fileManager: fileManager
+           )
+        {
+            return ResolvedCredentials(
+                credentials: ssoCredentials,
+                region: resolveRegion(
+                    preferredRegion: preferredRegion,
+                    authMethod: authMethod,
+                    ssoProfileName: normalizedProfileName,
+                    environment: environment,
+                    fileManager: fileManager
+                ),
+                credentialSource: .sso(profileName: normalizedProfileName),
+                expiration: ssoCredentials.expiration
             )
         }
 
         if let awsCLICredentials = credentialsFromAWSCLI(fileManager: fileManager) {
             return ResolvedCredentials(
                 credentials: awsCLICredentials,
-                region: resolveRegion(preferredRegion: preferredRegion, environment: environment, fileManager: fileManager),
-                credentialSource: .awsCLI
+                region: resolveRegion(
+                    preferredRegion: preferredRegion,
+                    authMethod: authMethod,
+                    ssoProfileName: ssoProfileName,
+                    environment: environment,
+                    fileManager: fileManager
+                ),
+                credentialSource: .awsCLI,
+                expiration: awsCLICredentials.expiration
             )
         }
 
         if let environmentCredentials = credentialsFromEnvironment(environment) {
             return ResolvedCredentials(
                 credentials: environmentCredentials,
-                region: resolveRegion(preferredRegion: preferredRegion, environment: environment, fileManager: fileManager),
-                credentialSource: .environment
+                region: resolveRegion(
+                    preferredRegion: preferredRegion,
+                    authMethod: authMethod,
+                    ssoProfileName: ssoProfileName,
+                    environment: environment,
+                    fileManager: fileManager
+                ),
+                credentialSource: .environment,
+                expiration: environmentCredentials.expiration
             )
         }
 
         return nil
+    }
+
+    static func ssoProfile(named profileName: String, fileManager: FileManager = .default) -> SSOProfileConfiguration? {
+        let normalizedProfileName = normalizedProfileName(profileName)
+        guard let normalizedProfileName else {
+            return nil
+        }
+
+        let configURL = awsDirectoryURL(fileManager: fileManager).appendingPathComponent("config")
+        let sections = parseINI(from: configURL, fileManager: fileManager)
+        guard let profileSection = profileSection(named: normalizedProfileName, in: sections) else {
+            return nil
+        }
+
+        let startURL = trimmed(profileSection["sso_start_url"])
+        let accountID = trimmed(profileSection["sso_account_id"])
+        let roleName = trimmed(profileSection["sso_role_name"])
+        let ssoRegion = trimmed(profileSection["sso_region"])
+        guard !startURL.isEmpty, !accountID.isEmpty, !roleName.isEmpty, !ssoRegion.isEmpty else {
+            return nil
+        }
+
+        let regionValue = trimmed(profileSection["region"])
+        return SSOProfileConfiguration(
+            profileName: normalizedProfileName,
+            startURL: startURL,
+            accountID: accountID,
+            roleName: roleName,
+            ssoRegion: ssoRegion,
+            region: regionValue.isEmpty ? nil : regionValue
+        )
+    }
+
+    static func ssoTokenStatus(
+        profileName: String,
+        fileManager: FileManager = .default,
+        now: Date = Date()
+    ) -> SSOTokenStatus {
+        guard let profile = ssoProfile(named: profileName, fileManager: fileManager) else {
+            return .missingProfile
+        }
+
+        guard let token = validTokenCacheEntry(
+            matchingStartURL: profile.startURL,
+            fileManager: fileManager
+        ) else {
+            return .missingToken
+        }
+
+        if token.expiresAt <= now {
+            return .expired(expiresAt: token.expiresAt)
+        }
+
+        return .valid(expiresAt: token.expiresAt)
     }
 
     static func credentialsFromAWSCLI(fileManager: FileManager = .default) -> AWSCredentials? {
@@ -425,14 +548,77 @@ final class GlacierClient {
         }
     }
 
+    private struct SSOCacheToken: Sendable {
+        let startURL: String
+        let accessToken: String
+        let expiresAt: Date
+    }
+
+    private struct ExportCredentialsProcessOutput: Decodable {
+        let accessKeyID: String
+        let secretAccessKey: String
+        let sessionToken: String?
+        let expiration: String?
+
+        enum CodingKeys: String, CodingKey {
+            case accessKeyID = "AccessKeyId"
+            case secretAccessKey = "SecretAccessKey"
+            case sessionToken = "SessionToken"
+            case expiration = "Expiration"
+        }
+    }
+
+    private static let iso8601DateFormatterWithFractionalSeconds: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private static let iso8601DateFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
+    private static let awsUTCDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'UTC'"
+        return formatter
+    }()
+
+    private static let awsOffsetDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ssZ"
+        return formatter
+    }()
+
     private static func resolveRegion(
         preferredRegion: String?,
+        authMethod: AppState.Settings.AuthenticationMethod,
+        ssoProfileName: String?,
         environment: [String: String],
         fileManager: FileManager
     ) -> String? {
         let normalizedPreferredRegion = trimmed(preferredRegion)
         if !normalizedPreferredRegion.isEmpty {
             return normalizedPreferredRegion
+        }
+
+        if authMethod == .ssoProfile,
+           let normalizedProfileName = normalizedProfileName(ssoProfileName),
+           let profile = ssoProfile(named: normalizedProfileName, fileManager: fileManager)
+        {
+            if let profileRegion = profile.region, !trimmed(profileRegion).isEmpty {
+                return profileRegion
+            }
+
+            if !trimmed(profile.ssoRegion).isEmpty {
+                return profile.ssoRegion
+            }
         }
 
         if let configRegion = regionFromAWSConfig(fileManager: fileManager) {
@@ -452,6 +638,156 @@ final class GlacierClient {
         return nil
     }
 
+    private static func credentialsFromSSOProfile(
+        profileName: String,
+        environment: [String: String],
+        fileManager: FileManager
+    ) -> AWSCredentials? {
+        guard case .valid = ssoTokenStatus(profileName: profileName, fileManager: fileManager) else {
+            return nil
+        }
+
+        return credentialsFromAWSCLIProcess(profileName: profileName, environment: environment)
+    }
+
+    private static func credentialsFromAWSCLIProcess(
+        profileName: String,
+        environment: [String: String]
+    ) -> AWSCredentials? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = [
+            "aws",
+            "configure",
+            "export-credentials",
+            "--profile",
+            profileName,
+            "--format",
+            "process"
+        ]
+
+        var processEnvironment = environment
+        processEnvironment["AWS_PROFILE"] = profileName
+        processEnvironment["AWS_SDK_LOAD_CONFIG"] = "1"
+        process.environment = processEnvironment
+
+        let outputPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            return nil
+        }
+
+        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        guard
+            !outputData.isEmpty,
+            let exportedCredentials = try? JSONDecoder().decode(ExportCredentialsProcessOutput.self, from: outputData)
+        else {
+            return nil
+        }
+
+        let accessKey = trimmed(exportedCredentials.accessKeyID)
+        let secretKey = trimmed(exportedCredentials.secretAccessKey)
+        guard !accessKey.isEmpty, !secretKey.isEmpty else {
+            return nil
+        }
+
+        let sessionToken = trimmed(exportedCredentials.sessionToken)
+        let expiration = parseDate(exportedCredentials.expiration)
+        return AWSCredentials(
+            accessKey: accessKey,
+            secretKey: secretKey,
+            sessionToken: sessionToken.isEmpty ? nil : sessionToken,
+            expiration: expiration
+        )
+    }
+
+    private static func validTokenCacheEntry(
+        matchingStartURL startURL: String,
+        fileManager: FileManager
+    ) -> SSOCacheToken? {
+        let cacheDirectoryURL = awsDirectoryURL(fileManager: fileManager)
+            .appendingPathComponent("sso", isDirectory: true)
+            .appendingPathComponent("cache", isDirectory: true)
+
+        guard let cacheFiles = try? fileManager.contentsOfDirectory(
+            at: cacheDirectoryURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return nil
+        }
+
+        let normalizedStartURL = trimmed(startURL)
+        guard !normalizedStartURL.isEmpty else {
+            return nil
+        }
+
+        let matchingTokens = cacheFiles
+            .filter { $0.pathExtension.caseInsensitiveCompare("json") == .orderedSame }
+            .compactMap(parseSSOCacheToken(from:))
+            .filter { $0.startURL.caseInsensitiveCompare(normalizedStartURL) == .orderedSame }
+
+        return matchingTokens.max(by: { $0.expiresAt < $1.expiresAt })
+    }
+
+    private static func parseSSOCacheToken(from fileURL: URL) -> SSOCacheToken? {
+        guard
+            let data = try? Data(contentsOf: fileURL),
+            let jsonObject = try? JSONSerialization.jsonObject(with: data),
+            let json = jsonObject as? [String: Any]
+        else {
+            return nil
+        }
+
+        let startURL = trimmed((json["startUrl"] as? String) ?? (json["start_url"] as? String))
+        let accessToken = trimmed((json["accessToken"] as? String) ?? (json["access_token"] as? String))
+        let expiresAtRaw = trimmed((json["expiresAt"] as? String) ?? (json["expires_at"] as? String))
+        guard
+            !startURL.isEmpty,
+            !accessToken.isEmpty,
+            !expiresAtRaw.isEmpty,
+            let expiresAt = parseDate(expiresAtRaw)
+        else {
+            return nil
+        }
+
+        return SSOCacheToken(
+            startURL: startURL,
+            accessToken: accessToken,
+            expiresAt: expiresAt
+        )
+    }
+
+    private static func parseDate(_ value: String?) -> Date? {
+        let normalizedValue = trimmed(value)
+        guard !normalizedValue.isEmpty else {
+            return nil
+        }
+
+        if let date = iso8601DateFormatterWithFractionalSeconds.date(from: normalizedValue) {
+            return date
+        }
+
+        if let date = iso8601DateFormatter.date(from: normalizedValue) {
+            return date
+        }
+
+        if let date = awsUTCDateFormatter.date(from: normalizedValue) {
+            return date
+        }
+
+        return awsOffsetDateFormatter.date(from: normalizedValue)
+    }
+
     private static func normalized(credentials: AWSCredentials?) -> AWSCredentials? {
         guard let credentials else {
             return nil
@@ -463,7 +799,13 @@ final class GlacierClient {
             return nil
         }
 
-        return AWSCredentials(accessKey: accessKey, secretKey: secretKey)
+        let sessionToken = trimmed(credentials.sessionToken)
+        return AWSCredentials(
+            accessKey: accessKey,
+            secretKey: secretKey,
+            sessionToken: sessionToken.isEmpty ? nil : sessionToken,
+            expiration: credentials.expiration
+        )
     }
 
     private static func credentialsFromEnvironment(_ environment: [String: String]) -> AWSCredentials? {
@@ -473,15 +815,37 @@ final class GlacierClient {
             return nil
         }
 
-        return AWSCredentials(accessKey: accessKey, secretKey: secretKey)
+        let sessionToken = trimmed(environment["AWS_SESSION_TOKEN"])
+        return AWSCredentials(
+            accessKey: accessKey,
+            secretKey: secretKey,
+            sessionToken: sessionToken.isEmpty ? nil : sessionToken
+        )
     }
 
     private static func parseDefaultProfile(from fileURL: URL, fileManager: FileManager) -> [String: String]? {
         let sections = parseINI(from: fileURL, fileManager: fileManager)
-        if let exactDefault = section(named: "default", in: sections) {
-            return exactDefault
+        return profileSection(named: "default", in: sections)
+    }
+
+    private static func profileSection(
+        named profileName: String,
+        in sections: [String: [String: String]]
+    ) -> [String: String]? {
+        let normalizedProfileName = normalizedProfileName(profileName) ?? "default"
+        let candidateSectionNames: [String]
+        if normalizedProfileName.caseInsensitiveCompare("default") == .orderedSame {
+            candidateSectionNames = ["default", "profile default"]
+        } else {
+            candidateSectionNames = ["profile \(normalizedProfileName)", normalizedProfileName]
         }
-        return section(named: "profile default", in: sections)
+
+        for sectionName in candidateSectionNames {
+            if let section = section(named: sectionName, in: sections) {
+                return section
+            }
+        }
+        return nil
     }
 
     private static func section(named expectedName: String, in sections: [String: [String: String]]) -> [String: String]? {
@@ -554,6 +918,11 @@ final class GlacierClient {
     private static func awsDirectoryURL(fileManager: FileManager) -> URL {
         fileManager.homeDirectoryForCurrentUser
             .appendingPathComponent(".aws", isDirectory: true)
+    }
+
+    private static func normalizedProfileName(_ value: String?) -> String? {
+        let normalizedValue = trimmed(value)
+        return normalizedValue.isEmpty ? nil : normalizedValue
     }
 
     private static func trimmed(_ value: String?) -> String {

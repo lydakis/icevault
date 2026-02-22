@@ -8,6 +8,8 @@ struct SettingsView: View {
     @State private var accessKey = ""
     @State private var secretKey = ""
     @State private var detectedCredentialSource: CredentialSource?
+    @State private var detectedCredentialExpiry: Date?
+    @State private var ssoTokenStatus: SSOTokenStatus?
     @State private var scheduleInstalled = false
     @State private var savedAt: Date?
     @State private var saveMessage: String?
@@ -15,6 +17,9 @@ struct SettingsView: View {
     @State private var connectionMessage: String?
     @State private var connectionSucceeded = false
     @State private var isTestingConnection = false
+    @State private var isRunningSSOLogin = false
+    @State private var ssoLoginMessage: String?
+    @State private var ssoLoginSucceeded = false
 
     private static let commonRegions: [String] = [
         "us-east-1",
@@ -35,26 +40,72 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
-            Section("AWS Credentials") {
-                TextField("Access Key ID", text: $accessKey)
-                    .textContentType(.username)
+            Section("AWS Authentication") {
+                Picker("Authentication Method", selection: $draft.authenticationMethod) {
+                    ForEach(AppState.Settings.AuthenticationMethod.allCases) { method in
+                        Text(method.displayName).tag(method)
+                    }
+                }
+                .pickerStyle(.segmented)
 
-                SecureField("Secret Access Key", text: $secretKey)
-                    .textContentType(.password)
+                if draft.authenticationMethod == .ssoProfile {
+                    TextField("SSO Profile Name", text: $draft.ssoProfileName)
+
+                    HStack(spacing: 10) {
+                        Button("Login") {
+                            loginToSSOProfile()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(isRunningSSOLogin || trimmed(draft.ssoProfileName).isEmpty)
+
+                        if isRunningSSOLogin {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+
+                        Spacer()
+                    }
+
+                    Text(ssoStatusDescription)
+                        .font(.caption)
+                        .foregroundStyle(ssoStatusColor)
+
+                    if let ssoLoginMessage {
+                        Text(ssoLoginMessage)
+                            .font(.caption)
+                            .foregroundStyle(ssoLoginSucceeded ? .green : .red)
+                    }
+
+                    Text("Run `aws configure sso --profile <name>` once before first login.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    TextField("Access Key ID", text: $accessKey)
+                        .textContentType(.username)
+
+                    SecureField("Secret Access Key", text: $secretKey)
+                        .textContentType(.password)
+
+                    Text("Saved credentials are stored in macOS Keychain.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
 
                 if let detectedCredentialSource {
                     Text(detectedCredentialSource.settingsDescription)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
-                    Text("No credentials detected. Enter credentials manually or run aws configure.")
+                    Text("No credentials detected.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
 
-                Text("Saved credentials are stored in macOS Keychain.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                if let detectedCredentialExpiry {
+                    Text("Detected credentials expire at \(detectedCredentialExpiry.formatted(date: .abbreviated, time: .shortened)).")
+                        .font(.caption)
+                        .foregroundStyle(detectedCredentialExpiry > Date() ? Color.secondary : Color.red)
+                }
             }
 
             Section("Storage") {
@@ -157,6 +208,17 @@ struct SettingsView: View {
         .onAppear {
             loadDraft()
         }
+        .onChange(of: draft.authenticationMethod) { _, _ in
+            ssoLoginMessage = nil
+            applyDetectedCredentials(prefillFields: false)
+        }
+        .onChange(of: draft.ssoProfileName) { _, _ in
+            ssoLoginMessage = nil
+            applyDetectedCredentials(prefillFields: false)
+        }
+        .onChange(of: draft.awsRegion) { _, _ in
+            applyDetectedCredentials(prefillFields: false)
+        }
     }
 
     private var regionOptions: [String] {
@@ -164,6 +226,41 @@ struct SettingsView: View {
             return Self.commonRegions
         }
         return [draft.awsRegion].filter { !$0.isEmpty } + Self.commonRegions
+    }
+
+    private var ssoStatusDescription: String {
+        guard draft.authenticationMethod == .ssoProfile else {
+            return ""
+        }
+
+        let profileName = trimmed(draft.ssoProfileName)
+        if profileName.isEmpty {
+            return "Enter an SSO profile name from ~/.aws/config."
+        }
+
+        switch ssoTokenStatus {
+        case .missingProfile, .none:
+            return "Profile '\(profileName)' is missing required SSO fields in ~/.aws/config."
+        case .missingToken:
+            return "No cached SSO login found for '\(profileName)'."
+        case .expired(let expiresAt):
+            return "SSO token expired at \(expiresAt.formatted(date: .abbreviated, time: .shortened))."
+        case .valid(let expiresAt):
+            return "SSO token is valid until \(expiresAt.formatted(date: .abbreviated, time: .shortened))."
+        }
+    }
+
+    private var ssoStatusColor: Color {
+        guard draft.authenticationMethod == .ssoProfile else {
+            return .secondary
+        }
+
+        switch ssoTokenStatus {
+        case .valid:
+            return .green
+        case .expired, .missingProfile, .missingToken, .none:
+            return .red
+        }
     }
 
     private func loadDraft() {
@@ -177,18 +274,21 @@ struct SettingsView: View {
             let normalizedAccessKey = trimmed(accessKey)
             let normalizedSecretKey = trimmed(secretKey)
 
-            if normalizedAccessKey.isEmpty && normalizedSecretKey.isEmpty {
-                try appState.deleteStoredCredentials()
-            } else {
-                try appState.saveCredentials(
-                    accessKey: normalizedAccessKey,
-                    secretKey: normalizedSecretKey
-                )
+            if draft.authenticationMethod == .staticKeys {
+                if normalizedAccessKey.isEmpty && normalizedSecretKey.isEmpty {
+                    try appState.deleteStoredCredentials()
+                } else {
+                    try appState.saveCredentials(
+                        accessKey: normalizedAccessKey,
+                        secretKey: normalizedSecretKey
+                    )
+                }
             }
 
             var normalizedSettings = draft
             normalizedSettings.bucket = trimmed(draft.bucket)
             normalizedSettings.awsRegion = trimmed(draft.awsRegion)
+            normalizedSettings.ssoProfileName = trimmed(draft.ssoProfileName)
             normalizedSettings.sourcePath = trimmed(draft.sourcePath)
             normalizedSettings.customIntervalHours = min(max(draft.customIntervalHours, 1), 168)
             appState.updateSettings(normalizedSettings)
@@ -219,25 +319,30 @@ struct SettingsView: View {
                 let credentials: AWSCredentials
                 let resolvedRegion: String
 
-                if normalizedAccessKey.isEmpty && normalizedSecretKey.isEmpty {
-                    guard let resolvedCredentials = appState.resolveCredentials(preferredRegion: region) else {
-                        throw GlacierClientError.invalidCredentials
+                if draft.authenticationMethod == .staticKeys,
+                   (!normalizedAccessKey.isEmpty || !normalizedSecretKey.isEmpty)
+                {
+                    guard !normalizedAccessKey.isEmpty, !normalizedSecretKey.isEmpty else {
+                        throw KeychainServiceError.incompleteCredentials
                     }
-                    credentials = resolvedCredentials.credentials
-                    resolvedRegion = trimmed(resolvedCredentials.region ?? region)
-                } else if normalizedAccessKey.isEmpty || normalizedSecretKey.isEmpty {
-                    throw KeychainServiceError.incompleteCredentials
-                } else {
+
                     credentials = AWSCredentials(
                         accessKey: normalizedAccessKey,
                         secretKey: normalizedSecretKey
                     )
                     resolvedRegion = region
+                } else {
+                    guard let resolvedCredentials = resolveCredentialsForDraft(preferredRegion: region) else {
+                        throw GlacierClientError.invalidCredentials
+                    }
+                    credentials = resolvedCredentials.credentials
+                    resolvedRegion = trimmed(resolvedCredentials.region ?? region)
                 }
 
                 try await appState.testConnection(
                     accessKey: credentials.accessKey,
                     secretKey: credentials.secretKey,
+                    sessionToken: credentials.sessionToken,
                     region: resolvedRegion,
                     bucket: bucket
                 )
@@ -251,6 +356,91 @@ struct SettingsView: View {
 
             isTestingConnection = false
         }
+    }
+
+    private func loginToSSOProfile() {
+        let profileName = trimmed(draft.ssoProfileName)
+        guard !profileName.isEmpty else {
+            ssoLoginMessage = "Enter an SSO profile name first."
+            ssoLoginSucceeded = false
+            return
+        }
+
+        isRunningSSOLogin = true
+        ssoLoginMessage = nil
+
+        Task { @MainActor in
+            let (exitCode, output) = await runSSOLogin(profileName: profileName)
+            isRunningSSOLogin = false
+
+            if exitCode == 0 {
+                ssoLoginMessage = "SSO login succeeded for profile '\(profileName)'."
+                ssoLoginSucceeded = true
+                appState.dismissAuthenticationPrompt()
+                applyDetectedCredentials(prefillFields: false)
+                return
+            }
+
+            let outputSuffix = output.isEmpty ? "" : " \(output)"
+            ssoLoginMessage = "SSO login failed for profile '\(profileName)'.\(outputSuffix)"
+            ssoLoginSucceeded = false
+            applyDetectedCredentials(prefillFields: false)
+        }
+    }
+
+    private func runSSOLogin(profileName: String) async -> (Int32, String) {
+        await Task.detached(priority: .userInitiated) {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = ["aws", "sso", "login", "--profile", profileName]
+
+            var environment = ProcessInfo.processInfo.environment
+            environment["AWS_PROFILE"] = profileName
+            environment["AWS_SDK_LOAD_CONFIG"] = "1"
+            process.environment = environment
+
+            let outputPipe = Pipe()
+            process.standardOutput = outputPipe
+            process.standardError = outputPipe
+
+            do {
+                try process.run()
+            } catch {
+                return (-1, error.localizedDescription)
+            }
+
+            process.waitUntilExit()
+
+            let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: outputData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+            let clippedOutput: String
+            if output.count > 240 {
+                let endIndex = output.index(output.startIndex, offsetBy: 240)
+                clippedOutput = String(output[..<endIndex]) + "..."
+            } else {
+                clippedOutput = output
+            }
+
+            return (process.terminationStatus, clippedOutput)
+        }.value
+    }
+
+    private func resolveCredentialsForDraft(preferredRegion: String?) -> ResolvedCredentials? {
+        let keychainCredentials: AWSCredentials?
+        do {
+            keychainCredentials = try appState.loadStoredCredentials()
+        } catch {
+            keychainCredentials = nil
+        }
+
+        return GlacierClient.resolveCredentials(
+            keychainCredentials: keychainCredentials,
+            authMethod: draft.authenticationMethod,
+            ssoProfileName: draft.ssoProfileName,
+            preferredRegion: preferredRegion
+        )
     }
 
     private func chooseSourceFolder() {
@@ -271,8 +461,20 @@ struct SettingsView: View {
     }
 
     private func applyDetectedCredentials(prefillFields: Bool) {
-        let resolved = appState.resolveCredentials(preferredRegion: draft.awsRegion)
+        let resolved = resolveCredentialsForDraft(preferredRegion: draft.awsRegion)
         detectedCredentialSource = resolved?.credentialSource
+        detectedCredentialExpiry = resolved?.expiration
+
+        if draft.authenticationMethod == .ssoProfile {
+            let profileName = trimmed(draft.ssoProfileName)
+            if profileName.isEmpty {
+                ssoTokenStatus = .missingProfile
+            } else {
+                ssoTokenStatus = GlacierClient.ssoTokenStatus(profileName: profileName)
+            }
+        } else {
+            ssoTokenStatus = nil
+        }
 
         guard prefillFields else {
             return
@@ -291,4 +493,5 @@ struct SettingsView: View {
             draft.awsRegion = detectedRegion
         }
     }
+
 }
