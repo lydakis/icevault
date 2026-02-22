@@ -192,6 +192,10 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
     }
 
     private func configureNotificationCenter() {
+        guard Bundle.main.bundleIdentifier != nil else {
+            // Running outside a proper .app bundle (e.g. swift run) — skip notifications
+            return
+        }
         let center = UNUserNotificationCenter.current()
         center.delegate = self
 
