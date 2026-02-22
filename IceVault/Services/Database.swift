@@ -42,7 +42,7 @@ final class DatabaseService {
     }
 
     func updateFile(_ record: FileRecord) throws {
-        var mutableRecord = record
+        let mutableRecord = record
         try dbQueue.write { db in
             try mutableRecord.update(db)
         }
@@ -62,6 +62,47 @@ final class DatabaseService {
                 .filter(FileRecord.Columns.uploadedAt == nil)
                 .order(FileRecord.Columns.relativePath)
                 .fetchAll(db)
+        }
+    }
+
+    func syncScannedFiles(_ scannedFiles: [FileRecord], for sourceRoot: String) throws {
+        try dbQueue.write { db in
+            let existingRecords = try FileRecord
+                .filter(FileRecord.Columns.sourcePath == sourceRoot)
+                .fetchAll(db)
+            var existingByRelativePath = Dictionary(
+                uniqueKeysWithValues: existingRecords.map { ($0.relativePath, $0) }
+            )
+
+            for scanned in scannedFiles {
+                if var existing = existingByRelativePath.removeValue(forKey: scanned.relativePath) {
+                    if Self.hasContentChanged(existing: existing, comparedTo: scanned) {
+                        existing.fileSize = scanned.fileSize
+                        existing.modifiedAt = scanned.modifiedAt
+                        if !scanned.sha256.isEmpty {
+                            existing.sha256 = scanned.sha256
+                        }
+                        existing.glacierKey = ""
+                        existing.uploadedAt = nil
+                        existing.storageClass = FileRecord.deepArchiveStorageClass
+                        try existing.update(db)
+                    }
+                } else {
+                    var newRecord = scanned
+                    newRecord.sourcePath = sourceRoot
+                    newRecord.glacierKey = ""
+                    newRecord.uploadedAt = nil
+                    newRecord.storageClass = FileRecord.deepArchiveStorageClass
+                    try newRecord.insert(db)
+                }
+            }
+
+            for staleRecord in existingByRelativePath.values {
+                guard let id = staleRecord.id else {
+                    continue
+                }
+                _ = try FileRecord.deleteOne(db, key: id)
+            }
         }
     }
 
@@ -137,5 +178,22 @@ final class DatabaseService {
         }
 
         return migrator
+    }
+
+    private static func hasContentChanged(existing: FileRecord, comparedTo scanned: FileRecord) -> Bool {
+        if existing.fileSize != scanned.fileSize {
+            return true
+        }
+
+        let modifiedDelta = abs(existing.modifiedAt.timeIntervalSince(scanned.modifiedAt))
+        if modifiedDelta > 1 {
+            return true
+        }
+
+        if !scanned.sha256.isEmpty && existing.sha256 != scanned.sha256 {
+            return true
+        }
+
+        return false
     }
 }

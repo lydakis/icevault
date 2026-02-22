@@ -40,12 +40,17 @@ struct MenuBarView: View {
             }
 
             Button("Backup Now") {
-                Task {
-                    await appState.startManualBackup()
-                }
+                appState.startBackup()
             }
             .buttonStyle(.borderedProminent)
             .disabled(appState.currentJob?.isRunning == true)
+
+            if appState.currentJob?.isRunning == true {
+                Button("Cancel Backup") {
+                    appState.cancelBackup()
+                }
+                .buttonStyle(.bordered)
+            }
 
             Divider()
 

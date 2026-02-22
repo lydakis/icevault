@@ -32,6 +32,7 @@ final class AppState: ObservableObject {
     private let userDefaults: UserDefaults
     private let backupEngine: BackupEngine
     private var currentJobObserver: AnyCancellable?
+    private var backupTask: Task<Void, Never>?
 
     private static let settingsKey = "IceVault.settings"
     private static let historyKey = "IceVault.history"
@@ -81,8 +82,8 @@ final class AppState: ObservableObject {
         settings = newSettings
     }
 
-    func startManualBackup() async {
-        guard currentJob == nil else {
+    func startBackup() {
+        guard currentJob == nil, backupTask == nil else {
             return
         }
 
@@ -92,26 +93,46 @@ final class AppState: ObservableObject {
         let job = BackupJob(sourceRoot: sourceRoot, bucket: bucket, status: .scanning)
         currentJob = job
 
-        do {
-            try await backupEngine.run(job: job, settings: settings)
-            if job.status != .failed {
-                job.markCompleted()
+        backupTask = Task { [weak self] in
+            guard let self else {
+                return
             }
-        } catch {
-            job.markFailed(error.localizedDescription)
+            await executeBackup(job: job)
         }
+    }
 
-        var updatedHistory = history
-        updatedHistory.insert(job.historyEntry(), at: 0)
-        history = Array(updatedHistory.prefix(100))
+    func cancelBackup() {
+        backupTask?.cancel()
+    }
 
-        currentJob = nil
+    func startManualBackup() async {
+        startBackup()
+        await backupTask?.value
     }
 
     private func bindCurrentJob() {
         currentJobObserver = currentJob?.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
+    }
+
+    private func executeBackup(job: BackupJob) async {
+        do {
+            try await backupEngine.run(job: job, settings: settings)
+        } catch {
+            if !(error is CancellationError) && job.status != .failed {
+                job.markFailed(error.localizedDescription)
+            }
+        }
+
+        var updatedHistory = history
+        updatedHistory.insert(job.historyEntry(), at: 0)
+        history = Array(updatedHistory.prefix(100))
+
+        if currentJob?.id == job.id {
+            currentJob = nil
+        }
+        backupTask = nil
     }
 
     private func saveSettings() {
