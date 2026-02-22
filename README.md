@@ -38,6 +38,25 @@ Headless backup mode (used by LaunchAgent):
 swift run IceVault --backup
 ```
 
+## Quick Install (.app)
+
+```bash
+./scripts/build-app.sh && open build/IceVault.app
+```
+
+## Build DMG
+
+```bash
+./scripts/build-app.sh --dmg
+```
+
+## Manual Install
+
+```bash
+cp -R build/IceVault.app /Applications/
+open /Applications/IceVault.app
+```
+
 ## Least-Privilege IAM Policy
 
 Replace `YOUR_BUCKET_NAME` with your bucket. This policy scopes access to one bucket and only upload-related actions.
