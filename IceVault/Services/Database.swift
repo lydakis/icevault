@@ -79,9 +79,7 @@ final class DatabaseService {
                     if Self.hasContentChanged(existing: existing, comparedTo: scanned) {
                         existing.fileSize = scanned.fileSize
                         existing.modifiedAt = scanned.modifiedAt
-                        if !scanned.sha256.isEmpty {
-                            existing.sha256 = scanned.sha256
-                        }
+                        existing.sha256 = scanned.sha256
                         existing.glacierKey = ""
                         existing.uploadedAt = nil
                         existing.storageClass = FileRecord.deepArchiveStorageClass
@@ -185,12 +183,11 @@ final class DatabaseService {
             return true
         }
 
-        let modifiedDelta = abs(existing.modifiedAt.timeIntervalSince(scanned.modifiedAt))
-        if modifiedDelta > 1 {
+        if existing.sha256.isEmpty || scanned.sha256.isEmpty {
             return true
         }
 
-        if !scanned.sha256.isEmpty && existing.sha256 != scanned.sha256 {
+        if existing.sha256 != scanned.sha256 {
             return true
         }
 

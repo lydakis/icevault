@@ -27,6 +27,11 @@ let package = Package(
             resources: [
                 .process("Resources")
             ]
+        ),
+        .testTarget(
+            name: "IceVaultTests",
+            dependencies: ["IceVault"],
+            path: "Tests/IceVaultTests"
         )
     ]
 )

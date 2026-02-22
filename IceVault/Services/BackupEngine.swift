@@ -2,6 +2,7 @@ import Foundation
 
 enum BackupEngineError: LocalizedError {
     case invalidSettings(String)
+    case databaseUnavailable(String)
     case missingFileRecordID(String)
     case sourceFileMissing(String)
 
@@ -9,6 +10,8 @@ enum BackupEngineError: LocalizedError {
         switch self {
         case .invalidSettings(let message):
             return message
+        case .databaseUnavailable(let message):
+            return "Backup database unavailable: \(message)"
         case .missingFileRecordID(let relativePath):
             return "Missing database identifier for pending file: \(relativePath)"
         case .sourceFileMissing(let path):
@@ -20,15 +23,21 @@ enum BackupEngineError: LocalizedError {
 final class BackupEngine: @unchecked Sendable {
     typealias GlacierClientFactory = (_ accessKey: String, _ secretKey: String, _ sessionToken: String?, _ region: String) throws -> GlacierClient
 
+    private enum DatabaseState {
+        case available(DatabaseService)
+        case unavailable(String)
+    }
+
     private let scanner: FileScanner
     private let fileManager: FileManager
-    private let database: DatabaseService?
+    private let databaseState: DatabaseState
     private let glacierClientFactory: GlacierClientFactory
 
     init(
         scanner: FileScanner = FileScanner(),
         fileManager: FileManager = .default,
-        database: DatabaseService? = try? DatabaseService(),
+        database: DatabaseService? = nil,
+        databaseFactory: () throws -> DatabaseService = { try DatabaseService() },
         glacierClientFactory: @escaping GlacierClientFactory = { accessKey, secretKey, sessionToken, region in
             try GlacierClient(
                 accessKey: accessKey,
@@ -40,7 +49,15 @@ final class BackupEngine: @unchecked Sendable {
     ) {
         self.scanner = scanner
         self.fileManager = fileManager
-        self.database = database
+        if let database {
+            databaseState = .available(database)
+        } else {
+            do {
+                databaseState = .available(try databaseFactory())
+            } catch {
+                databaseState = .unavailable(error.localizedDescription)
+            }
+        }
         self.glacierClientFactory = glacierClientFactory
     }
 
@@ -50,6 +67,7 @@ final class BackupEngine: @unchecked Sendable {
 
         do {
             try validate(settings: settings, sourceRoot: sourceRoot, bucket: bucket)
+            let database = try resolveDatabase()
 
             await MainActor.run {
                 job.status = .scanning
@@ -62,7 +80,7 @@ final class BackupEngine: @unchecked Sendable {
             let scannedFiles = try scanner.scan(sourceRoot: sourceRoot)
             try Task.checkCancellation()
 
-            let pendingFiles = try pendingFilesAfterSync(scannedFiles: scannedFiles, sourceRoot: sourceRoot)
+            let pendingFiles = try pendingFilesAfterSync(scannedFiles: scannedFiles, sourceRoot: sourceRoot, database: database)
             let bytesTotal = pendingFiles.reduce(Int64(0)) { partialResult, record in
                 partialResult + max(record.fileSize, 0)
             }
@@ -120,9 +138,7 @@ final class BackupEngine: @unchecked Sendable {
                     }
                 }
 
-                if let database {
-                    try database.markUploaded(id: recordID, glacierKey: objectKey)
-                }
+                try database.markUploaded(id: recordID, glacierKey: objectKey)
 
                 completedFiles += 1
                 completedBytes += fileSize
@@ -151,11 +167,16 @@ final class BackupEngine: @unchecked Sendable {
         }
     }
 
-    private func pendingFilesAfterSync(scannedFiles: [FileRecord], sourceRoot: String) throws -> [FileRecord] {
-        guard let database else {
-            return scannedFiles
+    private func resolveDatabase() throws -> DatabaseService {
+        switch databaseState {
+        case .available(let database):
+            return database
+        case .unavailable(let message):
+            throw BackupEngineError.databaseUnavailable(message)
         }
+    }
 
+    private func pendingFilesAfterSync(scannedFiles: [FileRecord], sourceRoot: String, database: DatabaseService) throws -> [FileRecord] {
         try database.syncScannedFiles(scannedFiles, for: sourceRoot)
         return try database.pendingFiles(for: sourceRoot)
     }

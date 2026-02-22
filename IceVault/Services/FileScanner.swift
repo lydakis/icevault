@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 final class FileScanner {
@@ -11,7 +12,6 @@ final class FileScanner {
         let rootURL = URL(fileURLWithPath: sourceRoot, isDirectory: true).standardizedFileURL
         let keys: Set<URLResourceKey> = [
             .isRegularFileKey,
-            .isHiddenKey,
             .fileSizeKey,
             .contentModificationDateKey
         ]
@@ -19,7 +19,7 @@ final class FileScanner {
         guard let enumerator = fileManager.enumerator(
             at: rootURL,
             includingPropertiesForKeys: Array(keys),
-            options: [.skipsHiddenFiles, .skipsPackageDescendants],
+            options: [],
             errorHandler: { _, _ in
                 // Ignore inaccessible paths so one file doesn't fail the whole scan.
                 true
@@ -43,6 +43,10 @@ final class FileScanner {
             let relativePath = self.relativePath(of: fileURL, from: rootURL)
             let modifiedAt = values.contentModificationDate ?? Date.distantPast
             let fileSize = Int64(values.fileSize ?? 0)
+            guard let sha256 = try? Self.sha256Hex(for: fileURL) else {
+                // Keep scanning when a single file becomes unreadable.
+                continue
+            }
 
             records.append(
                 FileRecord(
@@ -50,7 +54,7 @@ final class FileScanner {
                     relativePath: relativePath,
                     fileSize: fileSize,
                     modifiedAt: modifiedAt,
-                    sha256: "",
+                    sha256: sha256,
                     glacierKey: "",
                     uploadedAt: nil,
                     storageClass: FileRecord.deepArchiveStorageClass
@@ -64,12 +68,7 @@ final class FileScanner {
     }
 
     private func shouldSkip(fileURL: URL) -> Bool {
-        let filename = fileURL.lastPathComponent
-        if filename == ".DS_Store" {
-            return true
-        }
-
-        return filename.hasPrefix(".")
+        fileURL.lastPathComponent == ".DS_Store"
     }
 
     private func relativePath(of fileURL: URL, from rootURL: URL) -> String {
@@ -87,5 +86,25 @@ final class FileScanner {
         }
 
         return String(suffix)
+    }
+
+    private static func sha256Hex(for fileURL: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: fileURL)
+        defer {
+            try? handle.close()
+        }
+
+        var hasher = SHA256()
+        let chunkSize = 1024 * 1024
+
+        while true {
+            let chunk = try handle.read(upToCount: chunkSize) ?? Data()
+            if chunk.isEmpty {
+                break
+            }
+            hasher.update(data: chunk)
+        }
+
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 }
