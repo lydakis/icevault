@@ -16,17 +16,26 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
     private var loginTask: Task<Void, Never>?
     private var isRequestingAuthorization = false
 
-    private static let checkInterval: TimeInterval = 60 * 60
-    private static let expiringSoonThreshold: TimeInterval = 24 * 60 * 60
-    private static let notificationCategoryIdentifier = "ICEVAULT_SSO_EXPIRY"
-    private static let refreshActionIdentifier = "ICEVAULT_SSO_REFRESH_LOGIN"
-    private static let notificationActionUserInfoKey = "icevaultAction"
+    nonisolated private static let checkInterval: TimeInterval = 60 * 60
+    nonisolated private static let expiringSoonThreshold: TimeInterval = 24 * 60 * 60
+    nonisolated private static let notificationCategoryIdentifier = "ICEVAULT_SSO_EXPIRY"
+    nonisolated private static let refreshActionIdentifier = "ICEVAULT_SSO_REFRESH_LOGIN"
+    nonisolated private static let notificationActionUserInfoKey = "icevaultAction"
     nonisolated private static let notificationProfileUserInfoKey = "profileName"
-    private static let notificationRefreshAction = "refreshSSOLogin"
-    private static let lastSoonEventKey = "IceVault.ssoMonitor.lastSoonEvent"
-    private static let lastSoonDateKey = "IceVault.ssoMonitor.lastSoonDate"
-    private static let lastExpiredEventKey = "IceVault.ssoMonitor.lastExpiredEvent"
-    private static let lastExpiredDateKey = "IceVault.ssoMonitor.lastExpiredDate"
+    nonisolated private static let notificationRefreshAction = "refreshSSOLogin"
+    nonisolated private static let lastSoonEventKey = "IceVault.ssoMonitor.lastSoonEvent"
+    nonisolated private static let lastSoonDateKey = "IceVault.ssoMonitor.lastSoonDate"
+    nonisolated private static let lastExpiredEventKey = "IceVault.ssoMonitor.lastExpiredEvent"
+    nonisolated private static let lastExpiredDateKey = "IceVault.ssoMonitor.lastExpiredDate"
+    nonisolated private static let supportsUserNotifications = {
+        let mainBundle = Bundle.main
+        guard mainBundle.bundleURL.pathExtension.caseInsensitiveCompare("app") == .orderedSame else {
+            return false
+        }
+
+        let packageType = mainBundle.object(forInfoDictionaryKey: "CFBundlePackageType") as? String
+        return packageType == "APPL"
+    }()
 
     private static let iso8601DateFormatterWithFractionalSeconds: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
@@ -88,6 +97,11 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
     }
 
     func requestNotificationPermissionIfNeeded() {
+        guard Self.supportsUserNotifications else {
+            notificationsAuthorized = false
+            return
+        }
+
         Task { [weak self] in
             guard let self else {
                 return
@@ -192,8 +206,8 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
     }
 
     private func configureNotificationCenter() {
-        guard Bundle.main.bundleIdentifier != nil else {
-            // Running outside a proper .app bundle (e.g. swift run) — skip notifications
+        guard Self.supportsUserNotifications else {
+            // Running outside a proper .app bundle (e.g. swift run) — all notifications are a no-op.
             return
         }
         let center = UNUserNotificationCenter.current()
@@ -214,6 +228,11 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
     }
 
     private func refreshNotificationAuthorizationStatus() async {
+        guard Self.supportsUserNotifications else {
+            notificationsAuthorized = false
+            return
+        }
+
         let settings = await UNUserNotificationCenter.current().notificationSettings()
         notificationsAuthorized = Self.isNotificationAuthorized(settings.authorizationStatus)
     }
@@ -291,6 +310,10 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
         body: String,
         profileName: String
     ) {
+        guard Self.supportsUserNotifications else {
+            return
+        }
+
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
