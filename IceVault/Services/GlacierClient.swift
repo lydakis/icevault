@@ -230,10 +230,25 @@ final class GlacierClient {
             return nil
         }
 
-        let startURL = trimmed(profileSection["sso_start_url"])
         let accountID = trimmed(profileSection["sso_account_id"])
         let roleName = trimmed(profileSection["sso_role_name"])
-        let ssoRegion = trimmed(profileSection["sso_region"])
+        let profileStartURL = trimmed(profileSection["sso_start_url"])
+        let profileSSORegion = trimmed(profileSection["sso_region"])
+        let linkedSessionName = trimmed(profileSection["sso_session"])
+        let linkedSessionSection: [String: String]
+        if linkedSessionName.isEmpty {
+            linkedSessionSection = [:]
+        } else {
+            linkedSessionSection = ssoSessionSection(named: linkedSessionName, in: sections) ?? [:]
+        }
+
+        let startURL = profileStartURL.isEmpty
+            ? trimmed(linkedSessionSection["sso_start_url"])
+            : profileStartURL
+        let ssoRegion = profileSSORegion.isEmpty
+            ? trimmed(linkedSessionSection["sso_region"])
+            : profileSSORegion
+
         guard !startURL.isEmpty, !accountID.isEmpty, !roleName.isEmpty, !ssoRegion.isEmpty else {
             return nil
         }
@@ -839,6 +854,29 @@ final class GlacierClient {
         } else {
             candidateSectionNames = ["profile \(normalizedProfileName)", normalizedProfileName]
         }
+
+        for sectionName in candidateSectionNames {
+            if let section = section(named: sectionName, in: sections) {
+                return section
+            }
+        }
+        return nil
+    }
+
+    private static func ssoSessionSection(
+        named sessionName: String,
+        in sections: [String: [String: String]]
+    ) -> [String: String]? {
+        let normalizedSessionName = trimmed(sessionName)
+        guard !normalizedSessionName.isEmpty else {
+            return nil
+        }
+
+        let candidateSectionNames = [
+            "sso-session \(normalizedSessionName)",
+            "sso_session \(normalizedSessionName)",
+            normalizedSessionName
+        ]
 
         for sectionName in candidateSectionNames {
             if let section = section(named: sectionName, in: sections) {
