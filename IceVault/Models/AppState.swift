@@ -246,9 +246,9 @@ final class AppState: ObservableObject {
         }
 
         switch ssoSessionStatus {
-        case .valid(let expiresAt):
+        case .some(.valid(let expiresAt)):
             return "Session valid (expires \(expiresAt.formatted(date: .abbreviated, time: .omitted)))"
-        case .expired:
+        case .some(.expired):
             return "Session expired ⚠️"
         case .some(.missingToken):
             return "Session missing - refresh login"
@@ -274,8 +274,8 @@ final class AppState: ObservableObject {
             return "Backup paused: run `aws sso login --profile \(resolvedProfileName)`."
         case .some(.expired(let expiresAt)):
             return "Backup paused: SSO session expired at \(expiresAt.formatted(date: .abbreviated, time: .shortened))."
-        case .valid, .none:
-            return "Backup paused: SSO login is required."
+        case .some(.valid), .none:
+            return nil
         }
     }
 
