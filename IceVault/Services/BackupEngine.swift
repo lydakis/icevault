@@ -4,8 +4,7 @@ enum BackupEngineError: Error {
     case notImplemented
 }
 
-@MainActor
-final class BackupEngine {
+final class BackupEngine: @unchecked Sendable {
     private let scanner: FileScanner
     private let database: DatabaseService?
 
