@@ -3,6 +3,40 @@ import AWSSDKIdentity
 import Foundation
 import Smithy
 
+enum CredentialSource: String, Codable, CaseIterable, Sendable {
+    case keychain
+    case awsCLI
+    case environment
+
+    var displayLabel: String {
+        switch self {
+        case .keychain:
+            return "Keychain"
+        case .awsCLI:
+            return "~/.aws/credentials"
+        case .environment:
+            return "Environment variables"
+        }
+    }
+
+    var settingsDescription: String {
+        switch self {
+        case .keychain:
+            return "Using credentials from Keychain."
+        case .awsCLI:
+            return "Using credentials from ~/.aws/credentials."
+        case .environment:
+            return "Using credentials from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY."
+        }
+    }
+}
+
+struct ResolvedCredentials: Equatable, Sendable {
+    let credentials: AWSCredentials
+    let region: String?
+    let credentialSource: CredentialSource
+}
+
 enum GlacierClientError: LocalizedError {
     case invalidCredentials
     case invalidRegion(String)
@@ -80,6 +114,64 @@ final class GlacierClient {
 
         self.s3Client = S3Client(config: config)
         self.fileManager = fileManager
+    }
+
+    static func resolveCredentials(
+        keychainCredentials: AWSCredentials?,
+        preferredRegion: String?,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        fileManager: FileManager = .default
+    ) -> ResolvedCredentials? {
+        if let normalizedKeychainCredentials = normalized(credentials: keychainCredentials) {
+            return ResolvedCredentials(
+                credentials: normalizedKeychainCredentials,
+                region: resolveRegion(preferredRegion: preferredRegion, environment: environment, fileManager: fileManager),
+                credentialSource: .keychain
+            )
+        }
+
+        if let awsCLICredentials = credentialsFromAWSCLI(fileManager: fileManager) {
+            return ResolvedCredentials(
+                credentials: awsCLICredentials,
+                region: resolveRegion(preferredRegion: preferredRegion, environment: environment, fileManager: fileManager),
+                credentialSource: .awsCLI
+            )
+        }
+
+        if let environmentCredentials = credentialsFromEnvironment(environment) {
+            return ResolvedCredentials(
+                credentials: environmentCredentials,
+                region: resolveRegion(preferredRegion: preferredRegion, environment: environment, fileManager: fileManager),
+                credentialSource: .environment
+            )
+        }
+
+        return nil
+    }
+
+    static func credentialsFromAWSCLI(fileManager: FileManager = .default) -> AWSCredentials? {
+        let credentialsURL = awsDirectoryURL(fileManager: fileManager).appendingPathComponent("credentials")
+        guard let defaultProfile = parseDefaultProfile(from: credentialsURL, fileManager: fileManager) else {
+            return nil
+        }
+
+        let accessKey = trimmed(defaultProfile["aws_access_key_id"])
+        let secretKey = trimmed(defaultProfile["aws_secret_access_key"])
+        guard !accessKey.isEmpty, !secretKey.isEmpty else {
+            return nil
+        }
+
+        return AWSCredentials(accessKey: accessKey, secretKey: secretKey)
+    }
+
+    static func regionFromAWSConfig(fileManager: FileManager = .default) -> String? {
+        let configURL = awsDirectoryURL(fileManager: fileManager).appendingPathComponent("config")
+        guard let defaultProfile = parseDefaultProfile(from: configURL, fileManager: fileManager) else {
+            return nil
+        }
+
+        let region = trimmed(defaultProfile["region"])
+        return region.isEmpty ? nil : region
     }
 
     @discardableResult
@@ -331,5 +423,140 @@ final class GlacierClient {
         } else {
             fileHandle.closeFile()
         }
+    }
+
+    private static func resolveRegion(
+        preferredRegion: String?,
+        environment: [String: String],
+        fileManager: FileManager
+    ) -> String? {
+        let normalizedPreferredRegion = trimmed(preferredRegion)
+        if !normalizedPreferredRegion.isEmpty {
+            return normalizedPreferredRegion
+        }
+
+        if let configRegion = regionFromAWSConfig(fileManager: fileManager) {
+            return configRegion
+        }
+
+        let environmentRegion = trimmed(environment["AWS_REGION"])
+        if !environmentRegion.isEmpty {
+            return environmentRegion
+        }
+
+        let fallbackEnvironmentRegion = trimmed(environment["AWS_DEFAULT_REGION"])
+        if !fallbackEnvironmentRegion.isEmpty {
+            return fallbackEnvironmentRegion
+        }
+
+        return nil
+    }
+
+    private static func normalized(credentials: AWSCredentials?) -> AWSCredentials? {
+        guard let credentials else {
+            return nil
+        }
+
+        let accessKey = trimmed(credentials.accessKey)
+        let secretKey = trimmed(credentials.secretKey)
+        guard !accessKey.isEmpty, !secretKey.isEmpty else {
+            return nil
+        }
+
+        return AWSCredentials(accessKey: accessKey, secretKey: secretKey)
+    }
+
+    private static func credentialsFromEnvironment(_ environment: [String: String]) -> AWSCredentials? {
+        let accessKey = trimmed(environment["AWS_ACCESS_KEY_ID"])
+        let secretKey = trimmed(environment["AWS_SECRET_ACCESS_KEY"])
+        guard !accessKey.isEmpty, !secretKey.isEmpty else {
+            return nil
+        }
+
+        return AWSCredentials(accessKey: accessKey, secretKey: secretKey)
+    }
+
+    private static func parseDefaultProfile(from fileURL: URL, fileManager: FileManager) -> [String: String]? {
+        let sections = parseINI(from: fileURL, fileManager: fileManager)
+        if let exactDefault = section(named: "default", in: sections) {
+            return exactDefault
+        }
+        return section(named: "profile default", in: sections)
+    }
+
+    private static func section(named expectedName: String, in sections: [String: [String: String]]) -> [String: String]? {
+        sections.first(where: { $0.key.caseInsensitiveCompare(expectedName) == .orderedSame })?.value
+    }
+
+    private static func parseINI(from fileURL: URL, fileManager: FileManager) -> [String: [String: String]] {
+        guard
+            fileManager.fileExists(atPath: fileURL.path),
+            let data = try? Data(contentsOf: fileURL),
+            var contents = String(data: data, encoding: .utf8)
+        else {
+            return [:]
+        }
+
+        contents = contents
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+
+        var sections: [String: [String: String]] = [:]
+        var currentSection = ""
+
+        for rawLine in contents.components(separatedBy: .newlines) {
+            var line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty {
+                continue
+            }
+
+            if let firstCharacter = line.first, firstCharacter == "#" || firstCharacter == ";" {
+                continue
+            }
+
+            if let commentStart = line.firstIndex(where: { $0 == "#" || $0 == ";" }) {
+                line = String(line[..<commentStart]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if line.isEmpty {
+                    continue
+                }
+            }
+
+            if line.hasPrefix("[") && line.hasSuffix("]") {
+                currentSection = String(line.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+                continue
+            }
+
+            guard !currentSection.isEmpty else {
+                continue
+            }
+
+            let keyValue = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard keyValue.count == 2 else {
+                continue
+            }
+
+            let key = String(keyValue[0])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            let value = String(keyValue[1])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+
+            guard !key.isEmpty else {
+                continue
+            }
+
+            sections[currentSection, default: [:]][key] = value
+        }
+
+        return sections
+    }
+
+    private static func awsDirectoryURL(fileManager: FileManager) -> URL {
+        fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent(".aws", isDirectory: true)
+    }
+
+    private static func trimmed(_ value: String?) -> String {
+        (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

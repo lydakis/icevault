@@ -7,6 +7,8 @@ struct SettingsView: View {
     @State private var draft = AppState.Settings()
     @State private var accessKey = ""
     @State private var secretKey = ""
+    @State private var detectedCredentialSource: CredentialSource?
+    @State private var scheduleInstalled = false
     @State private var savedAt: Date?
     @State private var saveMessage: String?
     @State private var saveSucceeded = false
@@ -40,7 +42,17 @@ struct SettingsView: View {
                 SecureField("Secret Access Key", text: $secretKey)
                     .textContentType(.password)
 
-                Text("Credentials are stored in macOS Keychain.")
+                if let detectedCredentialSource {
+                    Text(detectedCredentialSource.settingsDescription)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("No credentials detected. Enter credentials manually or run aws configure.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Text("Saved credentials are stored in macOS Keychain.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -70,6 +82,33 @@ struct SettingsView: View {
                         chooseSourceFolder()
                     }
                 }
+            }
+
+            Section("Scheduling") {
+                Toggle("Scheduled Backups", isOn: $draft.scheduledBackupsEnabled)
+
+                if draft.scheduledBackupsEnabled {
+                    Picker("Interval", selection: $draft.scheduleInterval) {
+                        ForEach(AppState.Settings.ScheduleInterval.allCases) { interval in
+                            Text(interval.displayName).tag(interval)
+                        }
+                    }
+                    .pickerStyle(.menu)
+
+                    if draft.scheduleInterval == .customHours {
+                        Stepper(value: $draft.customIntervalHours, in: 1...168) {
+                            Text("Every \(draft.customIntervalHours) hour\(draft.customIntervalHours == 1 ? "" : "s")")
+                        }
+                    }
+
+                    Text("LaunchAgent: ~/Library/LaunchAgents/com.icevault.backup.plist")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Text(scheduleInstalled ? "LaunchAgent is installed." : "LaunchAgent is not installed.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section {
@@ -129,20 +168,8 @@ struct SettingsView: View {
 
     private func loadDraft() {
         draft = appState.settings
-        do {
-            if let credentials = try appState.loadStoredCredentials() {
-                accessKey = credentials.accessKey
-                secretKey = credentials.secretKey
-            } else {
-                accessKey = ""
-                secretKey = ""
-            }
-        } catch {
-            accessKey = ""
-            secretKey = ""
-            saveMessage = error.localizedDescription
-            saveSucceeded = false
-        }
+        scheduleInstalled = appState.scheduledBackupsInstalled()
+        applyDetectedCredentials(prefillFields: true)
     }
 
     private func saveSettings() {
@@ -163,11 +190,15 @@ struct SettingsView: View {
             normalizedSettings.bucket = trimmed(draft.bucket)
             normalizedSettings.awsRegion = trimmed(draft.awsRegion)
             normalizedSettings.sourcePath = trimmed(draft.sourcePath)
+            normalizedSettings.customIntervalHours = min(max(draft.customIntervalHours, 1), 168)
             appState.updateSettings(normalizedSettings)
+            _ = try appState.applyScheduledBackups()
+            scheduleInstalled = appState.scheduledBackupsInstalled()
 
             savedAt = Date()
             saveMessage = "Settings saved."
             saveSucceeded = true
+            applyDetectedCredentials(prefillFields: false)
         } catch {
             saveMessage = error.localizedDescription
             saveSucceeded = false
@@ -186,23 +217,28 @@ struct SettingsView: View {
         Task { @MainActor in
             do {
                 let credentials: AWSCredentials
+                let resolvedRegion: String
 
                 if normalizedAccessKey.isEmpty && normalizedSecretKey.isEmpty {
-                    guard let storedCredentials = try appState.loadStoredCredentials() else {
-                        throw KeychainServiceError.incompleteCredentials
+                    guard let resolvedCredentials = appState.resolveCredentials(preferredRegion: region) else {
+                        throw GlacierClientError.invalidCredentials
                     }
-                    credentials = storedCredentials
+                    credentials = resolvedCredentials.credentials
+                    resolvedRegion = trimmed(resolvedCredentials.region ?? region)
+                } else if normalizedAccessKey.isEmpty || normalizedSecretKey.isEmpty {
+                    throw KeychainServiceError.incompleteCredentials
                 } else {
                     credentials = AWSCredentials(
                         accessKey: normalizedAccessKey,
                         secretKey: normalizedSecretKey
                     )
+                    resolvedRegion = region
                 }
 
                 try await appState.testConnection(
                     accessKey: credentials.accessKey,
                     secretKey: credentials.secretKey,
-                    region: region,
+                    region: resolvedRegion,
                     bucket: bucket
                 )
 
@@ -232,5 +268,27 @@ struct SettingsView: View {
 
     private func trimmed(_ value: String) -> String {
         value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func applyDetectedCredentials(prefillFields: Bool) {
+        let resolved = appState.resolveCredentials(preferredRegion: draft.awsRegion)
+        detectedCredentialSource = resolved?.credentialSource
+
+        guard prefillFields else {
+            return
+        }
+
+        guard let resolved else {
+            accessKey = ""
+            secretKey = ""
+            return
+        }
+
+        accessKey = resolved.credentials.accessKey
+        secretKey = resolved.credentials.secretKey
+
+        if trimmed(draft.awsRegion).isEmpty, let detectedRegion = resolved.region {
+            draft.awsRegion = detectedRegion
+        }
     }
 }

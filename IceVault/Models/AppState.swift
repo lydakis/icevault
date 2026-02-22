@@ -4,16 +4,43 @@ import Foundation
 @MainActor
 final class AppState: ObservableObject {
     struct Settings: Codable, Equatable {
+        enum ScheduleInterval: String, Codable, CaseIterable, Identifiable {
+            case daily
+            case weekly
+            case customHours
+
+            var id: String {
+                rawValue
+            }
+
+            var displayName: String {
+                switch self {
+                case .daily:
+                    return "Daily"
+                case .weekly:
+                    return "Weekly"
+                case .customHours:
+                    return "Custom (Hours)"
+                }
+            }
+        }
+
         var awsAccessKey: String = ""
         var awsSecretKey: String = ""
         var awsRegion: String = "us-east-1"
         var bucket: String = ""
         var sourcePath: String = ""
+        var scheduledBackupsEnabled: Bool = false
+        var scheduleInterval: ScheduleInterval = .daily
+        var customIntervalHours: Int = 24
 
         enum CodingKeys: String, CodingKey {
             case awsRegion
             case bucket
             case sourcePath
+            case scheduledBackupsEnabled
+            case scheduleInterval
+            case customIntervalHours
         }
 
         init(
@@ -21,13 +48,19 @@ final class AppState: ObservableObject {
             awsSecretKey: String = "",
             awsRegion: String = "us-east-1",
             bucket: String = "",
-            sourcePath: String = ""
+            sourcePath: String = "",
+            scheduledBackupsEnabled: Bool = false,
+            scheduleInterval: ScheduleInterval = .daily,
+            customIntervalHours: Int = 24
         ) {
             self.awsAccessKey = awsAccessKey
             self.awsSecretKey = awsSecretKey
             self.awsRegion = awsRegion
             self.bucket = bucket
             self.sourcePath = sourcePath
+            self.scheduledBackupsEnabled = scheduledBackupsEnabled
+            self.scheduleInterval = scheduleInterval
+            self.customIntervalHours = max(1, customIntervalHours)
         }
 
         init(from decoder: Decoder) throws {
@@ -37,6 +70,9 @@ final class AppState: ObservableObject {
             awsRegion = try container.decodeIfPresent(String.self, forKey: .awsRegion) ?? "us-east-1"
             bucket = try container.decodeIfPresent(String.self, forKey: .bucket) ?? ""
             sourcePath = try container.decodeIfPresent(String.self, forKey: .sourcePath) ?? ""
+            scheduledBackupsEnabled = try container.decodeIfPresent(Bool.self, forKey: .scheduledBackupsEnabled) ?? false
+            scheduleInterval = try container.decodeIfPresent(ScheduleInterval.self, forKey: .scheduleInterval) ?? .daily
+            customIntervalHours = max(1, try container.decodeIfPresent(Int.self, forKey: .customIntervalHours) ?? 24)
         }
 
         func encode(to encoder: Encoder) throws {
@@ -44,6 +80,9 @@ final class AppState: ObservableObject {
             try container.encode(awsRegion, forKey: .awsRegion)
             try container.encode(bucket, forKey: .bucket)
             try container.encode(sourcePath, forKey: .sourcePath)
+            try container.encode(scheduledBackupsEnabled, forKey: .scheduledBackupsEnabled)
+            try container.encode(scheduleInterval, forKey: .scheduleInterval)
+            try container.encode(customIntervalHours, forKey: .customIntervalHours)
         }
     }
 
@@ -65,28 +104,34 @@ final class AppState: ObservableObject {
         }
     }
 
-    @Published private(set) var hasStoredCredentials: Bool
+    @Published private(set) var hasAvailableCredentials: Bool
+    @Published private(set) var credentialSource: CredentialSource?
 
     private let userDefaults: UserDefaults
     private let backupEngine: BackupEngine
     private let keychainService: KeychainService
+    private let launchAgent: LaunchAgent
     private var currentJobObserver: AnyCancellable?
     private var backupTask: Task<Void, Never>?
 
     private static let settingsKey = "IceVault.settings"
     private static let historyKey = "IceVault.history"
+    private static let launchAgentLabel = "com.icevault.backup"
 
     init(
         userDefaults: UserDefaults = .standard,
         backupEngine: BackupEngine = BackupEngine(),
-        keychainService: KeychainService = KeychainService()
+        keychainService: KeychainService = KeychainService(),
+        launchAgent: LaunchAgent = LaunchAgent()
     ) {
         self.userDefaults = userDefaults
         self.backupEngine = backupEngine
         self.keychainService = keychainService
+        self.launchAgent = launchAgent
         self.settings = Self.loadSettings(from: userDefaults, key: Self.settingsKey)
         self.history = Self.loadHistory(from: userDefaults, key: Self.historyKey)
-        self.hasStoredCredentials = false
+        self.hasAvailableCredentials = false
+        self.credentialSource = nil
 
         refreshCredentialState()
         saveSettings()
@@ -128,7 +173,7 @@ final class AppState: ObservableObject {
     }
 
     var isConfigured: Bool {
-        hasStoredCredentials
+        hasAvailableCredentials
             && !Self.trimmed(settings.awsRegion).isEmpty
             && !Self.trimmed(settings.bucket).isEmpty
             && !Self.trimmed(settings.sourcePath).isEmpty
@@ -141,7 +186,9 @@ final class AppState: ObservableObject {
         sanitized.awsRegion = Self.trimmed(sanitized.awsRegion)
         sanitized.bucket = Self.trimmed(sanitized.bucket)
         sanitized.sourcePath = Self.trimmed(sanitized.sourcePath)
+        sanitized.customIntervalHours = min(max(sanitized.customIntervalHours, 1), 168)
         settings = sanitized
+        refreshCredentialState()
     }
 
     func loadStoredCredentials() throws -> AWSCredentials? {
@@ -150,16 +197,54 @@ final class AppState: ObservableObject {
 
     func saveCredentials(accessKey: String, secretKey: String) throws {
         try keychainService.save(accessKey: accessKey, secretKey: secretKey)
-        hasStoredCredentials = true
+        refreshCredentialState()
     }
 
     func deleteStoredCredentials() throws {
         try keychainService.deleteCredentials()
-        hasStoredCredentials = false
+        refreshCredentialState()
     }
 
     func clearHistory() {
         history = []
+    }
+
+    func resolveCredentials(preferredRegion: String? = nil) -> ResolvedCredentials? {
+        let keychainCredentials: AWSCredentials?
+        do {
+            keychainCredentials = try keychainService.loadCredentials()
+        } catch {
+            keychainCredentials = nil
+        }
+
+        return GlacierClient.resolveCredentials(
+            keychainCredentials: keychainCredentials,
+            preferredRegion: preferredRegion
+        )
+    }
+
+    @discardableResult
+    func applyScheduledBackups() throws -> Bool {
+        let executablePath = Self.currentExecutablePath()
+        guard !executablePath.isEmpty else {
+            throw LaunchAgentError.invalidExecutablePath
+        }
+
+        if settings.scheduledBackupsEnabled {
+            try launchAgent.install(
+                label: Self.launchAgentLabel,
+                executablePath: executablePath,
+                interval: launchAgentInterval(for: settings)
+            )
+            return true
+        }
+
+        try launchAgent.uninstall(label: Self.launchAgentLabel)
+        return false
+    }
+
+    func scheduledBackupsInstalled() -> Bool {
+        launchAgent.isInstalled(label: Self.launchAgentLabel)
     }
 
     func testConnection(accessKey: String, secretKey: String, region: String, bucket: String) async throws {
@@ -208,20 +293,19 @@ final class AppState: ObservableObject {
     private func executeBackup(job: BackupJob) async {
         var runtimeSettings = settings
 
-        do {
-            if let credentials = try keychainService.loadCredentials() {
-                runtimeSettings.awsAccessKey = credentials.accessKey
-                runtimeSettings.awsSecretKey = credentials.secretKey
-                hasStoredCredentials = true
-            } else {
-                runtimeSettings.awsAccessKey = ""
-                runtimeSettings.awsSecretKey = ""
-                hasStoredCredentials = false
+        if let resolvedCredentials = resolveCredentials(preferredRegion: runtimeSettings.awsRegion) {
+            runtimeSettings.awsAccessKey = resolvedCredentials.credentials.accessKey
+            runtimeSettings.awsSecretKey = resolvedCredentials.credentials.secretKey
+            if Self.trimmed(runtimeSettings.awsRegion).isEmpty, let detectedRegion = resolvedCredentials.region {
+                runtimeSettings.awsRegion = detectedRegion
             }
-        } catch {
+            hasAvailableCredentials = true
+            credentialSource = resolvedCredentials.credentialSource
+        } else {
             runtimeSettings.awsAccessKey = ""
             runtimeSettings.awsSecretKey = ""
-            hasStoredCredentials = false
+            hasAvailableCredentials = false
+            credentialSource = nil
         }
 
         do {
@@ -259,11 +343,9 @@ final class AppState: ObservableObject {
     }
 
     private func refreshCredentialState() {
-        do {
-            hasStoredCredentials = try keychainService.loadCredentials() != nil
-        } catch {
-            hasStoredCredentials = false
-        }
+        let resolvedCredentials = resolveCredentials(preferredRegion: settings.awsRegion)
+        hasAvailableCredentials = resolvedCredentials != nil
+        credentialSource = resolvedCredentials?.credentialSource
     }
 
     private static func loadSettings(from userDefaults: UserDefaults, key: String) -> Settings {
@@ -290,5 +372,26 @@ final class AppState: ObservableObject {
 
     private static func trimmed(_ value: String) -> String {
         value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func launchAgentInterval(for settings: Settings) -> LaunchAgent.ScheduleInterval {
+        switch settings.scheduleInterval {
+        case .daily:
+            return .daily()
+        case .weekly:
+            return .weekly()
+        case .customHours:
+            return .customHours(min(max(settings.customIntervalHours, 1), 168))
+        }
+    }
+
+    private static func currentExecutablePath() -> String {
+        if
+            let executablePath = Bundle.main.executableURL?.path,
+            !trimmed(executablePath).isEmpty
+        {
+            return trimmed(executablePath)
+        }
+        return trimmed(CommandLine.arguments.first ?? "")
     }
 }
