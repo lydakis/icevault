@@ -93,6 +93,16 @@ final class DatabaseService {
         }
     }
 
+    func pendingMultipartUpload(bucket: String, key: String) throws -> MultipartUploadRecord? {
+        try dbQueue.read { db in
+            try MultipartUploadRecord
+                .filter(MultipartUploadRecord.Columns.bucket == bucket)
+                .filter(MultipartUploadRecord.Columns.key == key)
+                .order(MultipartUploadRecord.Columns.lastUpdatedAt.desc)
+                .fetchOne(db)
+        }
+    }
+
     func pendingFiles(for sourceRoot: String) throws -> [FileRecord] {
         try dbQueue.read { db in
             try FileRecord
@@ -247,6 +257,12 @@ final class DatabaseService {
                 on: MultipartUploadRecord.databaseTableName,
                 columns: ["lastUpdatedAt"]
             )
+        }
+
+        migrator.registerMigration("addMultipartUploadResumeToken") { db in
+            try db.alter(table: MultipartUploadRecord.databaseTableName) { table in
+                table.add(column: "resumeToken", .text).notNull().defaults(to: "")
+            }
         }
 
         return migrator

@@ -344,6 +344,12 @@ final class GlacierClient {
 
         let attributes = try fileManager.attributesOfItem(atPath: fileURL.path)
         let fileSize = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+        let fileModifiedAt = (attributes[.modificationDate] as? Date) ?? Date.distantPast
+        let multipartResumeToken = Self.multipartResumeToken(
+            fileSize: fileSize,
+            modifiedAt: fileModifiedAt,
+            sha256: multipartSHA256(fileRecordID: fileRecordId)
+        )
         let resolvedStorageClass = try Self.resolveStorageClass(storageClass)
 
         if fileSize > Self.multipartThresholdBytes {
@@ -354,6 +360,7 @@ final class GlacierClient {
                 key: normalizedKey,
                 storageClass: resolvedStorageClass,
                 fileRecordID: fileRecordId,
+                resumeToken: multipartResumeToken,
                 onProgress: onProgress
             )
         } else {
@@ -418,6 +425,7 @@ final class GlacierClient {
         key: String,
         storageClass: S3ClientTypes.StorageClass,
         fileRecordID: Int64?,
+        resumeToken: String,
         onProgress: ((Int64) -> Void)?
     ) async throws {
         let partSize = Self.partSize(for: fileSize)
@@ -427,6 +435,7 @@ final class GlacierClient {
             key: key,
             storageClass: storageClass,
             fileRecordID: fileRecordID,
+            resumeToken: resumeToken,
             totalParts: totalParts
         )
 
@@ -577,31 +586,36 @@ final class GlacierClient {
         key: String,
         storageClass: S3ClientTypes.StorageClass,
         fileRecordID: Int64?,
+        resumeToken: String,
         totalParts: Int
     ) async throws -> MultipartUploadState {
         if let existingRecord = try existingMultipartUploadRecord(bucket: bucket, key: key) {
-            do {
-                let verifiedCompletedParts = try await verifiedCompletedParts(
-                    bucket: bucket,
-                    key: key,
-                    uploadID: existingRecord.uploadId,
-                    totalParts: totalParts
-                )
+            if existingRecord.resumeToken == resumeToken {
+                do {
+                    let verifiedCompletedParts = try await verifiedCompletedParts(
+                        bucket: bucket,
+                        key: key,
+                        uploadID: existingRecord.uploadId,
+                        totalParts: totalParts
+                    )
 
-                var state = MultipartUploadState(
-                    uploadID: existingRecord.uploadId,
-                    record: existingRecord,
-                    completedPartsByNumber: verifiedCompletedParts
-                )
-                try updateMultipartProgressInDatabase(uploadState: &state)
-                return state
-            } catch {
-                let underlyingError = Self.unwrapOperationError(error)
-                if Self.httpStatusCode(for: underlyingError) == 404, let recordID = existingRecord.id {
-                    _ = try? database?.deleteMultipartUpload(id: recordID)
-                } else {
-                    throw error
+                    var state = MultipartUploadState(
+                        uploadID: existingRecord.uploadId,
+                        record: existingRecord,
+                        completedPartsByNumber: verifiedCompletedParts
+                    )
+                    try updateMultipartProgressInDatabase(uploadState: &state)
+                    return state
+                } catch {
+                    let underlyingError = Self.unwrapOperationError(error)
+                    if Self.httpStatusCode(for: underlyingError) == 404, let recordID = existingRecord.id {
+                        _ = try? database?.deleteMultipartUpload(id: recordID)
+                    } else {
+                        throw error
+                    }
                 }
+            } else {
+                await invalidateMultipartUploadRecord(existingRecord)
             }
         }
 
@@ -625,6 +639,7 @@ final class GlacierClient {
                 bucket: bucket,
                 key: key,
                 uploadId: uploadID,
+                resumeToken: resumeToken,
                 totalParts: totalParts,
                 completedPartsJSON: "[]",
                 createdAt: Date(),
@@ -646,8 +661,48 @@ final class GlacierClient {
             return nil
         }
 
-        return try database.pendingMultipartUploads()
-            .first(where: { $0.bucket == bucket && $0.key == key })
+        return try database.pendingMultipartUpload(bucket: bucket, key: key)
+    }
+
+    private func invalidateMultipartUploadRecord(_ record: MultipartUploadRecord) async {
+        do {
+            _ = try await performS3Operation("abortMultipartUpload") {
+                try await s3Client.abortMultipartUpload(
+                    input: AbortMultipartUploadInput(
+                        bucket: record.bucket,
+                        key: record.key,
+                        uploadId: record.uploadId
+                    )
+                )
+            }
+        } catch {
+            let underlyingError = Self.unwrapOperationError(error)
+            if Self.httpStatusCode(for: underlyingError) != 404 {
+                print(
+                    "Failed to abort mismatched multipart upload \(record.uploadId): \(underlyingError.localizedDescription)"
+                )
+            }
+        }
+
+        if let recordID = record.id {
+            _ = try? database?.deleteMultipartUpload(id: recordID)
+        }
+    }
+
+    private func multipartSHA256(fileRecordID: Int64?) -> String? {
+        guard let fileRecordID, let database else {
+            return nil
+        }
+
+        do {
+            guard let fileRecord = try database.fetchFile(id: fileRecordID) else {
+                return nil
+            }
+            let normalizedHash = fileRecord.sha256.trimmingCharacters(in: .whitespacesAndNewlines)
+            return normalizedHash.isEmpty ? nil : normalizedHash
+        } catch {
+            return nil
+        }
     }
 
     private func verifiedCompletedParts(
@@ -839,6 +894,16 @@ final class GlacierClient {
 
         let encodedParts = try JSONEncoder().encode(orderedParts)
         return String(decoding: encodedParts, as: UTF8.self)
+    }
+
+    private static func multipartResumeToken(
+        fileSize: Int64,
+        modifiedAt: Date,
+        sha256: String?
+    ) -> String {
+        let modifiedAtNanoseconds = Int64((modifiedAt.timeIntervalSince1970 * 1_000_000_000).rounded(.towardZero))
+        let normalizedHash = sha256?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return "\(fileSize):\(modifiedAtNanoseconds):\(normalizedHash)"
     }
 
     private static func normalizedObjectKey(_ key: String) -> String {

@@ -9,6 +9,7 @@ struct MultipartUploadRecord: Codable, FetchableRecord, MutablePersistableRecord
     var bucket: String
     var key: String
     var uploadId: String
+    var resumeToken: String
     var totalParts: Int
     var completedPartsJSON: String
     var createdAt: Date
@@ -20,6 +21,7 @@ struct MultipartUploadRecord: Codable, FetchableRecord, MutablePersistableRecord
         bucket: String,
         key: String,
         uploadId: String,
+        resumeToken: String = "",
         totalParts: Int,
         completedPartsJSON: String = "[]",
         createdAt: Date = Date(),
@@ -30,6 +32,7 @@ struct MultipartUploadRecord: Codable, FetchableRecord, MutablePersistableRecord
         self.bucket = bucket
         self.key = key
         self.uploadId = uploadId
+        self.resumeToken = resumeToken
         self.totalParts = totalParts
         self.completedPartsJSON = completedPartsJSON
         self.createdAt = createdAt
@@ -46,6 +49,7 @@ struct MultipartUploadRecord: Codable, FetchableRecord, MutablePersistableRecord
         case bucket
         case key
         case uploadId
+        case resumeToken
         case totalParts
         case completedPartsJSON
         case createdAt
