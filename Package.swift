@@ -11,7 +11,7 @@ let package = Package(
         .executable(name: "IceVault", targets: ["IceVault"])
     ],
     dependencies: [
-        .package(url: "https://github.com/groue/GRDB.swift", from: "7.0.0"),
+        .package(url: "https://github.com/groue/GRDB.swift", from: "6.0.0"),
         .package(url: "https://github.com/awslabs/aws-sdk-swift", from: "1.0.0"),
         .package(url: "https://github.com/kishikawakatsumi/KeychainAccess", from: "4.2.2")
     ],
