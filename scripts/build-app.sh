@@ -128,6 +128,14 @@ mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
 cp "${BINARY_PATH}" "${MACOS_DIR}/${APP_NAME}"
 chmod +x "${MACOS_DIR}/${APP_NAME}"
 
+ICON_PATH="${REPO_ROOT}/assets/logos/IceVault.icns"
+if [[ -f "${ICON_PATH}" ]]; then
+  cp "${ICON_PATH}" "${RESOURCES_DIR}/IceVault.icns"
+  echo "Icon included: IceVault.icns"
+else
+  echo "Warning: Icon not found at ${ICON_PATH}" >&2
+fi
+
 RESOURCE_BUNDLE_COUNT=0
 while IFS= read -r bundle; do
   [[ -n "${bundle}" ]] || continue
@@ -150,6 +158,8 @@ cat > "${INFO_PLIST_PATH}" <<EOF_PLIST
   <string>${APP_NAME}</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
+  <key>CFBundleIconFile</key>
+  <string>IceVault.icns</string>
   <key>CFBundleVersion</key>
   <string>${VERSION}</string>
   <key>CFBundleShortVersionString</key>
