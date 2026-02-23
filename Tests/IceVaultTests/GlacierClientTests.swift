@@ -4,6 +4,47 @@ import XCTest
 @testable import IceVault
 
 final class GlacierClientTests: XCTestCase {
+    func testCredentialSourceProvidesStableUserFacingDescriptions() {
+        let cases: [(CredentialSource, String, String)] = [
+            (.keychain, "Keychain", "Using credentials from Keychain."),
+            (.sso(profileName: "dev"), "SSO Profile (dev)", "Using temporary credentials from SSO profile 'dev'."),
+            (.awsCLI, "~/.aws/credentials", "Using credentials from ~/.aws/credentials."),
+            (.environment, "Environment variables", "Using credentials from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.")
+        ]
+
+        for (source, expectedLabel, expectedDescription) in cases {
+            XCTAssertEqual(source.displayLabel, expectedLabel)
+            XCTAssertEqual(source.settingsDescription, expectedDescription)
+        }
+    }
+
+    func testGlacierClientErrorDescriptionsRemainActionable() {
+        XCTAssertEqual(GlacierClientError.invalidCredentials.errorDescription, "AWS credentials are missing.")
+        XCTAssertEqual(GlacierClientError.invalidRegion("bad-region").errorDescription, "AWS region is invalid: bad-region")
+        XCTAssertEqual(GlacierClientError.invalidBucket.errorDescription, "S3 bucket is required.")
+        XCTAssertEqual(GlacierClientError.invalidObjectKey.errorDescription, "S3 object key is required.")
+        XCTAssertEqual(GlacierClientError.fileNotFound("/tmp/file").errorDescription, "Local file not found: /tmp/file")
+        XCTAssertEqual(GlacierClientError.unreadableFile("/tmp/file").errorDescription, "Unable to read local file: /tmp/file")
+        XCTAssertEqual(GlacierClientError.unsupportedStorageClass("BAD").errorDescription, "Unsupported S3 storage class: BAD")
+        XCTAssertEqual(GlacierClientError.missingMultipartUploadID.errorDescription, "S3 did not return a multipart upload ID.")
+        XCTAssertEqual(
+            GlacierClientError.missingMultipartETag(partNumber: 7).errorDescription,
+            "S3 did not return an ETag for uploaded part 7."
+        )
+        XCTAssertEqual(
+            GlacierClientError.incompleteFileRead(expectedBytes: 10, actualBytes: 8).errorDescription,
+            "Read 8 bytes but expected 10 bytes."
+        )
+        XCTAssertTrue(
+            GlacierClientError.s3OperationFailed(
+                operation: "putObject",
+                underlying: MockS3Error.syntheticFailure
+            )
+            .errorDescription?
+            .contains("S3 putObject failed") == true
+        )
+    }
+
     func testUploadFileMultipartReusesPendingUploadWhenResumeTokenMatches() async throws {
         let database = try makeDatabaseService()
         let workingDirectory = try makeTemporaryDirectory(prefix: "IceVaultTests-Glacier")
@@ -221,10 +262,321 @@ final class GlacierClientTests: XCTestCase {
         }
     }
 
+    func testResolveCredentialsFallsBackToEnvironmentAndRegion() throws {
+        let home = try makeTemporaryDirectory(prefix: "IceVaultTests-ResolveEnv")
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let resolved = GlacierClient.resolveCredentials(
+            keychainCredentials: nil,
+            authMethod: .staticKeys,
+            ssoProfileName: nil,
+            preferredRegion: nil,
+            environment: [
+                "AWS_ACCESS_KEY_ID": "  ENV_ACCESS  ",
+                "AWS_SECRET_ACCESS_KEY": "  ENV_SECRET  ",
+                "AWS_SESSION_TOKEN": "  ENV_TOKEN  ",
+                "AWS_REGION": " us-east-2 "
+            ],
+            fileManager: TestHomeFileManager(homeDirectory: home)
+        )
+
+        XCTAssertEqual(resolved?.credentials.accessKey, "ENV_ACCESS")
+        XCTAssertEqual(resolved?.credentials.secretKey, "ENV_SECRET")
+        XCTAssertEqual(resolved?.credentials.sessionToken, "ENV_TOKEN")
+        XCTAssertEqual(resolved?.region, "us-east-2")
+        XCTAssertEqual(resolved?.credentialSource, .environment)
+    }
+
+    func testResolveCredentialsFallsBackToAWSCLIProfileAndConfigRegion() throws {
+        let home = try makeTemporaryDirectory(prefix: "IceVaultTests-ResolveCLI")
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let awsDirectory = home.appendingPathComponent(".aws", isDirectory: true)
+        try FileManager.default.createDirectory(at: awsDirectory, withIntermediateDirectories: true)
+        try """
+        [default]
+        aws_access_key_id = AKIA_CLI_KEY
+        aws_secret_access_key = cli-secret
+        """
+        .data(using: .utf8)?
+        .write(to: awsDirectory.appendingPathComponent("credentials"))
+        try """
+        [default]
+        region = us-west-1
+        """
+        .data(using: .utf8)?
+        .write(to: awsDirectory.appendingPathComponent("config"))
+
+        let resolved = GlacierClient.resolveCredentials(
+            keychainCredentials: nil,
+            authMethod: .staticKeys,
+            ssoProfileName: nil,
+            preferredRegion: nil,
+            environment: [:],
+            fileManager: TestHomeFileManager(homeDirectory: home)
+        )
+
+        XCTAssertEqual(resolved?.credentials.accessKey, "AKIA_CLI_KEY")
+        XCTAssertEqual(resolved?.credentials.secretKey, "cli-secret")
+        XCTAssertEqual(resolved?.region, "us-west-1")
+        XCTAssertEqual(resolved?.credentialSource, .awsCLI)
+    }
+
+    func testResolveCredentialsUsesSSOProfileAndCLIProcessOutput() throws {
+        let home = try makeTemporaryDirectory(prefix: "IceVaultTests-ResolveSSO")
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let fileManager = TestHomeFileManager(homeDirectory: home)
+        let awsDirectory = home.appendingPathComponent(".aws", isDirectory: true)
+        let ssoCacheDirectory = awsDirectory
+            .appendingPathComponent("sso", isDirectory: true)
+            .appendingPathComponent("cache", isDirectory: true)
+        try FileManager.default.createDirectory(at: ssoCacheDirectory, withIntermediateDirectories: true)
+
+        try """
+        [profile dev]
+        sso_session = company-session
+        sso_account_id = 123456789012
+        sso_role_name = Admin
+        region = us-east-1
+
+        [sso-session company-session]
+        sso_start_url = https://example.awsapps.com/start
+        sso_region = us-west-2
+        """
+        .data(using: .utf8)?
+        .write(to: awsDirectory.appendingPathComponent("config"))
+
+        try """
+        {
+          "startUrl": "https://example.awsapps.com/start",
+          "accessToken": "token",
+          "expiresAt": "2099-01-01T00:00:00Z"
+        }
+        """
+        .data(using: .utf8)?
+        .write(to: ssoCacheDirectory.appendingPathComponent("token.json"))
+
+        let fakeCLIPath = try makeFakeAWSCLI(
+            in: home,
+            jsonResponse: """
+            {"Version":1,"AccessKeyId":"AKIA_SSO_KEY","SecretAccessKey":"sso-secret","SessionToken":"sso-token","Expiration":"2099-01-02T00:00:00Z"}
+            """
+        )
+        let environment = [
+            "PATH": "\(fakeCLIPath.deletingLastPathComponent().path):\(ProcessInfo.processInfo.environment["PATH"] ?? "")"
+        ]
+
+        let resolved = GlacierClient.resolveCredentials(
+            keychainCredentials: nil,
+            authMethod: .ssoProfile,
+            ssoProfileName: " dev ",
+            preferredRegion: nil,
+            environment: environment,
+            fileManager: fileManager
+        )
+
+        XCTAssertEqual(resolved?.credentials.accessKey, "AKIA_SSO_KEY")
+        XCTAssertEqual(resolved?.credentials.secretKey, "sso-secret")
+        XCTAssertEqual(resolved?.credentials.sessionToken, "sso-token")
+        XCTAssertEqual(resolved?.region, "us-east-1")
+        XCTAssertEqual(resolved?.credentialSource, .sso(profileName: "dev"))
+        XCTAssertNotNil(resolved?.expiration)
+    }
+
+    func testResolveCredentialsReturnsNilWhenNoProvidersAreAvailable() throws {
+        let home = try makeTemporaryDirectory(prefix: "IceVaultTests-ResolveNone")
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let resolved = GlacierClient.resolveCredentials(
+            keychainCredentials: nil,
+            authMethod: .staticKeys,
+            ssoProfileName: nil,
+            preferredRegion: nil,
+            environment: [:],
+            fileManager: TestHomeFileManager(homeDirectory: home)
+        )
+
+        XCTAssertNil(resolved)
+    }
+
+    func testVerifyBucketAccessValidatesInputAndCallsHeadBucket() async throws {
+        let s3 = MockGlacierS3Client()
+        let client = GlacierClient(s3Client: s3)
+
+        do {
+            try await client.verifyBucketAccess(bucket: "   ")
+            XCTFail("Expected invalid bucket error")
+        } catch let error as GlacierClientError {
+            guard case .invalidBucket = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+
+        try await client.verifyBucketAccess(bucket: "test-bucket")
+        XCTAssertEqual(s3.headBucketInputs.count, 1)
+        XCTAssertEqual(s3.headBucketInputs.first?.bucket, "test-bucket")
+    }
+
+    func testUploadFileValidationRejectsInvalidKeyStorageClassAndMissingFile() async throws {
+        let s3 = MockGlacierS3Client()
+        let client = GlacierClient(s3Client: s3, multipartThreshold: 1_000_000)
+        let directory = try makeTemporaryDirectory(prefix: "IceVaultTests-UploadValidation")
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let fileURL = directory.appendingPathComponent("payload.txt")
+        try Data("payload".utf8).write(to: fileURL)
+
+        do {
+            _ = try await client.uploadFile(
+                localPath: fileURL.path,
+                bucket: "bucket",
+                key: " / ",
+                storageClass: FileRecord.deepArchiveStorageClass
+            )
+            XCTFail("Expected invalid key error")
+        } catch let error as GlacierClientError {
+            guard case .invalidObjectKey = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+
+        do {
+            _ = try await client.uploadFile(
+                localPath: fileURL.path,
+                bucket: "bucket",
+                key: "file.txt",
+                storageClass: "NOT_A_STORAGE_CLASS"
+            )
+            XCTFail("Expected unsupported storage class error")
+        } catch let error as GlacierClientError {
+            guard case .unsupportedStorageClass(let value) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(value, "NOT_A_STORAGE_CLASS")
+        }
+
+        do {
+            _ = try await client.uploadFile(
+                localPath: directory.appendingPathComponent("missing.bin").path,
+                bucket: "bucket",
+                key: "missing.bin",
+                storageClass: FileRecord.deepArchiveStorageClass
+            )
+            XCTFail("Expected missing file error")
+        } catch let error as GlacierClientError {
+            guard case .fileNotFound = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testUploadFileWrapsS3ErrorsForSinglePartUploads() async throws {
+        let s3 = MockGlacierS3Client()
+        s3.putObjectError = MockS3Error.syntheticFailure
+
+        let client = GlacierClient(s3Client: s3, multipartThreshold: 1_000_000)
+        let directory = try makeTemporaryDirectory(prefix: "IceVaultTests-UploadFailure")
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let fileURL = directory.appendingPathComponent("payload.txt")
+        try Data("payload".utf8).write(to: fileURL)
+
+        do {
+            _ = try await client.uploadFile(
+                localPath: fileURL.path,
+                bucket: "bucket",
+                key: "payload.txt",
+                storageClass: FileRecord.deepArchiveStorageClass
+            )
+            XCTFail("Expected wrapped S3 failure")
+        } catch let error as GlacierClientError {
+            guard case .s3OperationFailed(let operation, let underlying) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(operation, "putObject")
+            XCTAssertTrue(underlying is MockS3Error)
+        }
+    }
+
+    func testAbortStaleMultipartUploadsAbortsOnlyExpiredRecords() async throws {
+        let database = try makeDatabaseService()
+        let directory = try makeTemporaryDirectory(prefix: "IceVaultTests-AbortStale")
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        var fileRecord = FileRecord(
+            sourcePath: directory.path,
+            relativePath: "payload.bin",
+            fileSize: 10,
+            modifiedAt: Date(),
+            sha256: "hash",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&fileRecord)
+        let fileRecordID = try XCTUnwrap(fileRecord.id)
+
+        let staleDate = Date().addingTimeInterval(-8_000)
+        let freshDate = Date()
+
+        var stale = MultipartUploadRecord(
+            fileRecordId: fileRecordID,
+            bucket: "bucket",
+            key: "old.bin",
+            uploadId: "old-upload-id",
+            resumeToken: "old",
+            totalParts: 1,
+            completedPartsJSON: "[]",
+            createdAt: staleDate,
+            lastUpdatedAt: staleDate
+        )
+        var fresh = MultipartUploadRecord(
+            fileRecordId: fileRecordID,
+            bucket: "bucket",
+            key: "new.bin",
+            uploadId: "new-upload-id",
+            resumeToken: "new",
+            totalParts: 1,
+            completedPartsJSON: "[]",
+            createdAt: freshDate,
+            lastUpdatedAt: freshDate
+        )
+        try database.insertMultipartUpload(&stale)
+        try database.insertMultipartUpload(&fresh)
+
+        let s3 = MockGlacierS3Client()
+        let client = GlacierClient(s3Client: s3, database: database)
+        await client.abortStaleMultipartUploads(olderThan: 3_600)
+
+        XCTAssertEqual(s3.abortMultipartUploadInputs.count, 1)
+        XCTAssertEqual(s3.abortMultipartUploadInputs.first?.uploadId, "old-upload-id")
+
+        let remaining = try database.pendingMultipartUploads()
+        XCTAssertEqual(remaining.count, 1)
+        XCTAssertEqual(remaining.first?.uploadId, "new-upload-id")
+    }
+
     private func makeDatabaseService() throws -> DatabaseService {
         let directory = try makeTemporaryDirectory(prefix: "IceVaultTests-GlacierDB")
         let databaseURL = directory.appendingPathComponent("icevault.sqlite")
         return try DatabaseService(databaseURL: databaseURL)
+    }
+
+    private func makeFakeAWSCLI(in directory: URL, jsonResponse: String) throws -> URL {
+        let binDirectory = directory.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: binDirectory, withIntermediateDirectories: true)
+        let scriptURL = binDirectory.appendingPathComponent("aws")
+        let script = """
+        #!/bin/sh
+        cat <<'JSON'
+        \(jsonResponse)
+        JSON
+        exit 0
+        """
+        try script.data(using: .utf8)?.write(to: scriptURL)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+        return scriptURL
     }
 }
 
@@ -244,29 +596,51 @@ private final class MockGlacierS3Client: GlacierS3Client {
     var putObjectOutput = PutObjectOutput()
     var headBucketOutput = HeadBucketOutput()
     var listPartsOutputs: [ListPartsOutput] = [ListPartsOutput(isTruncated: false, nextPartNumberMarker: nil, parts: [])]
+    var createMultipartUploadError: Error?
+    var uploadPartError: Error?
+    var completeMultipartUploadError: Error?
+    var abortMultipartUploadError: Error?
+    var listPartsError: Error?
+    var putObjectError: Error?
+    var headBucketError: Error?
 
     func createMultipartUpload(input: CreateMultipartUploadInput) async throws -> CreateMultipartUploadOutput {
         createMultipartUploadInputs.append(input)
+        if let createMultipartUploadError {
+            throw createMultipartUploadError
+        }
         return createMultipartUploadOutput
     }
 
     func uploadPart(input: UploadPartInput) async throws -> UploadPartOutput {
         uploadPartInputs.append(input)
+        if let uploadPartError {
+            throw uploadPartError
+        }
         return uploadPartOutput
     }
 
     func completeMultipartUpload(input: CompleteMultipartUploadInput) async throws -> CompleteMultipartUploadOutput {
         completeMultipartUploadInputs.append(input)
+        if let completeMultipartUploadError {
+            throw completeMultipartUploadError
+        }
         return completeMultipartUploadOutput
     }
 
     func abortMultipartUpload(input: AbortMultipartUploadInput) async throws -> AbortMultipartUploadOutput {
         abortMultipartUploadInputs.append(input)
+        if let abortMultipartUploadError {
+            throw abortMultipartUploadError
+        }
         return abortMultipartUploadOutput
     }
 
     func listParts(input: ListPartsInput) async throws -> ListPartsOutput {
         listPartsInputs.append(input)
+        if let listPartsError {
+            throw listPartsError
+        }
         if !listPartsOutputs.isEmpty {
             return listPartsOutputs.removeFirst()
         }
@@ -275,11 +649,21 @@ private final class MockGlacierS3Client: GlacierS3Client {
 
     func putObject(input: PutObjectInput) async throws -> PutObjectOutput {
         putObjectInputs.append(input)
+        if let putObjectError {
+            throw putObjectError
+        }
         return putObjectOutput
     }
 
     func headBucket(input: HeadBucketInput) async throws -> HeadBucketOutput {
         headBucketInputs.append(input)
+        if let headBucketError {
+            throw headBucketError
+        }
         return headBucketOutput
     }
+}
+
+private enum MockS3Error: Error {
+    case syntheticFailure
 }

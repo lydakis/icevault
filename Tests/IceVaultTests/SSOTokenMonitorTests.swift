@@ -95,6 +95,164 @@ final class SSOTokenMonitorTests: XCTestCase {
         XCTAssertEqual(recorder.profiles, ["dev"])
     }
 
+    func testRefreshNowReportsMissingProfileWhenConfiguredProfileIsAbsent() throws {
+        let home = try makeTemporaryDirectory(prefix: "IceVaultTests-SSOMonitor")
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let fileManager = TestHomeFileManager(homeDirectory: home)
+        let (userDefaults, suiteName) = makeUserDefaults()
+        defer { clearUserDefaults(userDefaults, suiteName: suiteName) }
+
+        let monitor = SSOTokenMonitor(
+            fileManager: fileManager,
+            userDefaults: userDefaults,
+            autoStart: false
+        )
+        monitor.configure(profileName: "missing")
+        monitor.refreshNow(now: Date(timeIntervalSince1970: 1_700_000_000))
+
+        XCTAssertEqual(monitor.status, .missingProfile)
+        XCTAssertNil(monitor.sessionExpiresAt())
+        XCTAssertFalse(monitor.isSessionValid(now: Date(timeIntervalSince1970: 1_700_000_000)))
+    }
+
+    func testRefreshNowReportsMissingTokenWhenProfileExistsButCachesAreEmpty() throws {
+        let home = try makeTemporaryDirectory(prefix: "IceVaultTests-SSOMonitor")
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let fileManager = TestHomeFileManager(homeDirectory: home)
+        let (userDefaults, suiteName) = makeUserDefaults()
+        defer { clearUserDefaults(userDefaults, suiteName: suiteName) }
+
+        try writeSSOProfile(named: "dev", startURL: "https://example.awsapps.com/start", in: home)
+
+        let monitor = SSOTokenMonitor(
+            fileManager: fileManager,
+            userDefaults: userDefaults,
+            autoStart: false
+        )
+        monitor.configure(profileName: "dev")
+        monitor.refreshNow(now: Date(timeIntervalSince1970: 1_700_000_000))
+
+        XCTAssertEqual(monitor.status, .missingToken)
+        XCTAssertNil(monitor.sessionExpiresAt())
+        XCTAssertNil(monitor.timeUntilExpiry(now: Date(timeIntervalSince1970: 1_700_000_000)))
+    }
+
+    func testRefreshNowReportsExpiredAndTimeUntilExpiryCanBeNegative() throws {
+        let home = try makeTemporaryDirectory(prefix: "IceVaultTests-SSOMonitor")
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let fileManager = TestHomeFileManager(homeDirectory: home)
+        let (userDefaults, suiteName) = makeUserDefaults()
+        defer { clearUserDefaults(userDefaults, suiteName: suiteName) }
+
+        try writeSSOProfile(named: "dev", startURL: "https://example.awsapps.com/start", in: home)
+        try writeSSOTokenCache(
+            startURL: "https://example.awsapps.com/start",
+            expiresAt: "2020-01-01T00:00:00Z",
+            at: home
+        )
+
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let monitor = SSOTokenMonitor(
+            fileManager: fileManager,
+            userDefaults: userDefaults,
+            autoStart: false
+        )
+        monitor.configure(profileName: "dev")
+        monitor.refreshNow(now: now)
+
+        guard case .expired(let expiresAt) = monitor.status else {
+            return XCTFail("Expected expired status, got \(String(describing: monitor.status))")
+        }
+
+        XCTAssertLessThan(expiresAt, now)
+        XCTAssertFalse(monitor.isSessionValid(now: now))
+        XCTAssertTrue((monitor.timeUntilExpiry(now: now) ?? 0) < 0)
+    }
+
+    func testRefreshNowParsesAWSDateFormatsFromSSOCache() throws {
+        let home = try makeTemporaryDirectory(prefix: "IceVaultTests-SSOMonitor")
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let fileManager = TestHomeFileManager(homeDirectory: home)
+        let (userDefaults, suiteName) = makeUserDefaults()
+        defer { clearUserDefaults(userDefaults, suiteName: suiteName) }
+
+        try writeSSOProfile(named: "dev", startURL: "https://example.awsapps.com/start", in: home)
+
+        let monitor = SSOTokenMonitor(
+            fileManager: fileManager,
+            userDefaults: userDefaults,
+            autoStart: false
+        )
+        monitor.configure(profileName: "dev")
+
+        try writeSSOTokenCache(
+            startURL: "https://example.awsapps.com/start",
+            expiresAt: "2030-01-01T00:00:00UTC",
+            at: home
+        )
+        monitor.refreshNow(now: Date(timeIntervalSince1970: 1_700_000_000))
+        guard case .valid(let utcExpiry) = monitor.status else {
+            return XCTFail("Expected valid status for UTC format, got \(String(describing: monitor.status))")
+        }
+        XCTAssertEqual(utcExpiry.timeIntervalSince1970, 1_893_456_000, accuracy: 1)
+
+        try writeSSOTokenCache(
+            startURL: "https://example.awsapps.com/start",
+            expiresAt: "2030-01-01T00:00:00+0000",
+            at: home
+        )
+        monitor.refreshNow(now: Date(timeIntervalSince1970: 1_700_000_000))
+        guard case .valid(let offsetExpiry) = monitor.status else {
+            return XCTFail("Expected valid status for offset format, got \(String(describing: monitor.status))")
+        }
+        XCTAssertEqual(offsetExpiry.timeIntervalSince1970, 1_893_456_000, accuracy: 1)
+    }
+
+    func testConfigureWithBlankProfileClearsStatusAndSessionExpiry() throws {
+        let home = try makeTemporaryDirectory(prefix: "IceVaultTests-SSOMonitor")
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let fileManager = TestHomeFileManager(homeDirectory: home)
+        let (userDefaults, suiteName) = makeUserDefaults()
+        defer { clearUserDefaults(userDefaults, suiteName: suiteName) }
+
+        try writeSSOProfile(named: "dev", startURL: "https://example.awsapps.com/start", in: home)
+        try writeSSOTokenCache(
+            startURL: "https://example.awsapps.com/start",
+            expiresAt: "2030-01-01T00:00:00Z",
+            at: home
+        )
+
+        let monitor = SSOTokenMonitor(
+            fileManager: fileManager,
+            userDefaults: userDefaults,
+            autoStart: false
+        )
+        monitor.configure(profileName: "dev")
+        monitor.refreshNow(now: Date(timeIntervalSince1970: 1_700_000_000))
+        XCTAssertNotNil(monitor.status)
+        XCTAssertNotNil(monitor.sessionExpiresAt())
+
+        monitor.configure(profileName: "   ")
+        XCTAssertNil(monitor.status)
+        XCTAssertNil(monitor.sessionExpiresAt())
+        XCTAssertNil(monitor.timeUntilExpiry())
+    }
+
+    func testRequestNotificationPermissionNoAppBundleKeepsNotificationsUnauthorized() {
+        let (userDefaults, suiteName) = makeUserDefaults()
+        defer { clearUserDefaults(userDefaults, suiteName: suiteName) }
+
+        let monitor = SSOTokenMonitor(userDefaults: userDefaults, autoStart: false)
+        monitor.requestNotificationPermissionIfNeeded()
+
+        XCTAssertFalse(monitor.notificationsAuthorized)
+    }
+
     private func makeUserDefaults() -> (UserDefaults, String) {
         let suiteName = "IceVaultTests-SSOMonitor-\(UUID().uuidString)"
         return (UserDefaults(suiteName: suiteName) ?? .standard, suiteName)

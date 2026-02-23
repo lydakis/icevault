@@ -869,6 +869,11 @@ final class GlacierClient {
         guard let storageClass = S3ClientTypes.StorageClass(rawValue: value) else {
             throw GlacierClientError.unsupportedStorageClass(value)
         }
+
+        if case .sdkUnknown = storageClass {
+            throw GlacierClientError.unsupportedStorageClass(value)
+        }
+
         return storageClass
     }
 
