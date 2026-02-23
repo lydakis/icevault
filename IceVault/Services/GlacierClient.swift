@@ -999,34 +999,6 @@ final class GlacierClient {
         }
     }
 
-    private static let iso8601DateFormatterWithFractionalSeconds: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter
-    }()
-
-    private static let iso8601DateFormatter: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter
-    }()
-
-    private static let awsUTCDateFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'UTC'"
-        return formatter
-    }()
-
-    private static let awsOffsetDateFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ssZ"
-        return formatter
-    }()
-
     private static func resolveRegion(
         preferredRegion: String?,
         authMethod: AppState.Settings.AuthenticationMethod,
@@ -1204,18 +1176,30 @@ final class GlacierClient {
             return nil
         }
 
-        if let date = iso8601DateFormatterWithFractionalSeconds.date(from: normalizedValue) {
+        let iso8601WithFractionalSeconds = ISO8601DateFormatter()
+        iso8601WithFractionalSeconds.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = iso8601WithFractionalSeconds.date(from: normalizedValue) {
             return date
         }
 
-        if let date = iso8601DateFormatter.date(from: normalizedValue) {
+        let iso8601 = ISO8601DateFormatter()
+        iso8601.formatOptions = [.withInternetDateTime]
+        if let date = iso8601.date(from: normalizedValue) {
             return date
         }
 
+        let awsUTCDateFormatter = DateFormatter()
+        awsUTCDateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        awsUTCDateFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+        awsUTCDateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'UTC'"
         if let date = awsUTCDateFormatter.date(from: normalizedValue) {
             return date
         }
 
+        let awsOffsetDateFormatter = DateFormatter()
+        awsOffsetDateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        awsOffsetDateFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+        awsOffsetDateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ssZ"
         return awsOffsetDateFormatter.date(from: normalizedValue)
     }
 

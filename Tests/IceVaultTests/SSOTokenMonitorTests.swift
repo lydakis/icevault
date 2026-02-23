@@ -253,6 +253,31 @@ final class SSOTokenMonitorTests: XCTestCase {
         XCTAssertFalse(monitor.notificationsAuthorized)
     }
 
+    func testDeinitInvalidatesMonitoringTimer() throws {
+        let (userDefaults, suiteName) = makeUserDefaults()
+        defer { clearUserDefaults(userDefaults, suiteName: suiteName) }
+
+        var createdTimer: Timer?
+        var monitor: SSOTokenMonitor? = SSOTokenMonitor(
+            userDefaults: userDefaults,
+            autoStart: true,
+            monitoringTimerFactory: { interval, repeats, block in
+                let timer = Timer(timeInterval: interval, repeats: repeats, block: block)
+                createdTimer = timer
+                return timer
+            }
+        )
+
+        let timer = try XCTUnwrap(createdTimer)
+        XCTAssertTrue(timer.isValid)
+        XCTAssertNotNil(monitor)
+
+        monitor = nil
+        RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+
+        XCTAssertFalse(timer.isValid)
+    }
+
     private func makeUserDefaults() -> (UserDefaults, String) {
         let suiteName = "IceVaultTests-SSOMonitor-\(UUID().uuidString)"
         return (UserDefaults(suiteName: suiteName) ?? .standard, suiteName)

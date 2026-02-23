@@ -17,8 +17,8 @@ IceVault focuses on low-cost archival backups with a native SwiftUI menu bar exp
 
 - macOS 14+ (Sonoma)
 - AWS account with S3 access
-- Xcode 15+ (for Xcode workflow)
-- Swift 5.9+ (for SwiftPM workflow)
+- Xcode 16+ (for Xcode workflow)
+- Swift 6.1+ (for SwiftPM workflow)
 
 ## Build
 

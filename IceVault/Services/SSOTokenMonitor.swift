@@ -3,7 +3,12 @@ import UserNotifications
 
 @MainActor
 final class SSOTokenMonitor: NSObject, ObservableObject {
-    typealias SSOLoginRunner = (_ profileName: String) -> Int32
+    typealias SSOLoginRunner = @Sendable (_ profileName: String) -> Int32
+    typealias MonitoringTimerFactory = @MainActor (
+        _ interval: TimeInterval,
+        _ repeats: Bool,
+        _ block: @escaping @Sendable (Timer) -> Void
+    ) -> Timer
 
     @Published private(set) var status: SSOTokenStatus?
     @Published private(set) var sessionExpiry: Date?
@@ -13,9 +18,10 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
     private let fileManager: FileManager
     private let userDefaults: UserDefaults
     private let ssoLoginRunner: SSOLoginRunner
+    private let monitoringTimerFactory: MonitoringTimerFactory
 
     private var monitoredProfileName: String?
-    private var monitorTimer: Timer?
+    nonisolated(unsafe) private var monitorTimer: Timer?
     private var loginTask: Task<Void, Never>?
     private var isRequestingAuthorization = false
 
@@ -40,43 +46,19 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
         return packageType == "APPL"
     }()
 
-    private static let iso8601DateFormatterWithFractionalSeconds: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter
-    }()
-
-    private static let iso8601DateFormatter: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter
-    }()
-
-    private static let awsUTCDateFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'UTC'"
-        return formatter
-    }()
-
-    private static let awsOffsetDateFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ssZ"
-        return formatter
-    }()
-
     init(
         fileManager: FileManager = .default,
         userDefaults: UserDefaults = .standard,
         autoStart: Bool = true,
-        ssoLoginRunner: @escaping SSOLoginRunner = SSOTokenMonitor.runSSOLoginProcess
+        ssoLoginRunner: @escaping SSOLoginRunner = SSOTokenMonitor.runSSOLoginProcess,
+        monitoringTimerFactory: @escaping MonitoringTimerFactory = { interval, repeats, block in
+            Timer(timeInterval: interval, repeats: repeats, block: block)
+        }
     ) {
         self.fileManager = fileManager
         self.userDefaults = userDefaults
         self.ssoLoginRunner = ssoLoginRunner
+        self.monitoringTimerFactory = monitoringTimerFactory
         self.status = nil
         self.sessionExpiry = nil
         self.notificationsAuthorized = false
@@ -95,7 +77,14 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
     }
 
     deinit {
-        monitorTimer?.invalidate()
+        let timer = monitorTimer
+        if Thread.isMainThread {
+            timer?.invalidate()
+        } else {
+            DispatchQueue.main.async {
+                timer?.invalidate()
+            }
+        }
     }
 
     func configure(profileName: String?) {
@@ -204,7 +193,7 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
 
     private func startMonitoringTimer() {
         monitorTimer?.invalidate()
-        let timer = Timer(timeInterval: Self.checkInterval, repeats: true) { [weak self] _ in
+        let timer = monitoringTimerFactory(Self.checkInterval, true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.refreshNow()
             }
@@ -509,18 +498,30 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
             return nil
         }
 
-        if let date = iso8601DateFormatterWithFractionalSeconds.date(from: normalizedValue) {
+        let iso8601WithFractionalSeconds = ISO8601DateFormatter()
+        iso8601WithFractionalSeconds.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = iso8601WithFractionalSeconds.date(from: normalizedValue) {
             return date
         }
 
-        if let date = iso8601DateFormatter.date(from: normalizedValue) {
+        let iso8601 = ISO8601DateFormatter()
+        iso8601.formatOptions = [.withInternetDateTime]
+        if let date = iso8601.date(from: normalizedValue) {
             return date
         }
 
+        let awsUTCDateFormatter = DateFormatter()
+        awsUTCDateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        awsUTCDateFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+        awsUTCDateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'UTC'"
         if let date = awsUTCDateFormatter.date(from: normalizedValue) {
             return date
         }
 
+        let awsOffsetDateFormatter = DateFormatter()
+        awsOffsetDateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        awsOffsetDateFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+        awsOffsetDateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ssZ"
         return awsOffsetDateFormatter.date(from: normalizedValue)
     }
 

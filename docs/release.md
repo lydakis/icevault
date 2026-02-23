@@ -9,9 +9,11 @@ Workflow: `.github/workflows/release.yml`
 When a tag like `v0.2.0` is pushed:
 
 1. Build `arm64` DMG on `macos-14`
-2. Build `x86_64` DMG on `macos-13`
+2. Build `x86_64` DMG on `macos-15-intel`
 3. Publish both DMGs + `checksums.txt` to GitHub Releases
 4. Update Homebrew tap cask in `lydakis/homebrew-icevault`
+
+The workflow explicitly selects the latest stable Xcode available on each runner.
 
 ## Build Locally
 
