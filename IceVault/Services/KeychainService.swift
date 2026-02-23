@@ -1,6 +1,33 @@
 import Foundation
 import KeychainAccess
 
+protocol KeychainStore {
+    func set(_ value: String, key: String) throws
+    func get(_ key: String) throws -> String?
+    func remove(_ key: String) throws
+}
+
+private struct SystemKeychainStore: KeychainStore {
+    private let keychain: Keychain
+
+    init(service: String) {
+        self.keychain = Keychain(service: service)
+            .accessibility(.whenUnlocked)
+    }
+
+    func set(_ value: String, key: String) throws {
+        try keychain.set(value, key: key)
+    }
+
+    func get(_ key: String) throws -> String? {
+        try keychain.get(key)
+    }
+
+    func remove(_ key: String) throws {
+        try keychain.remove(key)
+    }
+}
+
 struct AWSCredentials: Equatable, Sendable {
     let accessKey: String
     let secretKey: String
@@ -20,7 +47,7 @@ struct AWSCredentials: Equatable, Sendable {
     }
 }
 
-enum KeychainServiceError: LocalizedError {
+enum KeychainServiceError: LocalizedError, Equatable {
     case incompleteCredentials
 
     var errorDescription: String? {
@@ -37,11 +64,14 @@ final class KeychainService {
         static let secretKey = "aws.secret_key"
     }
 
-    private let keychain: Keychain
+    private let keychain: any KeychainStore
 
-    init(service: String = KeychainService.defaultServiceName) {
-        self.keychain = Keychain(service: service)
-            .accessibility(.whenUnlocked)
+    init(service: String = KeychainService.defaultServiceName, keychain: (any KeychainStore)? = nil) {
+        if let keychain {
+            self.keychain = keychain
+        } else {
+            self.keychain = SystemKeychainStore(service: service)
+        }
     }
 
     func save(accessKey: String, secretKey: String) throws {

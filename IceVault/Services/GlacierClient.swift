@@ -101,6 +101,18 @@ enum GlacierClientError: LocalizedError {
     }
 }
 
+protocol GlacierS3Client {
+    func createMultipartUpload(input: CreateMultipartUploadInput) async throws -> CreateMultipartUploadOutput
+    func uploadPart(input: UploadPartInput) async throws -> UploadPartOutput
+    func completeMultipartUpload(input: CompleteMultipartUploadInput) async throws -> CompleteMultipartUploadOutput
+    func abortMultipartUpload(input: AbortMultipartUploadInput) async throws -> AbortMultipartUploadOutput
+    func listParts(input: ListPartsInput) async throws -> ListPartsOutput
+    func putObject(input: PutObjectInput) async throws -> PutObjectOutput
+    func headBucket(input: HeadBucketInput) async throws -> HeadBucketOutput
+}
+
+extension S3Client: GlacierS3Client {}
+
 final class GlacierClient {
     static let multipartThresholdBytes: Int64 = 100 * 1024 * 1024
     private static let defaultPartSizeBytes: Int = 8 * 1024 * 1024
@@ -108,9 +120,10 @@ final class GlacierClient {
     private static let maxS3Retries = 3
     private static let retryBackoffSeconds: [UInt64] = [2, 8, 32]
 
-    private let s3Client: S3Client
+    private let s3Client: any GlacierS3Client
     private let fileManager: FileManager
     private let database: DatabaseService?
+    private let multipartThreshold: Int64
 
     init(
         accessKey: String,
@@ -118,7 +131,8 @@ final class GlacierClient {
         sessionToken: String? = nil,
         region: String,
         fileManager: FileManager = .default,
-        database: DatabaseService? = nil
+        database: DatabaseService? = nil,
+        multipartThreshold: Int64 = GlacierClient.multipartThresholdBytes
     ) throws {
         let trimmedAccessKey = accessKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedSecretKey = secretKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -144,6 +158,19 @@ final class GlacierClient {
         self.s3Client = S3Client(config: config)
         self.fileManager = fileManager
         self.database = database
+        self.multipartThreshold = multipartThreshold
+    }
+
+    init(
+        s3Client: any GlacierS3Client,
+        fileManager: FileManager = .default,
+        database: DatabaseService? = nil,
+        multipartThreshold: Int64 = GlacierClient.multipartThresholdBytes
+    ) {
+        self.s3Client = s3Client
+        self.fileManager = fileManager
+        self.database = database
+        self.multipartThreshold = multipartThreshold
     }
 
     static func resolveCredentials(
@@ -352,7 +379,7 @@ final class GlacierClient {
         )
         let resolvedStorageClass = try Self.resolveStorageClass(storageClass)
 
-        if fileSize > Self.multipartThresholdBytes {
+        if fileSize > multipartThreshold {
             try await uploadMultipartFile(
                 fileURL: fileURL,
                 fileSize: fileSize,

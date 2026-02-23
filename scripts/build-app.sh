@@ -83,11 +83,6 @@ cat > "${INFO_PLIST_PATH}" <<EOF
   <string>${VERSION}</string>
   <key>CFBundleShortVersionString</key>
   <string>${VERSION}</string>
-  <key>NSAppTransportSecurity</key>
-  <dict>
-    <key>NSAllowsArbitraryLoads</key>
-    <true/>
-  </dict>
   <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
 </dict>

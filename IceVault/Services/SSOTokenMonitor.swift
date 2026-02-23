@@ -3,6 +3,8 @@ import UserNotifications
 
 @MainActor
 final class SSOTokenMonitor: NSObject, ObservableObject {
+    typealias SSOLoginRunner = (_ profileName: String) -> Int32
+
     @Published private(set) var status: SSOTokenStatus?
     @Published private(set) var sessionExpiry: Date?
     @Published private(set) var notificationsAuthorized: Bool
@@ -10,6 +12,7 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
 
     private let fileManager: FileManager
     private let userDefaults: UserDefaults
+    private let ssoLoginRunner: SSOLoginRunner
 
     private var monitoredProfileName: String?
     private var monitorTimer: Timer?
@@ -67,10 +70,13 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
 
     init(
         fileManager: FileManager = .default,
-        userDefaults: UserDefaults = .standard
+        userDefaults: UserDefaults = .standard,
+        autoStart: Bool = true,
+        ssoLoginRunner: @escaping SSOLoginRunner = SSOTokenMonitor.runSSOLoginProcess
     ) {
         self.fileManager = fileManager
         self.userDefaults = userDefaults
+        self.ssoLoginRunner = ssoLoginRunner
         self.status = nil
         self.sessionExpiry = nil
         self.notificationsAuthorized = false
@@ -78,11 +84,13 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
         self.monitoredProfileName = nil
         super.init()
 
-        configureNotificationCenter()
-        startMonitoringTimer()
+        if autoStart {
+            configureNotificationCenter()
+            startMonitoringTimer()
 
-        Task { [weak self] in
-            await self?.refreshNotificationAuthorizationStatus()
+            Task { [weak self] in
+                await self?.refreshNotificationAuthorizationStatus()
+            }
         }
     }
 
@@ -342,8 +350,9 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
             return
         }
 
+        let loginRunner = ssoLoginRunner
         loginTask = Task.detached(priority: .userInitiated) { [profileName] in
-            _ = Self.runSSOLoginProcess(profileName: profileName)
+            _ = loginRunner(profileName)
             await MainActor.run { [weak self] in
                 self?.loginTask = nil
                 self?.refreshNow()

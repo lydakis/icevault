@@ -28,6 +28,8 @@ enum LaunchAgentError: LocalizedError {
 }
 
 final class LaunchAgent {
+    typealias LaunchctlRunner = (_ arguments: [String], _ allowFailure: Bool) throws -> Int32
+
     enum ScheduleInterval: Equatable, Sendable {
         case daily(hour: Int = 3, minute: Int = 0)
         case weekly(weekday: Int = 1, hour: Int = 3, minute: Int = 0)
@@ -35,9 +37,14 @@ final class LaunchAgent {
     }
 
     private let fileManager: FileManager
+    private let launchctlRunner: LaunchctlRunner
 
-    init(fileManager: FileManager = .default) {
+    init(
+        fileManager: FileManager = .default,
+        launchctlRunner: @escaping LaunchctlRunner = LaunchAgent.defaultLaunchctlRunner
+    ) {
         self.fileManager = fileManager
+        self.launchctlRunner = launchctlRunner
     }
 
     func install(label: String, executablePath: String, interval: ScheduleInterval) throws {
@@ -199,6 +206,10 @@ final class LaunchAgent {
 
     @discardableResult
     private func runLaunchctl(_ arguments: [String], allowFailure: Bool = false) throws -> Int32 {
+        try launchctlRunner(arguments, allowFailure)
+    }
+
+    private static func defaultLaunchctlRunner(_ arguments: [String], _ allowFailure: Bool) throws -> Int32 {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
         process.arguments = arguments
