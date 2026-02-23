@@ -19,7 +19,7 @@ final class BackupEngineTests: XCTestCase {
             databaseFactory: {
                 throw TestError.databaseFailed
             },
-            glacierClientFactory: { _, _, _, _ in
+            glacierClientFactory: { _, _, _, _, _ in
                 throw TestError.shouldNotCreateGlacierClient
             }
         )

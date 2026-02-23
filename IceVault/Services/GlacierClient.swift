@@ -1,5 +1,6 @@
 import AWSS3
 import AWSSDKIdentity
+import protocol ClientRuntime.HTTPError
 import Foundation
 import Smithy
 
@@ -104,16 +105,20 @@ final class GlacierClient {
     static let multipartThresholdBytes: Int64 = 100 * 1024 * 1024
     private static let defaultPartSizeBytes: Int = 8 * 1024 * 1024
     private static let minimumPartSizeBytes: Int = 5 * 1024 * 1024
+    private static let maxS3Retries = 3
+    private static let retryBackoffSeconds: [UInt64] = [2, 8, 32]
 
     private let s3Client: S3Client
     private let fileManager: FileManager
+    private let database: DatabaseService?
 
     init(
         accessKey: String,
         secretKey: String,
         sessionToken: String? = nil,
         region: String,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        database: DatabaseService? = nil
     ) throws {
         let trimmedAccessKey = accessKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedSecretKey = secretKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -138,6 +143,7 @@ final class GlacierClient {
 
         self.s3Client = S3Client(config: config)
         self.fileManager = fileManager
+        self.database = database
     }
 
     static func resolveCredentials(
@@ -318,6 +324,7 @@ final class GlacierClient {
         bucket: String,
         key: String,
         storageClass: String = FileRecord.deepArchiveStorageClass,
+        fileRecordId: Int64? = nil,
         onProgress: ((Int64) -> Void)? = nil
     ) async throws -> String {
         let trimmedBucket = bucket.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -346,6 +353,7 @@ final class GlacierClient {
                 bucket: trimmedBucket,
                 key: normalizedKey,
                 storageClass: resolvedStorageClass,
+                fileRecordID: fileRecordId,
                 onProgress: onProgress
             )
         } else {
@@ -409,8 +417,194 @@ final class GlacierClient {
         bucket: String,
         key: String,
         storageClass: S3ClientTypes.StorageClass,
+        fileRecordID: Int64?,
         onProgress: ((Int64) -> Void)?
     ) async throws {
+        let partSize = Self.partSize(for: fileSize)
+        let totalParts = max(1, Int((fileSize + Int64(partSize) - 1) / Int64(partSize)))
+        var uploadState = try await resumeOrCreateMultipartUpload(
+            bucket: bucket,
+            key: key,
+            storageClass: storageClass,
+            fileRecordID: fileRecordID,
+            totalParts: totalParts
+        )
+
+        let fileHandle: FileHandle
+        do {
+            fileHandle = try FileHandle(forReadingFrom: fileURL)
+        } catch {
+            throw GlacierClientError.unreadableFile(fileURL.path)
+        }
+
+        defer {
+            Self.close(fileHandle: fileHandle)
+        }
+
+        var uploadedBytes = Self.totalUploadedBytes(
+            for: Array(uploadState.completedPartsByNumber.keys),
+            totalParts: totalParts,
+            fileSize: fileSize,
+            partSize: partSize
+        )
+
+        onProgress?(uploadedBytes)
+
+        for partNumber in 1...totalParts {
+            try Task.checkCancellation()
+
+            if uploadState.completedPartsByNumber[partNumber] != nil {
+                continue
+            }
+
+            let partOffset = Int64(partNumber - 1) * Int64(partSize)
+            let bytesToRead = Int(Self.expectedPartSize(
+                partNumber: partNumber,
+                totalParts: totalParts,
+                fileSize: fileSize,
+                partSize: partSize
+            ))
+
+            try Self.seek(fileHandle: fileHandle, toOffset: UInt64(partOffset))
+            guard let partData = try Self.read(fileHandle: fileHandle, upToCount: bytesToRead), !partData.isEmpty else {
+                throw GlacierClientError.incompleteFileRead(
+                    expectedBytes: fileSize,
+                    actualBytes: uploadedBytes
+                )
+            }
+
+            let partOutput = try await performS3Operation("uploadPart #\(partNumber)") {
+                try await s3Client.uploadPart(
+                    input: UploadPartInput(
+                        body: .data(partData),
+                        bucket: bucket,
+                        contentLength: partData.count,
+                        key: key,
+                        partNumber: partNumber,
+                        uploadId: uploadState.uploadID
+                    )
+                )
+            }
+
+            guard let eTag = partOutput.eTag else {
+                throw GlacierClientError.missingMultipartETag(partNumber: partNumber)
+            }
+
+            uploadState.completedPartsByNumber[partNumber] = S3ClientTypes.CompletedPart(
+                eTag: eTag,
+                partNumber: partNumber
+            )
+            uploadedBytes += Int64(partData.count)
+            onProgress?(uploadedBytes)
+
+            try updateMultipartProgressInDatabase(uploadState: &uploadState)
+        }
+
+        if uploadedBytes != fileSize {
+            throw GlacierClientError.incompleteFileRead(
+                expectedBytes: fileSize,
+                actualBytes: uploadedBytes
+            )
+        }
+
+        let completedParts = uploadState.completedPartsByNumber
+            .keys
+            .sorted()
+            .compactMap { uploadState.completedPartsByNumber[$0] }
+
+        _ = try await performS3Operation("completeMultipartUpload") {
+            try await s3Client.completeMultipartUpload(
+                input: CompleteMultipartUploadInput(
+                    bucket: bucket,
+                    key: key,
+                    multipartUpload: S3ClientTypes.CompletedMultipartUpload(parts: completedParts),
+                    uploadId: uploadState.uploadID
+                )
+            )
+        }
+
+        if let recordID = uploadState.record?.id {
+            _ = try? database?.deleteMultipartUpload(id: recordID)
+        }
+    }
+
+    func abortStaleMultipartUploads(olderThan: TimeInterval) async {
+        guard olderThan > 0, let database else {
+            return
+        }
+
+        let cutoffDate = Date().addingTimeInterval(-olderThan)
+        let staleUploads: [MultipartUploadRecord]
+        do {
+            staleUploads = try database.pendingMultipartUploads()
+                .filter { $0.lastUpdatedAt <= cutoffDate }
+        } catch {
+            print("Failed to query stale multipart uploads: \(error.localizedDescription)")
+            return
+        }
+
+        for upload in staleUploads {
+            guard let recordID = upload.id else {
+                continue
+            }
+
+            do {
+                _ = try await performS3Operation("abortMultipartUpload") {
+                    try await s3Client.abortMultipartUpload(
+                        input: AbortMultipartUploadInput(
+                            bucket: upload.bucket,
+                            key: upload.key,
+                            uploadId: upload.uploadId
+                        )
+                    )
+                }
+                _ = try? database.deleteMultipartUpload(id: recordID)
+            } catch {
+                let underlyingError = Self.unwrapOperationError(error)
+                if Self.httpStatusCode(for: underlyingError) == 404 {
+                    _ = try? database.deleteMultipartUpload(id: recordID)
+                } else {
+                    print(
+                        "Failed to abort stale multipart upload \(upload.uploadId): \(underlyingError.localizedDescription)"
+                    )
+                }
+            }
+        }
+    }
+
+    private func resumeOrCreateMultipartUpload(
+        bucket: String,
+        key: String,
+        storageClass: S3ClientTypes.StorageClass,
+        fileRecordID: Int64?,
+        totalParts: Int
+    ) async throws -> MultipartUploadState {
+        if let existingRecord = try existingMultipartUploadRecord(bucket: bucket, key: key) {
+            do {
+                let verifiedCompletedParts = try await verifiedCompletedParts(
+                    bucket: bucket,
+                    key: key,
+                    uploadID: existingRecord.uploadId,
+                    totalParts: totalParts
+                )
+
+                var state = MultipartUploadState(
+                    uploadID: existingRecord.uploadId,
+                    record: existingRecord,
+                    completedPartsByNumber: verifiedCompletedParts
+                )
+                try updateMultipartProgressInDatabase(uploadState: &state)
+                return state
+            } catch {
+                let underlyingError = Self.unwrapOperationError(error)
+                if Self.httpStatusCode(for: underlyingError) == 404, let recordID = existingRecord.id {
+                    _ = try? database?.deleteMultipartUpload(id: recordID)
+                } else {
+                    throw error
+                }
+            }
+        }
+
         let createOutput = try await performS3Operation("createMultipartUpload") {
             try await s3Client.createMultipartUpload(
                 input: CreateMultipartUploadInput(
@@ -424,105 +618,169 @@ final class GlacierClient {
             throw GlacierClientError.missingMultipartUploadID
         }
 
-        let partSize = Self.partSize(for: fileSize)
-        let fileHandle: FileHandle
-        do {
-            fileHandle = try FileHandle(forReadingFrom: fileURL)
-        } catch {
-            throw GlacierClientError.unreadableFile(fileURL.path)
+        var uploadRecord: MultipartUploadRecord?
+        if let database, let fileRecordID {
+            var newRecord = MultipartUploadRecord(
+                fileRecordId: fileRecordID,
+                bucket: bucket,
+                key: key,
+                uploadId: uploadID,
+                totalParts: totalParts,
+                completedPartsJSON: "[]",
+                createdAt: Date(),
+                lastUpdatedAt: Date()
+            )
+            try database.insertMultipartUpload(&newRecord)
+            uploadRecord = newRecord
         }
 
-        defer {
-            Self.close(fileHandle: fileHandle)
+        return MultipartUploadState(
+            uploadID: uploadID,
+            record: uploadRecord,
+            completedPartsByNumber: [:]
+        )
+    }
+
+    private func existingMultipartUploadRecord(bucket: String, key: String) throws -> MultipartUploadRecord? {
+        guard let database else {
+            return nil
         }
 
-        var uploadedBytes: Int64 = 0
-        var partNumber = 1
-        var completedParts: [S3ClientTypes.CompletedPart] = []
+        return try database.pendingMultipartUploads()
+            .first(where: { $0.bucket == bucket && $0.key == key })
+    }
 
-        onProgress?(0)
+    private func verifiedCompletedParts(
+        bucket: String,
+        key: String,
+        uploadID: String,
+        totalParts: Int
+    ) async throws -> [Int: S3ClientTypes.CompletedPart] {
+        let listedParts = try await listUploadedParts(bucket: bucket, key: key, uploadID: uploadID)
+        var completedPartsByNumber: [Int: S3ClientTypes.CompletedPart] = [:]
 
-        do {
-            while uploadedBytes < fileSize {
-                try Task.checkCancellation()
-
-                let bytesRemaining = fileSize - uploadedBytes
-                let bytesToRead = Int(min(Int64(partSize), bytesRemaining))
-                guard let partData = try Self.read(fileHandle: fileHandle, upToCount: bytesToRead), !partData.isEmpty else {
-                    throw GlacierClientError.incompleteFileRead(
-                        expectedBytes: fileSize,
-                        actualBytes: uploadedBytes
-                    )
-                }
-
-                let partOutput = try await performS3Operation("uploadPart #\(partNumber)") {
-                    try await s3Client.uploadPart(
-                        input: UploadPartInput(
-                            body: .data(partData),
-                            bucket: bucket,
-                            contentLength: partData.count,
-                            key: key,
-                            partNumber: partNumber,
-                            uploadId: uploadID
-                        )
-                    )
-                }
-
-                guard let eTag = partOutput.eTag else {
-                    throw GlacierClientError.missingMultipartETag(partNumber: partNumber)
-                }
-
-                completedParts.append(
-                    S3ClientTypes.CompletedPart(
-                        eTag: eTag,
-                        partNumber: partNumber
-                    )
-                )
-                uploadedBytes += Int64(partData.count)
-                onProgress?(uploadedBytes)
-                partNumber += 1
+        for part in listedParts {
+            guard
+                let partNumber = part.partNumber,
+                partNumber > 0,
+                partNumber <= totalParts,
+                let eTag = part.eTag
+            else {
+                continue
             }
+            completedPartsByNumber[partNumber] = S3ClientTypes.CompletedPart(
+                eTag: eTag,
+                partNumber: partNumber
+            )
+        }
 
-            if uploadedBytes != fileSize {
-                throw GlacierClientError.incompleteFileRead(
-                    expectedBytes: fileSize,
-                    actualBytes: uploadedBytes
-                )
-            }
+        return completedPartsByNumber
+    }
 
-            _ = try await performS3Operation("completeMultipartUpload") {
-                try await s3Client.completeMultipartUpload(
-                    input: CompleteMultipartUploadInput(
+    private func listUploadedParts(
+        bucket: String,
+        key: String,
+        uploadID: String
+    ) async throws -> [S3ClientTypes.Part] {
+        var partNumberMarker: String?
+        var uploadedParts: [S3ClientTypes.Part] = []
+
+        while true {
+            let output = try await performS3Operation("listParts") {
+                try await s3Client.listParts(
+                    input: ListPartsInput(
                         bucket: bucket,
                         key: key,
-                        multipartUpload: S3ClientTypes.CompletedMultipartUpload(parts: completedParts),
+                        partNumberMarker: partNumberMarker,
                         uploadId: uploadID
                     )
                 )
             }
-        } catch {
-            _ = try? await s3Client.abortMultipartUpload(
-                input: AbortMultipartUploadInput(
-                    bucket: bucket,
-                    key: key,
-                    uploadId: uploadID
-                )
-            )
-            throw error
+
+            uploadedParts.append(contentsOf: output.parts ?? [])
+
+            guard output.isTruncated == true, let nextMarker = output.nextPartNumberMarker, !nextMarker.isEmpty else {
+                break
+            }
+            partNumberMarker = nextMarker
         }
+
+        return uploadedParts
+    }
+
+    private func updateMultipartProgressInDatabase(uploadState: inout MultipartUploadState) throws {
+        guard let database, var record = uploadState.record, let recordID = record.id else {
+            return
+        }
+
+        let completedPartsJSON = try Self.completedPartsJSON(from: uploadState.completedPartsByNumber)
+        try database.updateCompletedParts(
+            id: recordID,
+            completedPartsJSON: completedPartsJSON,
+            lastUpdatedAt: Date()
+        )
+        record.completedPartsJSON = completedPartsJSON
+        record.lastUpdatedAt = Date()
+        uploadState.record = record
     }
 
     private func performS3Operation<T>(
         _ operation: String,
         _ action: () async throws -> T
     ) async throws -> T {
-        do {
-            return try await action()
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            throw GlacierClientError.s3OperationFailed(operation: operation, underlying: error)
+        var retryIndex = 0
+
+        while true {
+            do {
+                return try await action()
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                guard Self.shouldRetryOperation(for: error), retryIndex < Self.maxS3Retries else {
+                    throw GlacierClientError.s3OperationFailed(operation: operation, underlying: error)
+                }
+
+                let delaySeconds = Self.retryBackoffSeconds[retryIndex]
+                print(
+                    "Retrying S3 \(operation) in \(delaySeconds)s (attempt \(retryIndex + 1)/\(Self.maxS3Retries))"
+                )
+                try await Task.sleep(nanoseconds: delaySeconds * 1_000_000_000)
+                retryIndex += 1
+            }
         }
+    }
+
+    private static func shouldRetryOperation(for error: Error) -> Bool {
+        if let statusCode = httpStatusCode(for: error) {
+            if statusCode == 403 || statusCode == 404 {
+                return false
+            }
+            return statusCode == 500 || statusCode == 503
+        }
+
+        return isNetworkError(error)
+    }
+
+    private static func httpStatusCode(for error: Error) -> Int? {
+        let candidateError = unwrapOperationError(error)
+        return (candidateError as? any HTTPError)?.httpResponse.statusCode.rawValue
+    }
+
+    private static func isNetworkError(_ error: Error) -> Bool {
+        let candidateError = unwrapOperationError(error)
+        if candidateError is URLError {
+            return true
+        }
+
+        let nsError = candidateError as NSError
+        return nsError.domain == NSURLErrorDomain
+    }
+
+    private static func unwrapOperationError(_ error: Error) -> Error {
+        guard case .s3OperationFailed(_, let underlying) = error as? GlacierClientError else {
+            return error
+        }
+        return underlying
     }
 
     private static func resolveStorageClass(_ value: String) throws -> S3ClientTypes.StorageClass {
@@ -541,11 +799,61 @@ final class GlacierClient {
         )
     }
 
+    private static func expectedPartSize(
+        partNumber: Int,
+        totalParts: Int,
+        fileSize: Int64,
+        partSize: Int
+    ) -> Int64 {
+        if partNumber < totalParts {
+            return Int64(partSize)
+        }
+
+        let priorPartsBytes = Int64(max(totalParts - 1, 0)) * Int64(partSize)
+        return max(fileSize - priorPartsBytes, 0)
+    }
+
+    private static func totalUploadedBytes(
+        for partNumbers: [Int],
+        totalParts: Int,
+        fileSize: Int64,
+        partSize: Int
+    ) -> Int64 {
+        partNumbers.reduce(Int64(0)) { partialResult, partNumber in
+            partialResult + expectedPartSize(
+                partNumber: partNumber,
+                totalParts: totalParts,
+                fileSize: fileSize,
+                partSize: partSize
+            )
+        }
+    }
+
+    private static func completedPartsJSON(from partsByNumber: [Int: S3ClientTypes.CompletedPart]) throws -> String {
+        let orderedParts = partsByNumber.keys.sorted().compactMap { partNumber -> PersistedCompletedPart? in
+            guard let eTag = partsByNumber[partNumber]?.eTag else {
+                return nil
+            }
+            return PersistedCompletedPart(partNumber: partNumber, eTag: eTag)
+        }
+
+        let encodedParts = try JSONEncoder().encode(orderedParts)
+        return String(decoding: encodedParts, as: UTF8.self)
+    }
+
     private static func normalizedObjectKey(_ key: String) -> String {
         key
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "\\", with: "/")
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
+    private static func seek(fileHandle: FileHandle, toOffset offset: UInt64) throws {
+        if #available(macOS 11, *) {
+            try fileHandle.seek(toOffset: offset)
+        } else {
+            fileHandle.seek(toFileOffset: offset)
+        }
     }
 
     private static func read(fileHandle: FileHandle, upToCount count: Int) throws -> Data? {
@@ -561,6 +869,17 @@ final class GlacierClient {
         } else {
             fileHandle.closeFile()
         }
+    }
+
+    private struct PersistedCompletedPart: Codable {
+        let partNumber: Int
+        let eTag: String
+    }
+
+    private struct MultipartUploadState {
+        let uploadID: String
+        var record: MultipartUploadRecord?
+        var completedPartsByNumber: [Int: S3ClientTypes.CompletedPart]
     }
 
     private struct SSOCacheToken: Sendable {

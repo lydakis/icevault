@@ -21,7 +21,15 @@ enum BackupEngineError: LocalizedError {
 }
 
 final class BackupEngine: @unchecked Sendable {
-    typealias GlacierClientFactory = (_ accessKey: String, _ secretKey: String, _ sessionToken: String?, _ region: String) throws -> GlacierClient
+    typealias GlacierClientFactory = (
+        _ accessKey: String,
+        _ secretKey: String,
+        _ sessionToken: String?,
+        _ region: String,
+        _ database: DatabaseService?
+    ) throws -> GlacierClient
+
+    private static let staleMultipartUploadThreshold: TimeInterval = 24 * 60 * 60
 
     private enum DatabaseState {
         case available(DatabaseService)
@@ -38,12 +46,13 @@ final class BackupEngine: @unchecked Sendable {
         fileManager: FileManager = .default,
         database: DatabaseService? = nil,
         databaseFactory: () throws -> DatabaseService = { try DatabaseService() },
-        glacierClientFactory: @escaping GlacierClientFactory = { accessKey, secretKey, sessionToken, region in
+        glacierClientFactory: @escaping GlacierClientFactory = { accessKey, secretKey, sessionToken, region, database in
             try GlacierClient(
                 accessKey: accessKey,
                 secretKey: secretKey,
                 sessionToken: sessionToken,
-                region: region
+                region: region,
+                database: database
             )
         }
     ) {
@@ -68,6 +77,14 @@ final class BackupEngine: @unchecked Sendable {
         do {
             try validate(settings: settings, sourceRoot: sourceRoot, bucket: bucket)
             let database = try resolveDatabase()
+            let glacierClient = try glacierClientFactory(
+                settings.awsAccessKey,
+                settings.awsSecretKey,
+                settings.awsSessionToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : settings.awsSessionToken,
+                settings.awsRegion,
+                database
+            )
+            await glacierClient.abortStaleMultipartUploads(olderThan: Self.staleMultipartUploadThreshold)
 
             await MainActor.run {
                 job.status = .scanning
@@ -97,13 +114,6 @@ final class BackupEngine: @unchecked Sendable {
                 return
             }
 
-            let glacierClient = try glacierClientFactory(
-                settings.awsAccessKey,
-                settings.awsSecretKey,
-                settings.awsSessionToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : settings.awsSessionToken,
-                settings.awsRegion
-            )
-
             var completedFiles = 0
             var completedBytes: Int64 = 0
             let sourceRootURL = URL(fileURLWithPath: sourceRoot, isDirectory: true)
@@ -129,7 +139,8 @@ final class BackupEngine: @unchecked Sendable {
                     localPath: localFileURL.path,
                     bucket: bucket,
                     key: objectKey,
-                    storageClass: FileRecord.deepArchiveStorageClass
+                    storageClass: FileRecord.deepArchiveStorageClass,
+                    fileRecordId: recordID
                 ) { uploadedBytesForCurrentFile in
                     let boundedProgress = min(max(uploadedBytesForCurrentFile, 0), fileSize)
                     Task { @MainActor in

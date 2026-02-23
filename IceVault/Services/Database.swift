@@ -55,6 +55,44 @@ final class DatabaseService {
         }
     }
 
+    func insertMultipartUpload(_ record: inout MultipartUploadRecord) throws {
+        try dbQueue.write { db in
+            try record.insert(db)
+        }
+    }
+
+    func updateCompletedParts(
+        id: Int64,
+        completedPartsJSON: String,
+        lastUpdatedAt: Date = Date()
+    ) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                UPDATE \(MultipartUploadRecord.databaseTableName)
+                SET completedPartsJSON = ?, lastUpdatedAt = ?
+                WHERE id = ?
+                """,
+                arguments: [completedPartsJSON, lastUpdatedAt, id]
+            )
+        }
+    }
+
+    @discardableResult
+    func deleteMultipartUpload(id: Int64) throws -> Bool {
+        try dbQueue.write { db in
+            try MultipartUploadRecord.deleteOne(db, key: id)
+        }
+    }
+
+    func pendingMultipartUploads() throws -> [MultipartUploadRecord] {
+        try dbQueue.read { db in
+            try MultipartUploadRecord
+                .order(MultipartUploadRecord.Columns.lastUpdatedAt.desc)
+                .fetchAll(db)
+        }
+    }
+
     func pendingFiles(for sourceRoot: String) throws -> [FileRecord] {
         try dbQueue.read { db in
             try FileRecord
@@ -172,6 +210,42 @@ final class DatabaseService {
                 index: "idx_file_records_uploaded_at",
                 on: FileRecord.databaseTableName,
                 columns: ["uploadedAt"]
+            )
+        }
+
+        migrator.registerMigration("createMultipartUploadRecords") { db in
+            try db.create(table: MultipartUploadRecord.databaseTableName) { table in
+                table.autoIncrementedPrimaryKey("id")
+                table.column("fileRecordId", .integer)
+                    .notNull()
+                    .references(FileRecord.databaseTableName, onDelete: .cascade)
+                table.column("bucket", .text).notNull()
+                table.column("key", .text).notNull()
+                table.column("uploadId", .text).notNull()
+                table.column("totalParts", .integer).notNull()
+                table.column("completedPartsJSON", .text).notNull().defaults(to: "[]")
+                table.column("createdAt", .datetime).notNull()
+                table.column("lastUpdatedAt", .datetime).notNull()
+            }
+
+            try db.create(
+                index: "idx_multipart_upload_bucket_key",
+                on: MultipartUploadRecord.databaseTableName,
+                columns: ["bucket", "key"],
+                unique: true
+            )
+
+            try db.create(
+                index: "idx_multipart_upload_upload_id",
+                on: MultipartUploadRecord.databaseTableName,
+                columns: ["uploadId"],
+                unique: true
+            )
+
+            try db.create(
+                index: "idx_multipart_upload_last_updated_at",
+                on: MultipartUploadRecord.databaseTableName,
+                columns: ["lastUpdatedAt"]
             )
         }
 
