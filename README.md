@@ -50,6 +50,16 @@ swift run IceVault --backup
 ./scripts/build-app.sh --dmg
 ```
 
+Output:
+- `build/IceVault.app`
+- `build/IceVault-<version>-macos-<arch>.dmg`
+
+Release-oriented options:
+
+```bash
+./scripts/build-app.sh --dmg --version 0.1.0 --arch arm64 --output-dir dist
+```
+
 ## Manual Install
 
 ```bash
@@ -156,6 +166,21 @@ Supported intervals:
 - Custom (every N hours)
 
 Configure this in the Settings UI under **Scheduling**.
+
+## Releases + Homebrew
+
+Tagging `v*` on `main` triggers `.github/workflows/release.yml`, which:
+
+1. Builds DMGs for `arm64` and `x86_64`
+2. Publishes both assets to the GitHub Release
+3. Updates `lydakis/homebrew-icevault` with a new `Casks/icevault.rb`
+
+Required secret in `lydakis/icevault`:
+
+- `GORELEASER_TOKEN` (preferred, same token pattern as JUL), or `HOMEBREW_TAP_GITHUB_TOKEN`
+- Token must have repo access to both `icevault` and `homebrew-icevault`
+
+Detailed release steps: `docs/release.md`
 
 ## Screenshots
 
