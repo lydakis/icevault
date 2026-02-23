@@ -2,7 +2,6 @@ import AppKit
 import SwiftUI
 
 struct MenuBarView: View {
-    @Environment(\.openSettings) private var openSettings
     @Environment(\.openWindow) private var openWindow
     @EnvironmentObject private var appState: AppState
 
@@ -94,7 +93,7 @@ struct MenuBarView: View {
 
             HStack {
                 Button("Settings") {
-                    openSettings()
+                    openAppSettings()
                 }
                 Button("History") {
                     openWindow(id: "history")
@@ -118,7 +117,7 @@ struct MenuBarView: View {
             )
         ) {
             Button("Open Settings") {
-                openSettings()
+                openAppSettings()
             }
             Button("OK", role: .cancel) {
                 appState.dismissAuthenticationPrompt()
@@ -149,5 +148,10 @@ struct MenuBarView: View {
 
     private func formattedBytes(_ value: Int64) -> String {
         Self.byteFormatter.string(fromByteCount: max(value, 0))
+    }
+
+    private func openAppSettings() {
+        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 }
