@@ -37,6 +37,13 @@ enum CredentialSource: Equatable, Sendable {
     }
 }
 
+enum RemoteObjectValidationResult: Equatable, Sendable {
+    case valid
+    case missing
+    case mismatch
+    case inaccessible
+}
+
 struct SSOProfileConfiguration: Equatable, Sendable {
     let profileName: String
     let startURL: String
@@ -108,7 +115,14 @@ protocol GlacierS3Client {
     func abortMultipartUpload(input: AbortMultipartUploadInput) async throws -> AbortMultipartUploadOutput
     func listParts(input: ListPartsInput) async throws -> ListPartsOutput
     func putObject(input: PutObjectInput) async throws -> PutObjectOutput
+    func headObject(input: HeadObjectInput) async throws -> HeadObjectOutput
     func headBucket(input: HeadBucketInput) async throws -> HeadBucketOutput
+}
+
+extension GlacierS3Client {
+    func headObject(input: HeadObjectInput) async throws -> HeadObjectOutput {
+        HeadObjectOutput()
+    }
 }
 
 extension S3Client: GlacierS3Client {}
@@ -117,6 +131,7 @@ extension S3Client: GlacierS3Client {}
 /// per-upload mutable state is scoped to local values inside async functions.
 final class GlacierClient: @unchecked Sendable {
     static let multipartThresholdBytes: Int64 = 100 * 1024 * 1024
+    static let sha256MetadataKey = "icevault-sha256"
     private static let defaultPartSizeBytes: Int = 8 * 1024 * 1024
     private static let minimumPartSizeBytes: Int = 5 * 1024 * 1024
     private static let maxBufferedMultipartBytes: Int64 = 64 * 1024 * 1024
@@ -378,10 +393,11 @@ final class GlacierClient: @unchecked Sendable {
         let attributes = try fileManager.attributesOfItem(atPath: fileURL.path)
         let fileSize = (attributes[.size] as? NSNumber)?.int64Value ?? 0
         let fileModifiedAt = (attributes[.modificationDate] as? Date) ?? Date.distantPast
+        let fileSHA256 = multipartSHA256(fileRecordID: fileRecordId)
         let multipartResumeToken = Self.multipartResumeToken(
             fileSize: fileSize,
             modifiedAt: fileModifiedAt,
-            sha256: multipartSHA256(fileRecordID: fileRecordId)
+            sha256: fileSHA256
         )
         let resolvedStorageClass = try Self.resolveStorageClass(storageClass)
 
@@ -393,6 +409,7 @@ final class GlacierClient: @unchecked Sendable {
                 key: normalizedKey,
                 storageClass: resolvedStorageClass,
                 fileRecordID: fileRecordId,
+                fileSHA256: fileSHA256,
                 resumeToken: multipartResumeToken,
                 multipartPartConcurrency: multipartPartConcurrency,
                 onProgress: onProgress
@@ -403,6 +420,7 @@ final class GlacierClient: @unchecked Sendable {
                 bucket: trimmedBucket,
                 key: normalizedKey,
                 storageClass: resolvedStorageClass,
+                fileSHA256: fileSHA256,
                 onProgress: onProgress
             )
         }
@@ -423,11 +441,73 @@ final class GlacierClient: @unchecked Sendable {
         }
     }
 
+    func validateRemoteObject(
+        bucket: String,
+        key: String,
+        expectedSize: Int64,
+        expectedSHA256: String?
+    ) async throws -> RemoteObjectValidationResult {
+        let trimmedBucket = bucket.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedBucket.isEmpty else {
+            throw GlacierClientError.invalidBucket
+        }
+
+        let normalizedKey = Self.normalizedObjectKey(key)
+        guard !normalizedKey.isEmpty else {
+            throw GlacierClientError.invalidObjectKey
+        }
+
+        let output: HeadObjectOutput
+        do {
+            output = try await performS3Operation("headObject") {
+                try await s3Client.headObject(
+                    input: HeadObjectInput(
+                        bucket: trimmedBucket,
+                        key: normalizedKey
+                    )
+                )
+            }
+        } catch {
+            let underlyingError = Self.unwrapOperationError(error)
+            let statusCode = Self.httpStatusCode(for: underlyingError)
+            if statusCode == 404 {
+                return .missing
+            }
+            if statusCode == 403 {
+                return .inaccessible
+            }
+            throw error
+        }
+
+        let normalizedExpectedSize = max(expectedSize, 0)
+        let remoteSize = Int64(output.contentLength ?? 0)
+        if remoteSize != normalizedExpectedSize {
+            return .mismatch
+        }
+
+        guard output.storageClass == .deepArchive else {
+            return .mismatch
+        }
+
+        let expectedHash = Self.normalizedSHA256(expectedSHA256)
+        if !expectedHash.isEmpty {
+            guard
+                let remoteHash = Self.sha256FromMetadata(output.metadata),
+                remoteHash == expectedHash
+            else {
+                return .mismatch
+            }
+        }
+
+        return .valid
+    }
+
     private func uploadSinglePartFile(
         fileURL: URL,
         bucket: String,
         key: String,
         storageClass: S3ClientTypes.StorageClass,
+        fileSHA256: String?,
         onProgress: ((Int64) async -> Void)?
     ) async throws {
         let data: Data
@@ -447,6 +527,7 @@ final class GlacierClient: @unchecked Sendable {
                     bucket: bucket,
                     contentLength: data.count,
                     key: key,
+                    metadata: Self.objectMetadata(sha256: fileSHA256),
                     storageClass: storageClass
                 )
             )
@@ -463,6 +544,7 @@ final class GlacierClient: @unchecked Sendable {
         key: String,
         storageClass: S3ClientTypes.StorageClass,
         fileRecordID: Int64?,
+        fileSHA256: String?,
         resumeToken: String,
         multipartPartConcurrency: Int,
         onProgress: ((Int64) async -> Void)?
@@ -480,6 +562,7 @@ final class GlacierClient: @unchecked Sendable {
             key: key,
             storageClass: storageClass,
             fileRecordID: fileRecordID,
+            fileSHA256: fileSHA256,
             resumeToken: resumeToken,
             totalParts: totalParts
         )
@@ -630,6 +713,7 @@ final class GlacierClient: @unchecked Sendable {
         key: String,
         storageClass: S3ClientTypes.StorageClass,
         fileRecordID: Int64?,
+        fileSHA256: String?,
         resumeToken: String,
         totalParts: Int
     ) async throws -> MultipartUploadState {
@@ -668,6 +752,7 @@ final class GlacierClient: @unchecked Sendable {
                 input: CreateMultipartUploadInput(
                     bucket: bucket,
                     key: key,
+                    metadata: Self.objectMetadata(sha256: fileSHA256),
                     storageClass: storageClass
                 )
             )
@@ -953,6 +1038,35 @@ final class GlacierClient: @unchecked Sendable {
 
         let encodedParts = try JSONEncoder().encode(orderedParts)
         return String(decoding: encodedParts, as: UTF8.self)
+    }
+
+    private static func objectMetadata(sha256: String?) -> [String: String]? {
+        let normalizedHash = normalizedSHA256(sha256)
+        guard !normalizedHash.isEmpty else {
+            return nil
+        }
+        return [sha256MetadataKey: normalizedHash]
+    }
+
+    private static func sha256FromMetadata(_ metadata: [String: String]?) -> String? {
+        guard let metadata else {
+            return nil
+        }
+
+        for (key, value) in metadata {
+            if key.lowercased() == sha256MetadataKey {
+                let normalizedHash = normalizedSHA256(value)
+                return normalizedHash.isEmpty ? nil : normalizedHash
+            }
+        }
+
+        return nil
+    }
+
+    private static func normalizedSHA256(_ value: String?) -> String {
+        value?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
     }
 
     private static func multipartResumeToken(

@@ -113,6 +113,16 @@ final class DatabaseService {
         }
     }
 
+    func uploadedFiles(for sourceRoot: String) throws -> [FileRecord] {
+        try dbQueue.read { db in
+            try FileRecord
+                .filter(FileRecord.Columns.sourcePath == sourceRoot)
+                .filter(FileRecord.Columns.uploadedAt != nil)
+                .order(FileRecord.Columns.relativePath)
+                .fetchAll(db)
+        }
+    }
+
     func syncScannedFiles(_ scannedFiles: [FileRecord], for sourceRoot: String) throws {
         try dbQueue.write { db in
             let existingRecords = try FileRecord
@@ -161,6 +171,19 @@ final class DatabaseService {
                 WHERE id = ?
                 """,
                 arguments: [Date(), glacierKey, FileRecord.deepArchiveStorageClass, id]
+            )
+        }
+    }
+
+    func markPending(id: Int64) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                UPDATE \(FileRecord.databaseTableName)
+                SET uploadedAt = NULL, storageClass = ?
+                WHERE id = ?
+                """,
+                arguments: [FileRecord.deepArchiveStorageClass, id]
             )
         }
     }

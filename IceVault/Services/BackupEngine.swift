@@ -32,6 +32,7 @@ final class BackupEngine: @unchecked Sendable {
     ) throws -> GlacierClient
 
     private static let staleMultipartUploadThreshold: TimeInterval = 24 * 60 * 60
+    private static let remoteValidationConcurrency = 4
 
     private enum DatabaseState {
         case available(DatabaseService)
@@ -44,11 +45,17 @@ final class BackupEngine: @unchecked Sendable {
         let localPath: String
         let objectKey: String
         let fileSize: Int64
+        let sha256: String
     }
 
     private struct UploadProgressSnapshot: Sendable {
         let filesUploaded: Int
         let bytesUploaded: Int64
+    }
+
+    private struct RemoteValidationOutcome: Sendable {
+        let recordID: Int64
+        let result: RemoteObjectValidationResult
     }
 
     private actor UploadProgressTracker {
@@ -165,7 +172,13 @@ final class BackupEngine: @unchecked Sendable {
             let scannedFiles = try scanner.scan(sourceRoot: sourceRoot)
             try Task.checkCancellation()
 
-            let pendingFiles = try pendingFilesAfterSync(scannedFiles: scannedFiles, sourceRoot: sourceRoot, database: database)
+            let pendingFiles = try await pendingFilesAfterSync(
+                scannedFiles: scannedFiles,
+                sourceRoot: sourceRoot,
+                bucket: bucket,
+                database: database,
+                glacierClient: glacierClient
+            )
             let bytesTotal = pendingFiles.reduce(Int64(0)) { partialResult, record in
                 partialResult + max(record.fileSize, 0)
             }
@@ -219,8 +232,20 @@ final class BackupEngine: @unchecked Sendable {
         }
     }
 
-    private func pendingFilesAfterSync(scannedFiles: [FileRecord], sourceRoot: String, database: DatabaseService) throws -> [FileRecord] {
+    private func pendingFilesAfterSync(
+        scannedFiles: [FileRecord],
+        sourceRoot: String,
+        bucket: String,
+        database: DatabaseService,
+        glacierClient: GlacierClient
+    ) async throws -> [FileRecord] {
         try database.syncScannedFiles(scannedFiles, for: sourceRoot)
+        try await validateUploadedFilesOnRemote(
+            sourceRoot: sourceRoot,
+            bucket: bucket,
+            database: database,
+            glacierClient: glacierClient
+        )
         return try database.pendingFiles(for: sourceRoot)
     }
 
@@ -234,13 +259,17 @@ final class BackupEngine: @unchecked Sendable {
             }
 
             let localFileURL = sourceRootURL.appendingPathComponent(record.relativePath)
+            let objectKey = record.glacierKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? Self.objectKey(from: record.relativePath)
+                : record.glacierKey
             plans.append(
                 PendingUploadPlan(
                     recordID: recordID,
                     relativePath: record.relativePath,
                     localPath: localFileURL.path,
-                    objectKey: Self.objectKey(from: record.relativePath),
-                    fileSize: max(record.fileSize, 0)
+                    objectKey: objectKey,
+                    fileSize: max(record.fileSize, 0),
+                    sha256: record.sha256
                 )
             )
         }
@@ -268,28 +297,39 @@ final class BackupEngine: @unchecked Sendable {
         try await BoundedTaskRunner.run(
             inputs: plans,
             maxConcurrentTasks: fileConcurrency,
-            operation: { plan in
-                _ = try await glacierClient.uploadFile(
-                    localPath: plan.localPath,
+            operation: { [self] plan in
+                let remoteValidation = try await self.preflightRemoteValidation(
+                    for: plan,
                     bucket: bucket,
-                    key: plan.objectKey,
-                    storageClass: FileRecord.deepArchiveStorageClass,
-                    fileRecordId: plan.recordID,
-                    multipartPartConcurrency: multipartPartConcurrency
-                ) { uploadedBytesForCurrentFile in
-                    let snapshot = await progressTracker.update(
-                        recordID: plan.recordID,
-                        uploadedBytes: uploadedBytesForCurrentFile
-                    )
-                    await MainActor.run {
-                        Self.applyMonotonicProgress(
-                            filesUploaded: snapshot.filesUploaded,
-                            bytesUploaded: snapshot.bytesUploaded,
-                            to: job
+                    glacierClient: glacierClient
+                )
+
+                switch remoteValidation {
+                case .valid:
+                    return plan
+                case .missing, .mismatch, .inaccessible:
+                    _ = try await glacierClient.uploadFile(
+                        localPath: plan.localPath,
+                        bucket: bucket,
+                        key: plan.objectKey,
+                        storageClass: FileRecord.deepArchiveStorageClass,
+                        fileRecordId: plan.recordID,
+                        multipartPartConcurrency: multipartPartConcurrency
+                    ) { uploadedBytesForCurrentFile in
+                        let snapshot = await progressTracker.update(
+                            recordID: plan.recordID,
+                            uploadedBytes: uploadedBytesForCurrentFile
                         )
+                        await MainActor.run {
+                            Self.applyMonotonicProgress(
+                                filesUploaded: snapshot.filesUploaded,
+                                bytesUploaded: snapshot.bytesUploaded,
+                                to: job
+                            )
+                        }
                     }
+                    return plan
                 }
-                return plan
             },
             onSuccess: { completedPlan in
                 try database.markUploaded(id: completedPlan.recordID, glacierKey: completedPlan.objectKey)
@@ -303,6 +343,84 @@ final class BackupEngine: @unchecked Sendable {
                 }
             }
         )
+    }
+
+    private func validateUploadedFilesOnRemote(
+        sourceRoot: String,
+        bucket: String,
+        database: DatabaseService,
+        glacierClient: GlacierClient
+    ) async throws {
+        let uploadedFiles = try database.uploadedFiles(for: sourceRoot)
+        guard !uploadedFiles.isEmpty else {
+            return
+        }
+
+        let auditTargets = uploadedFiles.compactMap { record -> PendingUploadPlan? in
+            guard let recordID = record.id else {
+                return nil
+            }
+            let localFileURL = URL(fileURLWithPath: sourceRoot, isDirectory: true)
+                .appendingPathComponent(record.relativePath)
+            let objectKey = record.glacierKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? Self.objectKey(from: record.relativePath)
+                : record.glacierKey
+            return PendingUploadPlan(
+                recordID: recordID,
+                relativePath: record.relativePath,
+                localPath: localFileURL.path,
+                objectKey: objectKey,
+                fileSize: max(record.fileSize, 0),
+                sha256: record.sha256
+            )
+        }
+
+        guard !auditTargets.isEmpty else {
+            return
+        }
+
+        try await BoundedTaskRunner.run(
+            inputs: auditTargets,
+            maxConcurrentTasks: min(Self.remoteValidationConcurrency, auditTargets.count),
+            operation: { [self] target in
+                let result = try await self.preflightRemoteValidation(
+                    for: target,
+                    bucket: bucket,
+                    glacierClient: glacierClient
+                )
+                return RemoteValidationOutcome(recordID: target.recordID, result: result)
+            },
+            onSuccess: { outcome in
+                switch outcome.result {
+                case .valid, .inaccessible:
+                    break
+                case .missing, .mismatch:
+                    try database.markPending(id: outcome.recordID)
+                }
+            }
+        )
+    }
+
+    private func preflightRemoteValidation(
+        for plan: PendingUploadPlan,
+        bucket: String,
+        glacierClient: GlacierClient
+    ) async throws -> RemoteObjectValidationResult {
+        do {
+            return try await glacierClient.validateRemoteObject(
+                bucket: bucket,
+                key: plan.objectKey,
+                expectedSize: plan.fileSize,
+                expectedSHA256: plan.sha256
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as GlacierClientError {
+            if case .s3OperationFailed = error {
+                return .inaccessible
+            }
+            throw error
+        }
     }
 
     @MainActor

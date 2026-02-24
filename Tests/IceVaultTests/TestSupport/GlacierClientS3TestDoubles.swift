@@ -9,6 +9,7 @@ final class MockGlacierS3Client: GlacierS3Client {
     var abortMultipartUploadInputs: [AbortMultipartUploadInput] = []
     var listPartsInputs: [ListPartsInput] = []
     var putObjectInputs: [PutObjectInput] = []
+    var headObjectInputs: [HeadObjectInput] = []
     var headBucketInputs: [HeadBucketInput] = []
 
     var createMultipartUploadOutput = CreateMultipartUploadOutput(uploadId: "upload-id")
@@ -16,6 +17,7 @@ final class MockGlacierS3Client: GlacierS3Client {
     var completeMultipartUploadOutput = CompleteMultipartUploadOutput()
     var abortMultipartUploadOutput = AbortMultipartUploadOutput()
     var putObjectOutput = PutObjectOutput()
+    var headObjectOutput = HeadObjectOutput()
     var headBucketOutput = HeadBucketOutput()
     var listPartsOutputs: [ListPartsOutput] = [ListPartsOutput(isTruncated: false, nextPartNumberMarker: nil, parts: [])]
     var createMultipartUploadError: Error?
@@ -24,6 +26,7 @@ final class MockGlacierS3Client: GlacierS3Client {
     var abortMultipartUploadError: Error?
     var listPartsError: Error?
     var putObjectError: Error?
+    var headObjectError: Error?
     var headBucketError: Error?
 
     func createMultipartUpload(input: CreateMultipartUploadInput) async throws -> CreateMultipartUploadOutput {
@@ -75,6 +78,14 @@ final class MockGlacierS3Client: GlacierS3Client {
             throw putObjectError
         }
         return putObjectOutput
+    }
+
+    func headObject(input: HeadObjectInput) async throws -> HeadObjectOutput {
+        headObjectInputs.append(input)
+        if let headObjectError {
+            throw headObjectError
+        }
+        return headObjectOutput
     }
 
     func headBucket(input: HeadBucketInput) async throws -> HeadBucketOutput {

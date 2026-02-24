@@ -1,9 +1,17 @@
 import Foundation
 import AWSS3
+import protocol ClientRuntime.HTTPError
+import class SmithyHTTPAPI.HTTPResponse
+import enum SmithyHTTPAPI.HTTPStatusCode
 @testable import IceVault
 
 final class MockBackupEngineS3Client: GlacierS3Client {
     var putObjectInputs: [PutObjectInput] = []
+    var headObjectInputs: [HeadObjectInput] = []
+    var headObjectOutputsByKey: [String: HeadObjectOutput] = [:]
+    var headObjectErrorsByKey: [String: Error] = [:]
+    var defaultHeadObjectOutput = HeadObjectOutput()
+    var defaultHeadObjectError: Error?
 
     func createMultipartUpload(input: CreateMultipartUploadInput) async throws -> CreateMultipartUploadOutput {
         CreateMultipartUploadOutput(uploadId: "upload-id")
@@ -28,6 +36,21 @@ final class MockBackupEngineS3Client: GlacierS3Client {
     func putObject(input: PutObjectInput) async throws -> PutObjectOutput {
         putObjectInputs.append(input)
         return PutObjectOutput()
+    }
+
+    func headObject(input: HeadObjectInput) async throws -> HeadObjectOutput {
+        headObjectInputs.append(input)
+        let key = input.key ?? ""
+        if let error = headObjectErrorsByKey[key] {
+            throw error
+        }
+        if let output = headObjectOutputsByKey[key] {
+            return output
+        }
+        if let defaultHeadObjectError {
+            throw defaultHeadObjectError
+        }
+        return defaultHeadObjectOutput
     }
 
     func headBucket(input: HeadBucketInput) async throws -> HeadBucketOutput {
@@ -200,6 +223,14 @@ final class DeterministicFailureBackupEngineS3Client: GlacierS3Client {
 
 enum DeterministicFailureS3Error: Error {
     case syntheticFailure
+}
+
+struct MockHTTPStatusCodeError: Error, HTTPError {
+    let httpResponse: HTTPResponse
+
+    init(statusCode: HTTPStatusCode) {
+        self.httpResponse = HTTPResponse(statusCode: statusCode)
+    }
 }
 
 final class CancelIgnoringSequencedBackupEngineS3Client: GlacierS3Client {

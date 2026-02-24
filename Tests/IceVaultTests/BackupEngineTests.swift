@@ -1,5 +1,6 @@
 import Foundation
 import AWSS3
+import CryptoKit
 import XCTest
 @testable import IceVault
 
@@ -181,6 +182,533 @@ final class BackupEngineTests: XCTestCase {
         XCTAssertEqual(stored.count, 1)
         XCTAssertEqual(stored.first?.glacierKey, "nested/file.txt")
         XCTAssertNotNil(stored.first?.uploadedAt)
+    }
+
+    func testRunSkipsReuploadWhenRemoteObjectAlreadyMatches() async throws {
+        let sourceRoot = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let fileURL = sourceRoot.appendingPathComponent("nested/file.txt")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let payload = Data("hello-world".utf8)
+        try payload.write(to: fileURL)
+
+        let database = try makeDatabaseService()
+        let mockS3 = MockBackupEngineS3Client()
+        mockS3.headObjectOutputsByKey["nested/file.txt"] = HeadObjectOutput(
+            contentLength: payload.count,
+            metadata: [GlacierClient.sha256MetadataKey: sha256Hex(of: payload)],
+            storageClass: .deepArchive
+        )
+
+        let backupEngine = BackupEngine(
+            scanner: FileScanner(),
+            fileManager: .default,
+            database: database,
+            glacierClientFactory: { _, _, _, _, db in
+                GlacierClient(s3Client: mockS3, database: db)
+            }
+        )
+
+        let settings = AppState.Settings(
+            awsAccessKey: "access",
+            awsSecretKey: "secret",
+            awsRegion: "us-east-1",
+            bucket: "bucket",
+            sourcePath: sourceRoot.path
+        )
+        let job = await MainActor.run {
+            BackupJob(sourceRoot: sourceRoot.path, bucket: "bucket")
+        }
+
+        try await backupEngine.run(job: job, settings: settings)
+
+        await MainActor.run {
+            XCTAssertEqual(job.status, .completed)
+            XCTAssertEqual(job.filesTotal, 1)
+            XCTAssertEqual(job.filesUploaded, 1)
+            XCTAssertEqual(job.bytesTotal, Int64(payload.count))
+            XCTAssertEqual(job.bytesUploaded, Int64(payload.count))
+        }
+
+        XCTAssertEqual(mockS3.putObjectInputs.count, 0)
+        XCTAssertEqual(mockS3.headObjectInputs.count, 1)
+        XCTAssertEqual(mockS3.headObjectInputs.first?.key, "nested/file.txt")
+        XCTAssertEqual(try database.pendingFiles(for: sourceRoot.path).count, 0)
+        let stored = try database.allFiles()
+        XCTAssertEqual(stored.count, 1)
+        XCTAssertEqual(stored.first?.glacierKey, "nested/file.txt")
+        XCTAssertNotNil(stored.first?.uploadedAt)
+    }
+
+    func testRunReuploadsUploadedFileWhenRemoteChecksumMetadataIsMissing() async throws {
+        let sourceRoot = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let fileURL = sourceRoot.appendingPathComponent("nested/file.txt")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let payload = Data("hello-world".utf8)
+        try payload.write(to: fileURL)
+
+        let database = try makeDatabaseService()
+        var existingRecord = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "nested/file.txt",
+            fileSize: Int64(payload.count),
+            modifiedAt: Date(),
+            sha256: sha256Hex(of: payload),
+            glacierKey: "nested/file.txt",
+            uploadedAt: Date(),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&existingRecord)
+
+        let mockS3 = MockBackupEngineS3Client()
+        mockS3.defaultHeadObjectOutput = HeadObjectOutput(
+            contentLength: payload.count,
+            storageClass: .deepArchive
+        )
+
+        let backupEngine = BackupEngine(
+            scanner: FileScanner(),
+            fileManager: .default,
+            database: database,
+            glacierClientFactory: { _, _, _, _, db in
+                GlacierClient(s3Client: mockS3, database: db)
+            }
+        )
+
+        let settings = AppState.Settings(
+            awsAccessKey: "access",
+            awsSecretKey: "secret",
+            awsRegion: "us-east-1",
+            bucket: "bucket",
+            sourcePath: sourceRoot.path
+        )
+        let job = await MainActor.run {
+            BackupJob(sourceRoot: sourceRoot.path, bucket: "bucket")
+        }
+
+        try await backupEngine.run(job: job, settings: settings)
+
+        await MainActor.run {
+            XCTAssertEqual(job.status, .completed)
+            XCTAssertEqual(job.filesTotal, 1)
+            XCTAssertEqual(job.filesUploaded, 1)
+            XCTAssertEqual(job.bytesTotal, Int64(payload.count))
+            XCTAssertEqual(job.bytesUploaded, Int64(payload.count))
+        }
+
+        XCTAssertGreaterThanOrEqual(mockS3.headObjectInputs.count, 2)
+        XCTAssertEqual(mockS3.putObjectInputs.count, 1)
+        XCTAssertEqual(mockS3.putObjectInputs.first?.key, "nested/file.txt")
+        XCTAssertEqual(try database.pendingFiles(for: sourceRoot.path).count, 0)
+        let stored = try database.allFiles()
+        XCTAssertEqual(stored.count, 1)
+        XCTAssertNotNil(stored.first?.uploadedAt)
+    }
+
+    func testRunReuploadsPreviouslyUploadedFileWhenRemoteObjectIsMissing() async throws {
+        let sourceRoot = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let fileURL = sourceRoot.appendingPathComponent("nested/file.txt")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let payload = Data("hello-world".utf8)
+        try payload.write(to: fileURL)
+
+        let database = try makeDatabaseService()
+        var existingRecord = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "nested/file.txt",
+            fileSize: Int64(payload.count),
+            modifiedAt: Date(),
+            sha256: sha256Hex(of: payload),
+            glacierKey: "nested/file.txt",
+            uploadedAt: Date(),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&existingRecord)
+
+        let mockS3 = MockBackupEngineS3Client()
+        mockS3.defaultHeadObjectError = MockHTTPStatusCodeError(statusCode: .notFound)
+
+        let backupEngine = BackupEngine(
+            scanner: FileScanner(),
+            fileManager: .default,
+            database: database,
+            glacierClientFactory: { _, _, _, _, db in
+                GlacierClient(s3Client: mockS3, database: db)
+            }
+        )
+
+        let settings = AppState.Settings(
+            awsAccessKey: "access",
+            awsSecretKey: "secret",
+            awsRegion: "us-east-1",
+            bucket: "bucket",
+            sourcePath: sourceRoot.path
+        )
+        let job = await MainActor.run {
+            BackupJob(sourceRoot: sourceRoot.path, bucket: "bucket")
+        }
+
+        try await backupEngine.run(job: job, settings: settings)
+
+        XCTAssertEqual(mockS3.putObjectInputs.count, 1)
+        XCTAssertEqual(mockS3.putObjectInputs.first?.key, "nested/file.txt")
+        XCTAssertGreaterThanOrEqual(mockS3.headObjectInputs.count, 2)
+        XCTAssertEqual(try database.pendingFiles(for: sourceRoot.path).count, 0)
+        let stored = try database.allFiles()
+        XCTAssertEqual(stored.count, 1)
+        XCTAssertNotNil(stored.first?.uploadedAt)
+    }
+
+    func testRunUploadsPendingFileWhenRemoteValidationIsInaccessible() async throws {
+        let sourceRoot = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let fileURL = sourceRoot.appendingPathComponent("nested/file.txt")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let payload = Data("hello-world".utf8)
+        try payload.write(to: fileURL)
+
+        let database = try makeDatabaseService()
+        let mockS3 = MockBackupEngineS3Client()
+        mockS3.defaultHeadObjectError = MockHTTPStatusCodeError(statusCode: .forbidden)
+
+        let backupEngine = BackupEngine(
+            scanner: FileScanner(),
+            fileManager: .default,
+            database: database,
+            glacierClientFactory: { _, _, _, _, db in
+                GlacierClient(s3Client: mockS3, database: db)
+            }
+        )
+
+        let settings = AppState.Settings(
+            awsAccessKey: "access",
+            awsSecretKey: "secret",
+            awsRegion: "us-east-1",
+            bucket: "bucket",
+            sourcePath: sourceRoot.path
+        )
+        let job = await MainActor.run {
+            BackupJob(sourceRoot: sourceRoot.path, bucket: "bucket")
+        }
+
+        try await backupEngine.run(job: job, settings: settings)
+
+        await MainActor.run {
+            XCTAssertEqual(job.status, .completed)
+            XCTAssertEqual(job.filesTotal, 1)
+            XCTAssertEqual(job.filesUploaded, 1)
+        }
+        XCTAssertEqual(mockS3.headObjectInputs.count, 1)
+        XCTAssertEqual(mockS3.putObjectInputs.count, 1)
+        XCTAssertEqual(mockS3.putObjectInputs.first?.key, "nested/file.txt")
+    }
+
+    func testRunUploadsPendingFileWhenRemoteValidationHasTransientFailure() async throws {
+        let sourceRoot = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let fileURL = sourceRoot.appendingPathComponent("nested/file.txt")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let payload = Data("hello-world".utf8)
+        try payload.write(to: fileURL)
+
+        let database = try makeDatabaseService()
+        let mockS3 = MockBackupEngineS3Client()
+        mockS3.headObjectErrorsByKey["nested/file.txt"] = TestError.syntheticHeadValidationFailure
+
+        let backupEngine = BackupEngine(
+            scanner: FileScanner(),
+            fileManager: .default,
+            database: database,
+            glacierClientFactory: { _, _, _, _, db in
+                GlacierClient(s3Client: mockS3, database: db)
+            }
+        )
+
+        let settings = AppState.Settings(
+            awsAccessKey: "access",
+            awsSecretKey: "secret",
+            awsRegion: "us-east-1",
+            bucket: "bucket",
+            sourcePath: sourceRoot.path
+        )
+        let job = await MainActor.run {
+            BackupJob(sourceRoot: sourceRoot.path, bucket: "bucket")
+        }
+
+        try await backupEngine.run(job: job, settings: settings)
+
+        await MainActor.run {
+            XCTAssertEqual(job.status, .completed)
+            XCTAssertEqual(job.filesTotal, 1)
+            XCTAssertEqual(job.filesUploaded, 1)
+            XCTAssertEqual(job.bytesTotal, Int64(payload.count))
+            XCTAssertEqual(job.bytesUploaded, Int64(payload.count))
+        }
+        XCTAssertEqual(mockS3.headObjectInputs.count, 1)
+        XCTAssertEqual(mockS3.putObjectInputs.count, 1)
+        XCTAssertEqual(mockS3.putObjectInputs.first?.key, "nested/file.txt")
+    }
+
+    func testRunContinuesWhenUploadedObjectAuditValidationHasTransientFailure() async throws {
+        let sourceRoot = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let existingFileURL = sourceRoot.appendingPathComponent("existing.txt")
+        let pendingFileURL = sourceRoot.appendingPathComponent("pending.txt")
+        try Data("existing-data".utf8).write(to: existingFileURL)
+        try Data("pending-data".utf8).write(to: pendingFileURL)
+
+        let database = try makeDatabaseService()
+        var existingRecord = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "existing.txt",
+            fileSize: Int64(Data("existing-data".utf8).count),
+            modifiedAt: Date(),
+            sha256: sha256Hex(of: Data("existing-data".utf8)),
+            glacierKey: "existing.txt",
+            uploadedAt: Date(),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&existingRecord)
+
+        let mockS3 = MockBackupEngineS3Client()
+        mockS3.headObjectErrorsByKey["existing.txt"] = TestError.syntheticHeadValidationFailure
+
+        let backupEngine = BackupEngine(
+            scanner: FileScanner(),
+            fileManager: .default,
+            database: database,
+            glacierClientFactory: { _, _, _, _, db in
+                GlacierClient(s3Client: mockS3, database: db)
+            }
+        )
+
+        let settings = AppState.Settings(
+            awsAccessKey: "access",
+            awsSecretKey: "secret",
+            awsRegion: "us-east-1",
+            bucket: "bucket",
+            sourcePath: sourceRoot.path
+        )
+        let job = await MainActor.run {
+            BackupJob(sourceRoot: sourceRoot.path, bucket: "bucket")
+        }
+
+        try await backupEngine.run(job: job, settings: settings)
+
+        await MainActor.run {
+            XCTAssertEqual(job.status, .completed)
+            XCTAssertEqual(job.filesTotal, 1)
+            XCTAssertEqual(job.filesUploaded, 1)
+        }
+
+        XCTAssertEqual(mockS3.putObjectInputs.count, 1)
+        XCTAssertEqual(mockS3.putObjectInputs.first?.key, "pending.txt")
+        XCTAssertEqual(mockS3.headObjectInputs.compactMap(\.key).sorted(), ["existing.txt", "pending.txt"])
+
+        let pending = try database.pendingFiles(for: sourceRoot.path)
+        XCTAssertEqual(pending.count, 0)
+
+        let stored = try database.allFiles()
+        let uploadedExisting = try XCTUnwrap(stored.first(where: { $0.relativePath == "existing.txt" }))
+        let uploadedPending = try XCTUnwrap(stored.first(where: { $0.relativePath == "pending.txt" }))
+        XCTAssertNotNil(uploadedExisting.uploadedAt)
+        XCTAssertNotNil(uploadedPending.uploadedAt)
+    }
+
+    func testRunKeepsUploadedFileWhenRemoteValidationIsInaccessible() async throws {
+        let sourceRoot = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let fileURL = sourceRoot.appendingPathComponent("nested/file.txt")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let payload = Data("hello-world".utf8)
+        try payload.write(to: fileURL)
+
+        let database = try makeDatabaseService()
+        var existingRecord = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "nested/file.txt",
+            fileSize: Int64(payload.count),
+            modifiedAt: Date(),
+            sha256: sha256Hex(of: payload),
+            glacierKey: "nested/file.txt",
+            uploadedAt: Date(),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&existingRecord)
+
+        let mockS3 = MockBackupEngineS3Client()
+        mockS3.defaultHeadObjectError = MockHTTPStatusCodeError(statusCode: .forbidden)
+
+        let backupEngine = BackupEngine(
+            scanner: FileScanner(),
+            fileManager: .default,
+            database: database,
+            glacierClientFactory: { _, _, _, _, db in
+                GlacierClient(s3Client: mockS3, database: db)
+            }
+        )
+
+        let settings = AppState.Settings(
+            awsAccessKey: "access",
+            awsSecretKey: "secret",
+            awsRegion: "us-east-1",
+            bucket: "bucket",
+            sourcePath: sourceRoot.path
+        )
+        let job = await MainActor.run {
+            BackupJob(sourceRoot: sourceRoot.path, bucket: "bucket")
+        }
+
+        try await backupEngine.run(job: job, settings: settings)
+
+        await MainActor.run {
+            XCTAssertEqual(job.status, .completed)
+            XCTAssertEqual(job.filesTotal, 0)
+            XCTAssertEqual(job.filesUploaded, 0)
+        }
+        XCTAssertEqual(mockS3.headObjectInputs.count, 1)
+        XCTAssertEqual(mockS3.putObjectInputs.count, 0)
+        XCTAssertEqual(try database.pendingFiles(for: sourceRoot.path).count, 0)
+    }
+
+    func testRunAuditsUploadedFileUsingPersistedGlacierKey() async throws {
+        let sourceRoot = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let fileURL = sourceRoot.appendingPathComponent("nested/file.txt")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let payload = Data("hello-world".utf8)
+        try payload.write(to: fileURL)
+
+        let database = try makeDatabaseService()
+        var existingRecord = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "nested/file.txt",
+            fileSize: Int64(payload.count),
+            modifiedAt: Date(),
+            sha256: sha256Hex(of: payload),
+            glacierKey: "archive-prefix/nested/file.txt",
+            uploadedAt: Date(),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&existingRecord)
+
+        let mockS3 = MockBackupEngineS3Client()
+        mockS3.defaultHeadObjectError = MockHTTPStatusCodeError(statusCode: .notFound)
+        mockS3.headObjectOutputsByKey["archive-prefix/nested/file.txt"] = HeadObjectOutput(
+            contentLength: payload.count,
+            metadata: [GlacierClient.sha256MetadataKey: sha256Hex(of: payload)],
+            storageClass: .deepArchive
+        )
+
+        let backupEngine = BackupEngine(
+            scanner: FileScanner(),
+            fileManager: .default,
+            database: database,
+            glacierClientFactory: { _, _, _, _, db in
+                GlacierClient(s3Client: mockS3, database: db)
+            }
+        )
+
+        let settings = AppState.Settings(
+            awsAccessKey: "access",
+            awsSecretKey: "secret",
+            awsRegion: "us-east-1",
+            bucket: "bucket",
+            sourcePath: sourceRoot.path
+        )
+        let job = await MainActor.run {
+            BackupJob(sourceRoot: sourceRoot.path, bucket: "bucket")
+        }
+
+        try await backupEngine.run(job: job, settings: settings)
+
+        await MainActor.run {
+            XCTAssertEqual(job.status, .completed)
+            XCTAssertEqual(job.filesTotal, 0)
+            XCTAssertEqual(job.filesUploaded, 0)
+        }
+
+        XCTAssertEqual(mockS3.headObjectInputs.count, 1)
+        XCTAssertEqual(mockS3.headObjectInputs.first?.key, "archive-prefix/nested/file.txt")
+        XCTAssertEqual(mockS3.putObjectInputs.count, 0)
+        XCTAssertEqual(try database.pendingFiles(for: sourceRoot.path).count, 0)
+    }
+
+    func testRunReuploadsMissingAuditedFileUsingPersistedGlacierKey() async throws {
+        let sourceRoot = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let fileURL = sourceRoot.appendingPathComponent("nested/file.txt")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let payload = Data("hello-world".utf8)
+        try payload.write(to: fileURL)
+
+        let database = try makeDatabaseService()
+        var existingRecord = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "nested/file.txt",
+            fileSize: Int64(payload.count),
+            modifiedAt: Date(),
+            sha256: sha256Hex(of: payload),
+            glacierKey: "archive-prefix/nested/file.txt",
+            uploadedAt: Date(),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&existingRecord)
+
+        let mockS3 = MockBackupEngineS3Client()
+        mockS3.defaultHeadObjectError = MockHTTPStatusCodeError(statusCode: .notFound)
+
+        let backupEngine = BackupEngine(
+            scanner: FileScanner(),
+            fileManager: .default,
+            database: database,
+            glacierClientFactory: { _, _, _, _, db in
+                GlacierClient(s3Client: mockS3, database: db)
+            }
+        )
+
+        let settings = AppState.Settings(
+            awsAccessKey: "access",
+            awsSecretKey: "secret",
+            awsRegion: "us-east-1",
+            bucket: "bucket",
+            sourcePath: sourceRoot.path
+        )
+        let job = await MainActor.run {
+            BackupJob(sourceRoot: sourceRoot.path, bucket: "bucket")
+        }
+
+        try await backupEngine.run(job: job, settings: settings)
+
+        await MainActor.run {
+            XCTAssertEqual(job.status, .completed)
+            XCTAssertEqual(job.filesTotal, 1)
+            XCTAssertEqual(job.filesUploaded, 1)
+        }
+
+        XCTAssertGreaterThanOrEqual(mockS3.headObjectInputs.count, 2)
+        XCTAssertEqual(
+            Set(mockS3.headObjectInputs.compactMap(\.key)),
+            ["archive-prefix/nested/file.txt"]
+        )
+        XCTAssertEqual(mockS3.putObjectInputs.count, 1)
+        XCTAssertEqual(mockS3.putObjectInputs.first?.key, "archive-prefix/nested/file.txt")
+
+        let stored = try database.allFiles()
+        XCTAssertEqual(stored.first?.glacierKey, "archive-prefix/nested/file.txt")
+        XCTAssertNotNil(stored.first?.uploadedAt)
+        XCTAssertEqual(try database.pendingFiles(for: sourceRoot.path).count, 0)
     }
 
     func testRunFailsWhenSourceDirectoryDoesNotExist() async throws {
@@ -523,6 +1051,12 @@ final class BackupEngineTests: XCTestCase {
         return directory
     }
 
+    private func sha256Hex(of data: Data) -> String {
+        SHA256.hash(data: data)
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
     private func makeDatabaseService() throws -> DatabaseService {
         let directory = try makeTempDirectory()
         let databaseURL = directory.appendingPathComponent("icevault.sqlite")
@@ -531,6 +1065,7 @@ final class BackupEngineTests: XCTestCase {
 
     private enum TestError: Error {
         case unexpectedGlacierClientCreation
+        case syntheticHeadValidationFailure
     }
 }
 

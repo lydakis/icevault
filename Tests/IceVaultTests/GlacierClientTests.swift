@@ -175,6 +175,10 @@ final class GlacierClientTests: XCTestCase {
         XCTAssertEqual(s3.abortMultipartUploadInputs.count, 1)
         XCTAssertEqual(s3.abortMultipartUploadInputs.first?.uploadId, "stale-upload-id")
         XCTAssertEqual(s3.createMultipartUploadInputs.count, 1)
+        XCTAssertEqual(
+            s3.createMultipartUploadInputs.first?.metadata?[GlacierClient.sha256MetadataKey],
+            "sha-new"
+        )
         XCTAssertEqual(s3.listPartsInputs.count, 0)
         XCTAssertEqual(s3.uploadPartInputs.count, 1)
         XCTAssertEqual(s3.uploadPartInputs.first?.uploadId, "fresh-upload-id")
@@ -536,6 +540,143 @@ final class GlacierClientTests: XCTestCase {
         try await client.verifyBucketAccess(bucket: "test-bucket")
         XCTAssertEqual(s3.headBucketInputs.count, 1)
         XCTAssertEqual(s3.headBucketInputs.first?.bucket, "test-bucket")
+    }
+
+    func testValidateRemoteObjectReturnsValidForMatchingObject() async throws {
+        let s3 = MockGlacierS3Client()
+        s3.headObjectOutput = HeadObjectOutput(
+            contentLength: 5,
+            metadata: [GlacierClient.sha256MetadataKey: "abc123"],
+            storageClass: .deepArchive
+        )
+        let client = GlacierClient(s3Client: s3)
+
+        let result = try await client.validateRemoteObject(
+            bucket: "test-bucket",
+            key: "path/file.txt",
+            expectedSize: 5,
+            expectedSHA256: "abc123"
+        )
+
+        XCTAssertEqual(result, .valid)
+        XCTAssertEqual(s3.headObjectInputs.count, 1)
+        XCTAssertEqual(s3.headObjectInputs.first?.bucket, "test-bucket")
+        XCTAssertEqual(s3.headObjectInputs.first?.key, "path/file.txt")
+    }
+
+    func testValidateRemoteObjectReturnsMismatchWhenChecksumMetadataIsMissing() async throws {
+        let s3 = MockGlacierS3Client()
+        s3.headObjectOutput = HeadObjectOutput(
+            contentLength: 5,
+            storageClass: .deepArchive
+        )
+        let client = GlacierClient(s3Client: s3)
+
+        let result = try await client.validateRemoteObject(
+            bucket: "test-bucket",
+            key: "path/file.txt",
+            expectedSize: 5,
+            expectedSHA256: "abc123"
+        )
+
+        XCTAssertEqual(result, .mismatch)
+        XCTAssertEqual(s3.headObjectInputs.count, 1)
+    }
+
+    func testValidateRemoteObjectReturnsMismatchWhenChecksumMetadataDiffers() async throws {
+        let s3 = MockGlacierS3Client()
+        s3.headObjectOutput = HeadObjectOutput(
+            contentLength: 5,
+            metadata: [GlacierClient.sha256MetadataKey: "other-hash"],
+            storageClass: .deepArchive
+        )
+        let client = GlacierClient(s3Client: s3)
+
+        let result = try await client.validateRemoteObject(
+            bucket: "test-bucket",
+            key: "path/file.txt",
+            expectedSize: 5,
+            expectedSHA256: "abc123"
+        )
+
+        XCTAssertEqual(result, .mismatch)
+        XCTAssertEqual(s3.headObjectInputs.count, 1)
+    }
+
+    func testValidateRemoteObjectReturnsMissingFor404() async throws {
+        let s3 = MockGlacierS3Client()
+        s3.headObjectError = MockHTTPStatusCodeError(statusCode: .notFound)
+        let client = GlacierClient(s3Client: s3)
+
+        let result = try await client.validateRemoteObject(
+            bucket: "test-bucket",
+            key: "path/file.txt",
+            expectedSize: 5,
+            expectedSHA256: "abc123"
+        )
+
+        XCTAssertEqual(result, .missing)
+        XCTAssertEqual(s3.headObjectInputs.count, 1)
+    }
+
+    func testValidateRemoteObjectReturnsInaccessibleFor403() async throws {
+        let s3 = MockGlacierS3Client()
+        s3.headObjectError = MockHTTPStatusCodeError(statusCode: .forbidden)
+        let client = GlacierClient(s3Client: s3)
+
+        let result = try await client.validateRemoteObject(
+            bucket: "test-bucket",
+            key: "path/file.txt",
+            expectedSize: 5,
+            expectedSHA256: "abc123"
+        )
+
+        XCTAssertEqual(result, .inaccessible)
+        XCTAssertEqual(s3.headObjectInputs.count, 1)
+    }
+
+    func testUploadFileAddsChecksumMetadataForSinglePart() async throws {
+        let database = try makeDatabaseService()
+        let directory = try makeTemporaryDirectory(prefix: "IceVaultTests-SinglePartMetadata")
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let fileURL = directory.appendingPathComponent("payload.txt")
+        let payload = Data("payload".utf8)
+        try payload.write(to: fileURL)
+
+        var fileRecord = FileRecord(
+            sourcePath: directory.path,
+            relativePath: "payload.txt",
+            fileSize: Int64(payload.count),
+            modifiedAt: Date(),
+            sha256: "sha-single",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&fileRecord)
+        let fileRecordID = try XCTUnwrap(fileRecord.id)
+
+        let s3 = MockGlacierS3Client()
+        let client = GlacierClient(
+            s3Client: s3,
+            fileManager: .default,
+            database: database,
+            multipartThreshold: 1_000_000
+        )
+
+        _ = try await client.uploadFile(
+            localPath: fileURL.path,
+            bucket: "bucket",
+            key: "payload.txt",
+            fileRecordId: fileRecordID
+        )
+
+        XCTAssertEqual(s3.putObjectInputs.count, 1)
+        XCTAssertEqual(
+            s3.putObjectInputs.first?.metadata?[GlacierClient.sha256MetadataKey],
+            "sha-single"
+        )
     }
 
     func testUploadFileValidationRejectsInvalidKeyStorageClassAndMissingFile() async throws {
