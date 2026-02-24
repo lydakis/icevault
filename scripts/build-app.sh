@@ -307,7 +307,13 @@ fi
 
 codesign --verify --deep --strict --verbose=2 "${APP_DIR}"
 if [[ -n "${SIGN_IDENTITY}" ]]; then
-  spctl --assess --type execute --verbose=4 "${APP_DIR}"
+  if [[ "${NOTARIZE}" -eq 1 ]]; then
+    echo "Skipping Gatekeeper assessment before notarization."
+  else
+    if ! spctl --assess --type execute --verbose=4 "${APP_DIR}"; then
+      echo "Warning: Gatekeeper rejected app (likely not notarized yet)." >&2
+    fi
+  fi
 fi
 
 if [[ "${NOTARIZE}" -eq 1 ]]; then
@@ -321,6 +327,7 @@ if [[ "${NOTARIZE}" -eq 1 ]]; then
     --wait
   xcrun stapler staple "${APP_DIR}"
   xcrun stapler validate "${APP_DIR}"
+  spctl --assess --type execute --verbose=4 "${APP_DIR}"
   rm -f "${NOTARY_ZIP_PATH}"
 fi
 
