@@ -135,6 +135,26 @@ struct SettingsView: View {
                 }
             }
 
+            Section("Performance") {
+                Stepper(
+                    value: $draft.maxConcurrentFileUploads,
+                    in: AppState.Settings.minimumUploadConcurrency...AppState.Settings.maximumConcurrentFileUploads
+                ) {
+                    Text("Concurrent File Uploads: \(draft.maxConcurrentFileUploads)")
+                }
+
+                Stepper(
+                    value: $draft.maxConcurrentMultipartPartUploads,
+                    in: AppState.Settings.minimumUploadConcurrency...AppState.Settings.maximumConcurrentMultipartPartUploads
+                ) {
+                    Text("Multipart Parts Per File: \(draft.maxConcurrentMultipartPartUploads)")
+                }
+
+                Text("Higher values can increase throughput but may saturate network bandwidth or trigger S3 throttling.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Scheduling") {
                 Toggle("Scheduled Backups", isOn: $draft.scheduledBackupsEnabled)
 
@@ -291,6 +311,14 @@ struct SettingsView: View {
             normalizedSettings.ssoProfileName = trimmed(draft.ssoProfileName)
             normalizedSettings.sourcePath = trimmed(draft.sourcePath)
             normalizedSettings.customIntervalHours = min(max(draft.customIntervalHours, 1), 168)
+            normalizedSettings.maxConcurrentFileUploads = min(
+                max(draft.maxConcurrentFileUploads, AppState.Settings.minimumUploadConcurrency),
+                AppState.Settings.maximumConcurrentFileUploads
+            )
+            normalizedSettings.maxConcurrentMultipartPartUploads = min(
+                max(draft.maxConcurrentMultipartPartUploads, AppState.Settings.minimumUploadConcurrency),
+                AppState.Settings.maximumConcurrentMultipartPartUploads
+            )
             appState.updateSettings(normalizedSettings)
             _ = try appState.applyScheduledBackups()
             scheduleInstalled = appState.scheduledBackupsInstalled()

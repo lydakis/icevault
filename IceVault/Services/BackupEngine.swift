@@ -20,6 +20,8 @@ enum BackupEngineError: LocalizedError {
     }
 }
 
+/// Thread-safety invariant: stored properties are immutable after initialization, and
+/// per-run mutable state is kept in local actors/value types inside `run`.
 final class BackupEngine: @unchecked Sendable {
     typealias GlacierClientFactory = (
         _ accessKey: String,
@@ -34,6 +36,72 @@ final class BackupEngine: @unchecked Sendable {
     private enum DatabaseState {
         case available(DatabaseService)
         case unavailable(String)
+    }
+
+    private struct PendingUploadPlan: Sendable {
+        let recordID: Int64
+        let relativePath: String
+        let localPath: String
+        let objectKey: String
+        let fileSize: Int64
+    }
+
+    private struct UploadProgressSnapshot: Sendable {
+        let filesUploaded: Int
+        let bytesUploaded: Int64
+    }
+
+    private actor UploadProgressTracker {
+        private let fileSizesByRecordID: [Int64: Int64]
+        private let totalBytes: Int64
+
+        private var completedRecordIDs: Set<Int64> = []
+        private var inFlightBytesByRecordID: [Int64: Int64] = [:]
+        private var inFlightBytesTotal: Int64 = 0
+        private var completedBytes: Int64 = 0
+
+        init(plans: [PendingUploadPlan], totalBytes: Int64) {
+            self.fileSizesByRecordID = Dictionary(
+                uniqueKeysWithValues: plans.map { ($0.recordID, $0.fileSize) }
+            )
+            self.totalBytes = max(totalBytes, 0)
+        }
+
+        func update(recordID: Int64, uploadedBytes: Int64) -> UploadProgressSnapshot {
+            guard
+                !completedRecordIDs.contains(recordID),
+                let fileSize = fileSizesByRecordID[recordID]
+            else {
+                return snapshot()
+            }
+
+            let boundedProgress = min(max(uploadedBytes, 0), max(fileSize, 0))
+            let previousProgress = inFlightBytesByRecordID[recordID] ?? 0
+            let nextProgress = max(previousProgress, boundedProgress)
+            inFlightBytesByRecordID[recordID] = nextProgress
+            inFlightBytesTotal += nextProgress - previousProgress
+            return snapshot()
+        }
+
+        func markCompleted(recordID: Int64) -> UploadProgressSnapshot {
+            guard !completedRecordIDs.contains(recordID) else {
+                return snapshot()
+            }
+
+            completedRecordIDs.insert(recordID)
+            let previousInFlightProgress = inFlightBytesByRecordID.removeValue(forKey: recordID) ?? 0
+            inFlightBytesTotal -= previousInFlightProgress
+            completedBytes += max(fileSizesByRecordID[recordID] ?? 0, 0)
+            return snapshot()
+        }
+
+        private func snapshot() -> UploadProgressSnapshot {
+            let uploadedBytes = min(totalBytes, max(completedBytes + inFlightBytesTotal, 0))
+            return UploadProgressSnapshot(
+                filesUploaded: completedRecordIDs.count,
+                bytesUploaded: uploadedBytes
+            )
+        }
     }
 
     private let scanner: FileScanner
@@ -114,53 +182,17 @@ final class BackupEngine: @unchecked Sendable {
                 return
             }
 
-            var completedFiles = 0
-            var completedBytes: Int64 = 0
             let sourceRootURL = URL(fileURLWithPath: sourceRoot, isDirectory: true)
-
-            for record in pendingFiles {
-                try Task.checkCancellation()
-
-                guard let recordID = record.id else {
-                    throw BackupEngineError.missingFileRecordID(record.relativePath)
-                }
-
-                let localFileURL = sourceRootURL.appendingPathComponent(record.relativePath)
-                guard fileManager.fileExists(atPath: localFileURL.path) else {
-                    throw BackupEngineError.sourceFileMissing(localFileURL.path)
-                }
-
-                let objectKey = Self.objectKey(from: record.relativePath)
-                let fileSize = max(record.fileSize, 0)
-                let bytesCommittedBeforeFile = completedBytes
-                let filesCommittedBeforeFile = completedFiles
-
-                _ = try await glacierClient.uploadFile(
-                    localPath: localFileURL.path,
-                    bucket: bucket,
-                    key: objectKey,
-                    storageClass: FileRecord.deepArchiveStorageClass,
-                    fileRecordId: recordID
-                ) { uploadedBytesForCurrentFile in
-                    let boundedProgress = min(max(uploadedBytesForCurrentFile, 0), fileSize)
-                    Task { @MainActor in
-                        job.filesUploaded = filesCommittedBeforeFile
-                        job.bytesUploaded = min(job.bytesTotal, bytesCommittedBeforeFile + boundedProgress)
-                    }
-                }
-
-                try database.markUploaded(id: recordID, glacierKey: objectKey)
-
-                completedFiles += 1
-                completedBytes += fileSize
-                let filesCommitted = completedFiles
-                let bytesCommitted = completedBytes
-
-                await MainActor.run {
-                    job.filesUploaded = filesCommitted
-                    job.bytesUploaded = min(job.bytesTotal, bytesCommitted)
-                }
-            }
+            let uploadPlans = try makeUploadPlans(pendingFiles: pendingFiles, sourceRootURL: sourceRootURL)
+            try await uploadPendingFiles(
+                plans: uploadPlans,
+                bucket: bucket,
+                settings: settings,
+                database: database,
+                glacierClient: glacierClient,
+                job: job,
+                totalBytes: bytesTotal
+            )
 
             await MainActor.run {
                 job.markCompleted()
@@ -190,6 +222,99 @@ final class BackupEngine: @unchecked Sendable {
     private func pendingFilesAfterSync(scannedFiles: [FileRecord], sourceRoot: String, database: DatabaseService) throws -> [FileRecord] {
         try database.syncScannedFiles(scannedFiles, for: sourceRoot)
         return try database.pendingFiles(for: sourceRoot)
+    }
+
+    private func makeUploadPlans(pendingFiles: [FileRecord], sourceRootURL: URL) throws -> [PendingUploadPlan] {
+        var plans: [PendingUploadPlan] = []
+        plans.reserveCapacity(pendingFiles.count)
+
+        for record in pendingFiles {
+            guard let recordID = record.id else {
+                throw BackupEngineError.missingFileRecordID(record.relativePath)
+            }
+
+            let localFileURL = sourceRootURL.appendingPathComponent(record.relativePath)
+            plans.append(
+                PendingUploadPlan(
+                    recordID: recordID,
+                    relativePath: record.relativePath,
+                    localPath: localFileURL.path,
+                    objectKey: Self.objectKey(from: record.relativePath),
+                    fileSize: max(record.fileSize, 0)
+                )
+            )
+        }
+
+        return plans
+    }
+
+    private func uploadPendingFiles(
+        plans: [PendingUploadPlan],
+        bucket: String,
+        settings: AppState.Settings,
+        database: DatabaseService,
+        glacierClient: GlacierClient,
+        job: BackupJob,
+        totalBytes: Int64
+    ) async throws {
+        guard !plans.isEmpty else {
+            return
+        }
+
+        let fileConcurrency = max(1, min(settings.maxConcurrentFileUploads, plans.count))
+        let multipartPartConcurrency = max(1, settings.maxConcurrentMultipartPartUploads)
+        let progressTracker = UploadProgressTracker(plans: plans, totalBytes: totalBytes)
+
+        try await BoundedTaskRunner.run(
+            inputs: plans,
+            maxConcurrentTasks: fileConcurrency,
+            operation: { plan in
+                _ = try await glacierClient.uploadFile(
+                    localPath: plan.localPath,
+                    bucket: bucket,
+                    key: plan.objectKey,
+                    storageClass: FileRecord.deepArchiveStorageClass,
+                    fileRecordId: plan.recordID,
+                    multipartPartConcurrency: multipartPartConcurrency
+                ) { uploadedBytesForCurrentFile in
+                    let snapshot = await progressTracker.update(
+                        recordID: plan.recordID,
+                        uploadedBytes: uploadedBytesForCurrentFile
+                    )
+                    await MainActor.run {
+                        Self.applyMonotonicProgress(
+                            filesUploaded: snapshot.filesUploaded,
+                            bytesUploaded: snapshot.bytesUploaded,
+                            to: job
+                        )
+                    }
+                }
+                return plan
+            },
+            onSuccess: { completedPlan in
+                try database.markUploaded(id: completedPlan.recordID, glacierKey: completedPlan.objectKey)
+                let snapshot = await progressTracker.markCompleted(recordID: completedPlan.recordID)
+                await MainActor.run {
+                    Self.applyMonotonicProgress(
+                        filesUploaded: snapshot.filesUploaded,
+                        bytesUploaded: snapshot.bytesUploaded,
+                        to: job
+                    )
+                }
+            }
+        )
+    }
+
+    @MainActor
+    static func applyMonotonicProgress(
+        filesUploaded: Int,
+        bytesUploaded: Int64,
+        to job: BackupJob
+    ) {
+        let boundedFiles = min(max(filesUploaded, 0), job.filesTotal)
+        let boundedBytes = min(max(bytesUploaded, 0), job.bytesTotal)
+        job.filesUploaded = max(job.filesUploaded, boundedFiles)
+        job.bytesUploaded = max(job.bytesUploaded, boundedBytes)
     }
 
     private func validate(settings: AppState.Settings, sourceRoot: String, bucket: String) throws {

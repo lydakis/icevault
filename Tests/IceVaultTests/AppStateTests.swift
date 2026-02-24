@@ -19,7 +19,9 @@ final class AppStateTests: XCTestCase {
                 sourcePath: "  /tmp/source ",
                 scheduledBackupsEnabled: true,
                 scheduleInterval: .customHours,
-                customIntervalHours: 999
+                customIntervalHours: 999,
+                maxConcurrentFileUploads: 999,
+                maxConcurrentMultipartPartUploads: 0
             )
         )
 
@@ -27,6 +29,8 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(appState.settings.bucket, "bucket-name")
         XCTAssertEqual(appState.settings.sourcePath, "/tmp/source")
         XCTAssertEqual(appState.settings.customIntervalHours, 168)
+        XCTAssertEqual(appState.settings.maxConcurrentFileUploads, AppState.Settings.maximumConcurrentFileUploads)
+        XCTAssertEqual(appState.settings.maxConcurrentMultipartPartUploads, AppState.Settings.minimumUploadConcurrency)
     }
 
     func testApplyScheduledBackupsInstallsThenUninstalls() throws {
@@ -181,7 +185,9 @@ final class AppStateTests: XCTestCase {
             sourcePath: "/tmp/source",
             scheduledBackupsEnabled: true,
             scheduleInterval: .customHours,
-            customIntervalHours: 0
+            customIntervalHours: 0,
+            maxConcurrentFileUploads: 0,
+            maxConcurrentMultipartPartUploads: 999
         )
 
         let encoded = try JSONEncoder().encode(settings)
@@ -195,6 +201,11 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(decoded.bucket, "bucket")
         XCTAssertEqual(decoded.sourcePath, "/tmp/source")
         XCTAssertEqual(decoded.customIntervalHours, 1)
+        XCTAssertEqual(decoded.maxConcurrentFileUploads, AppState.Settings.minimumUploadConcurrency)
+        XCTAssertEqual(
+            decoded.maxConcurrentMultipartPartUploads,
+            AppState.Settings.maximumConcurrentMultipartPartUploads
+        )
     }
 
     func testStatusAndMenuBarReflectConfigurationHistoryAndCurrentJobState() {

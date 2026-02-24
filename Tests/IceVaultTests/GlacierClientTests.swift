@@ -182,6 +182,126 @@ final class GlacierClientTests: XCTestCase {
         XCTAssertTrue(try database.pendingMultipartUploads().isEmpty)
     }
 
+    func testUploadFileMultipartUsesConfiguredPartConcurrency() async throws {
+        let workingDirectory = try makeTemporaryDirectory(prefix: "IceVaultTests-GlacierMultipartConcurrency")
+        defer { try? FileManager.default.removeItem(at: workingDirectory) }
+
+        let fileURL = workingDirectory.appendingPathComponent("large.bin")
+        let payloadSize = 24 * 1024 * 1024
+        try Data(repeating: 0xA5, count: payloadSize).write(to: fileURL)
+
+        let s3 = MultipartConcurrencyTrackingS3Client(uploadPartDelayNanoseconds: 120_000_000)
+        let client = GlacierClient(
+            s3Client: s3,
+            fileManager: .default,
+            database: nil,
+            multipartThreshold: 1
+        )
+
+        _ = try await client.uploadFile(
+            localPath: fileURL.path,
+            bucket: "test-bucket",
+            key: "archives/large.bin",
+            fileRecordId: nil,
+            multipartPartConcurrency: 3
+        )
+
+        let stats = await s3.uploadPartStats()
+        XCTAssertGreaterThan(stats.uploadPartCallCount, 1)
+        XCTAssertGreaterThanOrEqual(stats.maxInFlightUploadPartCalls, 2)
+        XCTAssertLessThanOrEqual(stats.maxInFlightUploadPartCalls, 3)
+    }
+
+    func testUploadFileMultipartCapsConcurrencyWhenPartsAreLarge() async throws {
+        let workingDirectory = try makeTemporaryDirectory(prefix: "IceVaultTests-GlacierMultipartMemoryCap")
+        defer { try? FileManager.default.removeItem(at: workingDirectory) }
+
+        let fileURL = workingDirectory.appendingPathComponent("sparse-large.bin")
+        try createSparseFile(at: fileURL, size: 100 * 1024 * 1024 * 1024)
+
+        let s3 = FailFastMultipartConcurrencyTrackingS3Client(
+            failingPartNumber: 2,
+            failureDelayNanoseconds: 500_000_000,
+            nonFailDelayNanoseconds: 5_000_000_000
+        )
+        let client = GlacierClient(
+            s3Client: s3,
+            fileManager: .default,
+            database: nil,
+            multipartThreshold: 1
+        )
+
+        do {
+            _ = try await client.uploadFile(
+                localPath: fileURL.path,
+                bucket: "test-bucket",
+                key: "archives/sparse-large.bin",
+                fileRecordId: nil,
+                multipartPartConcurrency: 8
+            )
+            XCTFail("Expected multipart upload to fail")
+        } catch {}
+
+        let stats = await s3.uploadPartStats()
+        XCTAssertGreaterThanOrEqual(stats.maxInFlightUploadPartCalls, 2)
+        XCTAssertLessThan(stats.maxInFlightUploadPartCalls, 8)
+    }
+
+    func testUploadFileMultipartPersistsCompletedPartsWhenSiblingPartFails() async throws {
+        let database = try makeDatabaseService()
+        let workingDirectory = try makeTemporaryDirectory(prefix: "IceVaultTests-GlacierMultipartFailure")
+        defer { try? FileManager.default.removeItem(at: workingDirectory) }
+
+        let fileURL = workingDirectory.appendingPathComponent("large.bin")
+        let payloadSize = 12 * 1024 * 1024
+        try Data(repeating: 0x6A, count: payloadSize).write(to: fileURL)
+
+        var fileRecord = FileRecord(
+            sourcePath: workingDirectory.path,
+            relativePath: "large.bin",
+            fileSize: Int64(payloadSize),
+            modifiedAt: Date(),
+            sha256: "sha-large",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&fileRecord)
+        let fileRecordID = try XCTUnwrap(fileRecord.id)
+
+        let s3 = DeterministicMultipartFailureS3Client(blockedPartNumber: 1, failingPartNumber: 2)
+        let client = GlacierClient(
+            s3Client: s3,
+            fileManager: .default,
+            database: database,
+            multipartThreshold: 1
+        )
+
+        let uploadTask = Task {
+            try await client.uploadFile(
+                localPath: fileURL.path,
+                bucket: "test-bucket",
+                key: "archives/large.bin",
+                fileRecordId: fileRecordID,
+                multipartPartConcurrency: 2
+            )
+        }
+
+        await s3.waitUntilFailureTriggered()
+        await s3.releaseBlockedPart()
+
+        do {
+            _ = try await uploadTask.value
+            XCTFail("Expected multipart upload to fail")
+        } catch {}
+
+        let pendingUploads = try database.pendingMultipartUploads()
+        XCTAssertEqual(pendingUploads.count, 1)
+        let pendingUpload = try XCTUnwrap(pendingUploads.first)
+        let completedPartNumbers = try completedPartNumbers(from: pendingUpload.completedPartsJSON)
+        XCTAssertEqual(completedPartNumbers, [1])
+    }
+
     func testCredentialsFromAWSCLIAndRegionFromConfigParseDefaultProfile() throws {
         let home = try makeTemporaryDirectory(prefix: "IceVaultTests-AWSHome")
         defer { try? FileManager.default.removeItem(at: home) }
@@ -563,6 +683,38 @@ final class GlacierClientTests: XCTestCase {
         return try DatabaseService(databaseURL: databaseURL)
     }
 
+    private func createSparseFile(at fileURL: URL, size: UInt64) throws {
+        guard FileManager.default.createFile(atPath: fileURL.path, contents: nil) else {
+            XCTFail("Failed to create sparse file at \(fileURL.path)")
+            return
+        }
+
+        let handle = try FileHandle(forWritingTo: fileURL)
+        defer {
+            if #available(macOS 11, *) {
+                try? handle.close()
+            } else {
+                handle.closeFile()
+            }
+        }
+
+        if #available(macOS 11, *) {
+            try handle.truncate(atOffset: size)
+        } else {
+            handle.truncateFile(atOffset: size)
+        }
+    }
+
+    private func completedPartNumbers(from completedPartsJSON: String) throws -> [Int] {
+        let data = try XCTUnwrap(completedPartsJSON.data(using: .utf8))
+        let decoded = try JSONSerialization.jsonObject(with: data)
+        guard let items = decoded as? [[String: Any]] else {
+            XCTFail("Expected completed parts JSON array")
+            return []
+        }
+        return items.compactMap { $0["partNumber"] as? Int }.sorted()
+    }
+
     private func makeFakeAWSCLI(in directory: URL, jsonResponse: String) throws -> URL {
         let binDirectory = directory.appendingPathComponent("bin", isDirectory: true)
         try FileManager.default.createDirectory(at: binDirectory, withIntermediateDirectories: true)
@@ -578,92 +730,4 @@ final class GlacierClientTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
         return scriptURL
     }
-}
-
-private final class MockGlacierS3Client: GlacierS3Client {
-    var createMultipartUploadInputs: [CreateMultipartUploadInput] = []
-    var uploadPartInputs: [UploadPartInput] = []
-    var completeMultipartUploadInputs: [CompleteMultipartUploadInput] = []
-    var abortMultipartUploadInputs: [AbortMultipartUploadInput] = []
-    var listPartsInputs: [ListPartsInput] = []
-    var putObjectInputs: [PutObjectInput] = []
-    var headBucketInputs: [HeadBucketInput] = []
-
-    var createMultipartUploadOutput = CreateMultipartUploadOutput(uploadId: "upload-id")
-    var uploadPartOutput = UploadPartOutput(eTag: "\"etag-uploaded\"")
-    var completeMultipartUploadOutput = CompleteMultipartUploadOutput()
-    var abortMultipartUploadOutput = AbortMultipartUploadOutput()
-    var putObjectOutput = PutObjectOutput()
-    var headBucketOutput = HeadBucketOutput()
-    var listPartsOutputs: [ListPartsOutput] = [ListPartsOutput(isTruncated: false, nextPartNumberMarker: nil, parts: [])]
-    var createMultipartUploadError: Error?
-    var uploadPartError: Error?
-    var completeMultipartUploadError: Error?
-    var abortMultipartUploadError: Error?
-    var listPartsError: Error?
-    var putObjectError: Error?
-    var headBucketError: Error?
-
-    func createMultipartUpload(input: CreateMultipartUploadInput) async throws -> CreateMultipartUploadOutput {
-        createMultipartUploadInputs.append(input)
-        if let createMultipartUploadError {
-            throw createMultipartUploadError
-        }
-        return createMultipartUploadOutput
-    }
-
-    func uploadPart(input: UploadPartInput) async throws -> UploadPartOutput {
-        uploadPartInputs.append(input)
-        if let uploadPartError {
-            throw uploadPartError
-        }
-        return uploadPartOutput
-    }
-
-    func completeMultipartUpload(input: CompleteMultipartUploadInput) async throws -> CompleteMultipartUploadOutput {
-        completeMultipartUploadInputs.append(input)
-        if let completeMultipartUploadError {
-            throw completeMultipartUploadError
-        }
-        return completeMultipartUploadOutput
-    }
-
-    func abortMultipartUpload(input: AbortMultipartUploadInput) async throws -> AbortMultipartUploadOutput {
-        abortMultipartUploadInputs.append(input)
-        if let abortMultipartUploadError {
-            throw abortMultipartUploadError
-        }
-        return abortMultipartUploadOutput
-    }
-
-    func listParts(input: ListPartsInput) async throws -> ListPartsOutput {
-        listPartsInputs.append(input)
-        if let listPartsError {
-            throw listPartsError
-        }
-        if !listPartsOutputs.isEmpty {
-            return listPartsOutputs.removeFirst()
-        }
-        return ListPartsOutput(isTruncated: false, nextPartNumberMarker: nil, parts: [])
-    }
-
-    func putObject(input: PutObjectInput) async throws -> PutObjectOutput {
-        putObjectInputs.append(input)
-        if let putObjectError {
-            throw putObjectError
-        }
-        return putObjectOutput
-    }
-
-    func headBucket(input: HeadBucketInput) async throws -> HeadBucketOutput {
-        headBucketInputs.append(input)
-        if let headBucketError {
-            throw headBucketError
-        }
-        return headBucketOutput
-    }
-}
-
-private enum MockS3Error: Error {
-    case syntheticFailure
 }

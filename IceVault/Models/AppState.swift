@@ -4,6 +4,12 @@ import Foundation
 @MainActor
 final class AppState: ObservableObject {
     struct Settings: Codable, Equatable {
+        static let defaultMaxConcurrentFileUploads = 3
+        static let defaultMaxConcurrentMultipartPartUploads = 2
+        static let minimumUploadConcurrency = 1
+        static let maximumConcurrentFileUploads = 8
+        static let maximumConcurrentMultipartPartUploads = 8
+
         enum AuthenticationMethod: String, Codable, CaseIterable, Identifiable {
             case staticKeys
             case ssoProfile
@@ -54,6 +60,8 @@ final class AppState: ObservableObject {
         var scheduledBackupsEnabled: Bool = false
         var scheduleInterval: ScheduleInterval = .daily
         var customIntervalHours: Int = 24
+        var maxConcurrentFileUploads: Int = Settings.defaultMaxConcurrentFileUploads
+        var maxConcurrentMultipartPartUploads: Int = Settings.defaultMaxConcurrentMultipartPartUploads
 
         enum CodingKeys: String, CodingKey {
             case awsRegion
@@ -64,6 +72,8 @@ final class AppState: ObservableObject {
             case scheduledBackupsEnabled
             case scheduleInterval
             case customIntervalHours
+            case maxConcurrentFileUploads
+            case maxConcurrentMultipartPartUploads
         }
 
         init(
@@ -77,7 +87,9 @@ final class AppState: ObservableObject {
             sourcePath: String = "",
             scheduledBackupsEnabled: Bool = false,
             scheduleInterval: ScheduleInterval = .daily,
-            customIntervalHours: Int = 24
+            customIntervalHours: Int = 24,
+            maxConcurrentFileUploads: Int = Settings.defaultMaxConcurrentFileUploads,
+            maxConcurrentMultipartPartUploads: Int = Settings.defaultMaxConcurrentMultipartPartUploads
         ) {
             self.awsAccessKey = awsAccessKey
             self.awsSecretKey = awsSecretKey
@@ -90,6 +102,8 @@ final class AppState: ObservableObject {
             self.scheduledBackupsEnabled = scheduledBackupsEnabled
             self.scheduleInterval = scheduleInterval
             self.customIntervalHours = max(1, customIntervalHours)
+            self.maxConcurrentFileUploads = Self.clampFileUploadConcurrency(maxConcurrentFileUploads)
+            self.maxConcurrentMultipartPartUploads = Self.clampMultipartPartConcurrency(maxConcurrentMultipartPartUploads)
         }
 
         init(from decoder: Decoder) throws {
@@ -105,6 +119,13 @@ final class AppState: ObservableObject {
             scheduledBackupsEnabled = try container.decodeIfPresent(Bool.self, forKey: .scheduledBackupsEnabled) ?? false
             scheduleInterval = try container.decodeIfPresent(ScheduleInterval.self, forKey: .scheduleInterval) ?? .daily
             customIntervalHours = max(1, try container.decodeIfPresent(Int.self, forKey: .customIntervalHours) ?? 24)
+            maxConcurrentFileUploads = Self.clampFileUploadConcurrency(
+                try container.decodeIfPresent(Int.self, forKey: .maxConcurrentFileUploads) ?? Self.defaultMaxConcurrentFileUploads
+            )
+            maxConcurrentMultipartPartUploads = Self.clampMultipartPartConcurrency(
+                try container.decodeIfPresent(Int.self, forKey: .maxConcurrentMultipartPartUploads)
+                    ?? Self.defaultMaxConcurrentMultipartPartUploads
+            )
         }
 
         func encode(to encoder: Encoder) throws {
@@ -117,6 +138,16 @@ final class AppState: ObservableObject {
             try container.encode(scheduledBackupsEnabled, forKey: .scheduledBackupsEnabled)
             try container.encode(scheduleInterval, forKey: .scheduleInterval)
             try container.encode(customIntervalHours, forKey: .customIntervalHours)
+            try container.encode(maxConcurrentFileUploads, forKey: .maxConcurrentFileUploads)
+            try container.encode(maxConcurrentMultipartPartUploads, forKey: .maxConcurrentMultipartPartUploads)
+        }
+
+        private static func clampFileUploadConcurrency(_ value: Int) -> Int {
+            min(max(value, minimumUploadConcurrency), maximumConcurrentFileUploads)
+        }
+
+        private static func clampMultipartPartConcurrency(_ value: Int) -> Int {
+            min(max(value, minimumUploadConcurrency), maximumConcurrentMultipartPartUploads)
         }
     }
 
@@ -293,6 +324,14 @@ final class AppState: ObservableObject {
         sanitized.bucket = Self.trimmed(sanitized.bucket)
         sanitized.sourcePath = Self.trimmed(sanitized.sourcePath)
         sanitized.customIntervalHours = min(max(sanitized.customIntervalHours, 1), 168)
+        sanitized.maxConcurrentFileUploads = min(
+            max(sanitized.maxConcurrentFileUploads, Settings.minimumUploadConcurrency),
+            Settings.maximumConcurrentFileUploads
+        )
+        sanitized.maxConcurrentMultipartPartUploads = min(
+            max(sanitized.maxConcurrentMultipartPartUploads, Settings.minimumUploadConcurrency),
+            Settings.maximumConcurrentMultipartPartUploads
+        )
         settings = sanitized
         configureSSOTokenMonitor()
         refreshCredentialState()
