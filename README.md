@@ -44,6 +44,24 @@ swift run IceVault --backup
 ./scripts/build-app.sh && open build/IceVault.app
 ```
 
+## Install via Homebrew
+
+```bash
+brew install --cask lydakis/icevault/icevault
+```
+
+Upgrade:
+
+```bash
+brew upgrade --cask lydakis/icevault/icevault
+```
+
+Uninstall:
+
+```bash
+brew uninstall --cask icevault
+```
+
 ## Build DMG
 
 ```bash
