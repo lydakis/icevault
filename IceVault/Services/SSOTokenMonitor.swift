@@ -351,12 +351,16 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
 
     nonisolated private static func runSSOLoginProcess(profileName: String) -> Int32 {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["aws", "sso", "login", "--profile", profileName]
+        let environment = AWSCLI.makeEnvironment(
+            base: ProcessInfo.processInfo.environment,
+            profileName: profileName
+        )
+        guard let awsExecutableURL = AWSCLI.executableURL(environment: environment) else {
+            return -1
+        }
 
-        var environment = ProcessInfo.processInfo.environment
-        environment["AWS_PROFILE"] = profileName
-        environment["AWS_SDK_LOAD_CONFIG"] = "1"
+        process.executableURL = awsExecutableURL
+        process.arguments = ["sso", "login", "--profile", profileName]
         process.environment = environment
 
         process.standardOutput = Pipe()

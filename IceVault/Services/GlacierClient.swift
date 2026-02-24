@@ -1236,9 +1236,16 @@ final class GlacierClient: @unchecked Sendable {
         environment: [String: String]
     ) -> AWSCredentials? {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        let processEnvironment = AWSCLI.makeEnvironment(
+            base: environment,
+            profileName: profileName
+        )
+        guard let awsExecutableURL = AWSCLI.executableURL(environment: processEnvironment) else {
+            return nil
+        }
+
+        process.executableURL = awsExecutableURL
         process.arguments = [
-            "aws",
             "configure",
             "export-credentials",
             "--profile",
@@ -1246,10 +1253,6 @@ final class GlacierClient: @unchecked Sendable {
             "--format",
             "process"
         ]
-
-        var processEnvironment = environment
-        processEnvironment["AWS_PROFILE"] = profileName
-        processEnvironment["AWS_SDK_LOAD_CONFIG"] = "1"
         process.environment = processEnvironment
 
         let outputPipe = Pipe()

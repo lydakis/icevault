@@ -419,12 +419,16 @@ struct SettingsView: View {
     private func runSSOLogin(profileName: String) async -> (Int32, String) {
         await Task.detached(priority: .userInitiated) {
             let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            process.arguments = ["aws", "sso", "login", "--profile", profileName]
+            let environment = AWSCLI.makeEnvironment(
+                base: ProcessInfo.processInfo.environment,
+                profileName: profileName
+            )
+            guard let awsExecutableURL = AWSCLI.executableURL(environment: environment) else {
+                return (-1, "AWS CLI not found. Install it with `brew install awscli`.")
+            }
 
-            var environment = ProcessInfo.processInfo.environment
-            environment["AWS_PROFILE"] = profileName
-            environment["AWS_SDK_LOAD_CONFIG"] = "1"
+            process.executableURL = awsExecutableURL
+            process.arguments = ["sso", "login", "--profile", profileName]
             process.environment = environment
 
             let outputPipe = Pipe()
