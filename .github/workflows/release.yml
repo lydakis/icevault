@@ -40,10 +40,89 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
+      - name: Validate signing and notarization secrets
+        env:
+          APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+          APPLE_DEVELOPER_ID_APPLICATION: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION }}
+          APP_STORE_CONNECT_API_KEY_P8: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          missing=0
+          for key in \
+            APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 \
+            APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD \
+            APPLE_DEVELOPER_ID_APPLICATION \
+            APP_STORE_CONNECT_API_KEY_P8 \
+            APP_STORE_CONNECT_KEY_ID \
+            APP_STORE_CONNECT_ISSUER_ID
+          do
+            if [[ -z "${!key}" ]]; then
+              echo "Missing required secret: ${key}" >&2
+              missing=1
+            fi
+          done
+          if [[ "${missing}" -ne 0 ]]; then
+            exit 1
+          fi
+
+      - name: Import Developer ID certificate
+        env:
+          APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+        run: |
+          CERT_PATH="${RUNNER_TEMP}/icevault-signing-cert.p12"
+          KEYCHAIN_PATH="${RUNNER_TEMP}/icevault-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+
+          printf '%s' "${APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64}" | base64 -D > "${CERT_PATH}"
+
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security import "${CERT_PATH}" \
+            -k "${KEYCHAIN_PATH}" \
+            -P "${APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD}" \
+            -A \
+            -t cert \
+            -f pkcs12
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "${KEYCHAIN_PASSWORD}" \
+            "${KEYCHAIN_PATH}"
+
+          security list-keychains -d user -s "${KEYCHAIN_PATH}"
+          security default-keychain -d user -s "${KEYCHAIN_PATH}"
+          security find-identity -v -p codesigning "${KEYCHAIN_PATH}"
+
+          {
+            echo "ICEVAULT_BUILD_KEYCHAIN_PATH=${KEYCHAIN_PATH}"
+            echo "ICEVAULT_BUILD_KEYCHAIN_PASSWORD=${KEYCHAIN_PASSWORD}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Write App Store Connect API key file
+        id: asc_key
+        env:
+          APP_STORE_CONNECT_API_KEY_P8: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
+        run: |
+          ASC_KEY_PATH="${RUNNER_TEMP}/app-store-connect-key.p8"
+          printf '%b' "${APP_STORE_CONNECT_API_KEY_P8}" > "${ASC_KEY_PATH}"
+          chmod 600 "${ASC_KEY_PATH}"
+          echo "path=${ASC_KEY_PATH}" >> "${GITHUB_OUTPUT}"
+
       - name: Build DMG
+        env:
+          ICEVAULT_SIGN_IDENTITY: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION }}
+          ICEVAULT_NOTARIZE: "1"
+          ICEVAULT_ASC_API_KEY_PATH: ${{ steps.asc_key.outputs.path }}
+          ICEVAULT_ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ICEVAULT_ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
         run: |
           ./scripts/build-app.sh \
             --dmg \
+            --notarize \
             --version "${{ steps.version.outputs.version }}" \
             --arch "${{ matrix.arch }}" \
             --output-dir dist
@@ -61,6 +140,13 @@ jobs:
             dist/*.dmg
             dist/*.sha256
           if-no-files-found: error
+
+      - name: Cleanup signing keychain
+        if: always()
+        run: |
+          if [[ -n "${ICEVAULT_BUILD_KEYCHAIN_PATH:-}" ]]; then
+            security delete-keychain "${ICEVAULT_BUILD_KEYCHAIN_PATH}" || true
+          fi
 
   publish-release:
     name: Publish GitHub Release
