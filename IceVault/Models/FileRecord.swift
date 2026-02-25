@@ -14,6 +14,7 @@ struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord, Identifia
     var glacierKey: String
     var uploadedAt: Date?
     var storageClass: String
+    var scanToken: String?
 
     init(
         id: Int64? = nil,
@@ -24,7 +25,8 @@ struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord, Identifia
         sha256: String = "",
         glacierKey: String = "",
         uploadedAt: Date? = nil,
-        storageClass: String = FileRecord.deepArchiveStorageClass
+        storageClass: String = FileRecord.deepArchiveStorageClass,
+        scanToken: String? = nil
     ) {
         self.id = id
         self.sourcePath = sourcePath
@@ -35,6 +37,7 @@ struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord, Identifia
         self.glacierKey = glacierKey
         self.uploadedAt = uploadedAt
         self.storageClass = storageClass
+        self.scanToken = scanToken
     }
 
     mutating func didInsert(_ inserted: InsertionSuccess) {
@@ -51,5 +54,6 @@ struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord, Identifia
         case glacierKey
         case uploadedAt
         case storageClass
+        case scanToken
     }
 }

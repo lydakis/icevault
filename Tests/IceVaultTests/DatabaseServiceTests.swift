@@ -113,6 +113,168 @@ final class DatabaseServiceTests: XCTestCase {
         XCTAssertTrue(pending.isEmpty)
     }
 
+    func testStreamingSyncPreservesIncrementalDiffBehavior() throws {
+        let database = try makeDatabaseService()
+        let sourceRoot = "/tmp/source"
+        let fixedDate = Date(timeIntervalSince1970: 1_700_000_350)
+
+        var unchangedUploaded = FileRecord(
+            sourcePath: sourceRoot,
+            relativePath: "unchanged.txt",
+            fileSize: 4,
+            modifiedAt: fixedDate,
+            sha256: "same",
+            glacierKey: "unchanged.txt",
+            uploadedAt: Date(),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        var changedUploaded = FileRecord(
+            sourcePath: sourceRoot,
+            relativePath: "changed.txt",
+            fileSize: 4,
+            modifiedAt: fixedDate,
+            sha256: "old",
+            glacierKey: "changed.txt",
+            uploadedAt: Date(),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        var staleUploaded = FileRecord(
+            sourcePath: sourceRoot,
+            relativePath: "stale.txt",
+            fileSize: 4,
+            modifiedAt: fixedDate,
+            sha256: "stale",
+            glacierKey: "stale.txt",
+            uploadedAt: Date(),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&unchangedUploaded)
+        try database.insertFile(&changedUploaded)
+        try database.insertFile(&staleUploaded)
+
+        let changedScan = FileRecord(
+            sourcePath: sourceRoot,
+            relativePath: "changed.txt",
+            fileSize: 4,
+            modifiedAt: fixedDate,
+            sha256: "new",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        let newScan = FileRecord(
+            sourcePath: sourceRoot,
+            relativePath: "new.txt",
+            fileSize: 7,
+            modifiedAt: fixedDate,
+            sha256: "new-file",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+
+        try database.syncScannedFiles(for: sourceRoot) { consume in
+            try consume(changedScan)
+            try consume(newScan)
+            try consume(unchangedUploaded)
+        }
+
+        let all = try database.allFiles().filter { $0.sourcePath == sourceRoot }
+        XCTAssertEqual(Set(all.map(\.relativePath)), ["changed.txt", "new.txt", "unchanged.txt"])
+
+        let changed = try XCTUnwrap(all.first(where: { $0.relativePath == "changed.txt" }))
+        XCTAssertEqual(changed.sha256, "new")
+        XCTAssertEqual(changed.glacierKey, "")
+        XCTAssertNil(changed.uploadedAt)
+
+        let unchanged = try XCTUnwrap(all.first(where: { $0.relativePath == "unchanged.txt" }))
+        XCTAssertEqual(unchanged.sha256, "same")
+        XCTAssertNotNil(unchanged.uploadedAt)
+
+        let inserted = try XCTUnwrap(all.first(where: { $0.relativePath == "new.txt" }))
+        XCTAssertEqual(inserted.sha256, "new-file")
+        XCTAssertNil(inserted.uploadedAt)
+    }
+
+    func testScanTokenSyncSupportsBatchedUpsertsAndStaleCleanup() throws {
+        let database = try makeDatabaseService()
+        let sourceRoot = "/tmp/source"
+        let fixedDate = Date(timeIntervalSince1970: 1_700_000_375)
+
+        var uploaded = FileRecord(
+            sourcePath: sourceRoot,
+            relativePath: "uploaded.txt",
+            fileSize: 10,
+            modifiedAt: fixedDate,
+            sha256: "uploaded-hash",
+            glacierKey: "uploaded.txt",
+            uploadedAt: Date(),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        var stale = FileRecord(
+            sourcePath: sourceRoot,
+            relativePath: "stale.txt",
+            fileSize: 10,
+            modifiedAt: fixedDate,
+            sha256: "stale-hash",
+            glacierKey: "stale.txt",
+            uploadedAt: Date(),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&uploaded)
+        try database.insertFile(&stale)
+
+        let scanToken = try database.beginScan(for: sourceRoot)
+
+        let scannedUploaded = FileRecord(
+            sourcePath: sourceRoot,
+            relativePath: "uploaded.txt",
+            fileSize: 10,
+            modifiedAt: fixedDate,
+            sha256: "uploaded-hash",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        let scannedNewA = FileRecord(
+            sourcePath: sourceRoot,
+            relativePath: "new-a.txt",
+            fileSize: 5,
+            modifiedAt: fixedDate,
+            sha256: "new-a",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        let scannedNewB = FileRecord(
+            sourcePath: sourceRoot,
+            relativePath: "new-b.txt",
+            fileSize: 6,
+            modifiedAt: fixedDate,
+            sha256: "new-b",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+
+        let pendingFromBatch = try database.syncScannedFilesBatch(
+            [scannedUploaded, scannedNewA, scannedNewB],
+            for: sourceRoot,
+            scanToken: scanToken
+        )
+
+        XCTAssertEqual(
+            Set(pendingFromBatch.map(\.relativePath)),
+            ["new-a.txt", "new-b.txt"]
+        )
+
+        try database.finishScan(for: sourceRoot, scanToken: scanToken)
+
+        let all = try database.allFiles().filter { $0.sourcePath == sourceRoot }
+        XCTAssertEqual(Set(all.map(\.relativePath)), ["new-a.txt", "new-b.txt", "uploaded.txt"])
+        XCTAssertFalse(all.contains(where: { $0.relativePath == "stale.txt" }))
+    }
+
     func testPendingMultipartUploadPersistsResumeToken() throws {
         let database = try makeDatabaseService()
         let sourceRoot = "/tmp/source"

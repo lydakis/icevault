@@ -1,54 +1,111 @@
 import CryptoKit
 import Foundation
 
-final class FileScanner {
+class FileScanner: @unchecked Sendable {
     private let fileManager: FileManager
 
     init(fileManager: FileManager = .default) {
         self.fileManager = fileManager
     }
 
-    func scan(sourceRoot: String) throws -> [FileRecord] {
+    func scan(
+        sourceRoot: String,
+        onRecord: (FileRecord) throws -> Void
+    ) throws {
         let rootURL = URL(fileURLWithPath: sourceRoot, isDirectory: true).standardizedFileURL
         let keys: Set<URLResourceKey> = [
+            .isDirectoryKey,
             .isRegularFileKey,
+            .isSymbolicLinkKey,
             .fileSizeKey,
             .contentModificationDateKey
         ]
 
-        guard let enumerator = fileManager.enumerator(
+        try scanDirectory(
             at: rootURL,
-            includingPropertiesForKeys: Array(keys),
-            options: [],
-            errorHandler: { _, _ in
-                // Ignore inaccessible paths so one file doesn't fail the whole scan.
-                true
-            }
-        ) else {
-            return []
+            rootURL: rootURL,
+            sourceRoot: sourceRoot,
+            keys: keys,
+            onRecord: onRecord
+        )
+    }
+
+    func scan(sourceRoot: String) throws -> [FileRecord] {
+        var records: [FileRecord] = []
+        try scan(sourceRoot: sourceRoot) { record in
+            records.append(record)
         }
 
-        var records: [FileRecord] = []
+        return records.sorted { lhs, rhs in
+            lhs.relativePath.localizedStandardCompare(rhs.relativePath) == .orderedAscending
+        }
+    }
 
-        for case let fileURL as URL in enumerator {
-            if shouldSkip(fileURL: fileURL) {
+    private func shouldSkip(fileURL: URL) -> Bool {
+        fileURL.lastPathComponent == ".DS_Store"
+    }
+
+    private func scanDirectory(
+        at directoryURL: URL,
+        rootURL: URL,
+        sourceRoot: String,
+        keys: Set<URLResourceKey>,
+        onRecord: (FileRecord) throws -> Void
+    ) throws {
+        let entries: [URL]
+        do {
+            entries = try fileManager.contentsOfDirectory(
+                at: directoryURL,
+                includingPropertiesForKeys: Array(keys),
+                options: []
+            )
+        } catch {
+            // Ignore inaccessible directories so one folder doesn't fail the whole scan.
+            return
+        }
+
+        let sortedEntries = entries.sorted { lhs, rhs in
+            lhs.lastPathComponent.localizedStandardCompare(rhs.lastPathComponent) == .orderedAscending
+        }
+
+        for entryURL in sortedEntries {
+            if shouldSkip(fileURL: entryURL) {
                 continue
             }
 
-            let values = try fileURL.resourceValues(forKeys: keys)
+            let values: URLResourceValues
+            do {
+                values = try entryURL.resourceValues(forKeys: keys)
+            } catch {
+                continue
+            }
+
+            if values.isDirectory == true {
+                if values.isSymbolicLink == true {
+                    continue
+                }
+                try scanDirectory(
+                    at: entryURL,
+                    rootURL: rootURL,
+                    sourceRoot: sourceRoot,
+                    keys: keys,
+                    onRecord: onRecord
+                )
+                continue
+            }
+
             guard values.isRegularFile == true else {
                 continue
             }
 
-            let relativePath = self.relativePath(of: fileURL, from: rootURL)
+            let relativePath = self.relativePath(of: entryURL, from: rootURL)
             let modifiedAt = values.contentModificationDate ?? Date.distantPast
             let fileSize = Int64(values.fileSize ?? 0)
-            guard let sha256 = try? Self.sha256Hex(for: fileURL) else {
-                // Keep scanning when a single file becomes unreadable.
+            guard let sha256 = try? Self.sha256Hex(for: entryURL) else {
                 continue
             }
 
-            records.append(
+            try onRecord(
                 FileRecord(
                     sourcePath: sourceRoot,
                     relativePath: relativePath,
@@ -61,14 +118,6 @@ final class FileScanner {
                 )
             )
         }
-
-        return records.sorted { lhs, rhs in
-            lhs.relativePath.localizedStandardCompare(rhs.relativePath) == .orderedAscending
-        }
-    }
-
-    private func shouldSkip(fileURL: URL) -> Bool {
-        fileURL.lastPathComponent == ".DS_Store"
     }
 
     private func relativePath(of fileURL: URL, from rootURL: URL) -> String {

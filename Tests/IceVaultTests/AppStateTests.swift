@@ -21,7 +21,8 @@ final class AppStateTests: XCTestCase {
                 scheduleInterval: .customHours,
                 customIntervalHours: 999,
                 maxConcurrentFileUploads: 999,
-                maxConcurrentMultipartPartUploads: 0
+                maxConcurrentMultipartPartUploads: 0,
+                maxBufferedPendingPlans: 999_999
             )
         )
 
@@ -31,6 +32,7 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(appState.settings.customIntervalHours, 168)
         XCTAssertEqual(appState.settings.maxConcurrentFileUploads, AppState.Settings.maximumConcurrentFileUploads)
         XCTAssertEqual(appState.settings.maxConcurrentMultipartPartUploads, AppState.Settings.minimumUploadConcurrency)
+        XCTAssertEqual(appState.settings.maxBufferedPendingPlans, AppState.Settings.maximumBufferedPendingPlans)
     }
 
     func testApplyScheduledBackupsInstallsThenUninstalls() throws {
@@ -187,7 +189,8 @@ final class AppStateTests: XCTestCase {
             scheduleInterval: .customHours,
             customIntervalHours: 0,
             maxConcurrentFileUploads: 0,
-            maxConcurrentMultipartPartUploads: 999
+            maxConcurrentMultipartPartUploads: 999,
+            maxBufferedPendingPlans: 1
         )
 
         let encoded = try JSONEncoder().encode(settings)
@@ -206,6 +209,7 @@ final class AppStateTests: XCTestCase {
             decoded.maxConcurrentMultipartPartUploads,
             AppState.Settings.maximumConcurrentMultipartPartUploads
         )
+        XCTAssertEqual(decoded.maxBufferedPendingPlans, AppState.Settings.minimumBufferedPendingPlans)
     }
 
     func testStatusAndMenuBarReflectConfigurationHistoryAndCurrentJobState() {

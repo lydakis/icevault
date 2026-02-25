@@ -150,7 +150,25 @@ struct SettingsView: View {
                     Text("Multipart Parts Per File: \(draft.maxConcurrentMultipartPartUploads)")
                 }
 
+                Toggle("Auto-Tune Scan Buffer", isOn: autoTuneScanBufferBinding)
+                    .help("Automatically sizes the scan-to-upload pending file buffer based on upload concurrency.")
+
+                if draft.maxBufferedPendingPlans != nil {
+                    Stepper(
+                        value: maxBufferedPendingPlansBinding,
+                        in: AppState.Settings.minimumBufferedPendingPlans...AppState.Settings.maximumBufferedPendingPlans,
+                        step: AppState.Settings.minimumBufferedPendingPlans
+                    ) {
+                        Text("Max Buffered Pending Files: \(draft.maxBufferedPendingPlans ?? AppState.Settings.defaultManualMaxBufferedPendingPlans)")
+                    }
+                    .help("Caps how many pending files can be queued between scanning and uploading to bound memory use.")
+                }
+
                 Text("Higher values can increase throughput but may saturate network bandwidth or trigger S3 throttling.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Text("Scan buffer tuning: lower cap = lower memory, higher cap = more scan-ahead.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -283,6 +301,36 @@ struct SettingsView: View {
         }
     }
 
+    private var autoTuneScanBufferBinding: Binding<Bool> {
+        Binding(
+            get: {
+                draft.maxBufferedPendingPlans == nil
+            },
+            set: { isAuto in
+                if isAuto {
+                    draft.maxBufferedPendingPlans = nil
+                } else {
+                    draft.maxBufferedPendingPlans = draft.maxBufferedPendingPlans
+                        ?? AppState.Settings.defaultManualMaxBufferedPendingPlans
+                }
+            }
+        )
+    }
+
+    private var maxBufferedPendingPlansBinding: Binding<Int> {
+        Binding(
+            get: {
+                draft.maxBufferedPendingPlans ?? AppState.Settings.defaultManualMaxBufferedPendingPlans
+            },
+            set: { newValue in
+                draft.maxBufferedPendingPlans = min(
+                    max(newValue, AppState.Settings.minimumBufferedPendingPlans),
+                    AppState.Settings.maximumBufferedPendingPlans
+                )
+            }
+        )
+    }
+
     private func loadDraft() {
         draft = appState.settings
         scheduleInstalled = appState.scheduledBackupsInstalled()
@@ -319,6 +367,14 @@ struct SettingsView: View {
                 max(draft.maxConcurrentMultipartPartUploads, AppState.Settings.minimumUploadConcurrency),
                 AppState.Settings.maximumConcurrentMultipartPartUploads
             )
+            if let maxBufferedPendingPlans = draft.maxBufferedPendingPlans {
+                normalizedSettings.maxBufferedPendingPlans = min(
+                    max(maxBufferedPendingPlans, AppState.Settings.minimumBufferedPendingPlans),
+                    AppState.Settings.maximumBufferedPendingPlans
+                )
+            } else {
+                normalizedSettings.maxBufferedPendingPlans = nil
+            }
             appState.updateSettings(normalizedSettings)
             _ = try appState.applyScheduledBackups()
             scheduleInstalled = appState.scheduledBackupsInstalled()

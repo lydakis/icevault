@@ -1,7 +1,10 @@
 import Foundation
 import GRDB
 
-final class DatabaseService {
+final class DatabaseService: @unchecked Sendable {
+    typealias ScannedFileConsumer = (FileRecord) throws -> Void
+    typealias ScannedFileStream = (_ consume: ScannedFileConsumer) throws -> Void
+
     private let dbQueue: DatabaseQueue
 
     init(databaseURL: URL? = nil) throws {
@@ -123,55 +126,165 @@ final class DatabaseService {
         }
     }
 
-    func syncScannedFiles(_ scannedFiles: [FileRecord], for sourceRoot: String) throws {
-        try dbQueue.write { db in
-            let existingRecords = try FileRecord
+    func uploadedFiles(
+        for sourceRoot: String,
+        afterRelativePath: String?,
+        limit: Int,
+        uploadedBefore: Date? = nil
+    ) throws -> [FileRecord] {
+        try dbQueue.read { db in
+            var request = FileRecord
                 .filter(FileRecord.Columns.sourcePath == sourceRoot)
-                .fetchAll(db)
-            var existingByRelativePath = Dictionary(
-                uniqueKeysWithValues: existingRecords.map { ($0.relativePath, $0) }
-            )
+                .filter(FileRecord.Columns.uploadedAt != nil)
+                .order(FileRecord.Columns.relativePath)
+                .limit(max(limit, 0))
 
-            for scanned in scannedFiles {
-                if var existing = existingByRelativePath.removeValue(forKey: scanned.relativePath) {
-                    if Self.hasContentChanged(existing: existing, comparedTo: scanned) {
-                        existing.fileSize = scanned.fileSize
-                        existing.modifiedAt = scanned.modifiedAt
-                        existing.sha256 = scanned.sha256
-                        existing.glacierKey = ""
-                        existing.uploadedAt = nil
-                        existing.storageClass = FileRecord.deepArchiveStorageClass
-                        try existing.update(db)
-                    }
-                } else {
-                    var newRecord = scanned
-                    newRecord.sourcePath = sourceRoot
-                    newRecord.glacierKey = ""
-                    newRecord.uploadedAt = nil
-                    newRecord.storageClass = FileRecord.deepArchiveStorageClass
-                    try newRecord.insert(db)
-                }
+            if let afterRelativePath {
+                request = request.filter(FileRecord.Columns.relativePath > afterRelativePath)
             }
 
-            for staleRecord in existingByRelativePath.values {
-                guard let id = staleRecord.id else {
-                    continue
-                }
-                _ = try FileRecord.deleteOne(db, key: id)
+            if let uploadedBefore {
+                request = request.filter(FileRecord.Columns.uploadedAt <= uploadedBefore)
+            }
+
+            return try request.fetchAll(db)
+        }
+    }
+
+    func syncScannedFiles(_ scannedFiles: [FileRecord], for sourceRoot: String) throws {
+        try syncScannedFiles(for: sourceRoot) { consume in
+            for scanned in scannedFiles {
+                try consume(scanned)
             }
         }
     }
 
-    func markUploaded(id: Int64, glacierKey: String) throws {
+    func syncScannedFiles(
+        for sourceRoot: String,
+        streamScannedFiles: ScannedFileStream
+    ) throws {
+        let scanToken = try beginScan(for: sourceRoot)
+        try streamScannedFiles { scanned in
+            _ = try syncScannedFile(scanned, for: sourceRoot, scanToken: scanToken)
+        }
+        try finishScan(for: sourceRoot, scanToken: scanToken)
+    }
+
+    func beginScan(for sourceRoot: String) throws -> String {
+        let scanToken = UUID().uuidString
         try dbQueue.write { db in
             try db.execute(
                 sql: """
                 UPDATE \(FileRecord.databaseTableName)
-                SET uploadedAt = ?, glacierKey = ?, storageClass = ?
-                WHERE id = ?
+                SET scanToken = NULL
+                WHERE sourcePath = ?
                 """,
-                arguments: [Date(), glacierKey, FileRecord.deepArchiveStorageClass, id]
+                arguments: [sourceRoot]
             )
+        }
+        return scanToken
+    }
+
+    @discardableResult
+    func syncScannedFile(
+        _ scanned: FileRecord,
+        for sourceRoot: String,
+        scanToken: String
+    ) throws -> FileRecord? {
+        try syncScannedFilesBatch([scanned], for: sourceRoot, scanToken: scanToken).first
+    }
+
+    func syncScannedFilesBatch(
+        _ scannedFiles: [FileRecord],
+        for sourceRoot: String,
+        scanToken: String
+    ) throws -> [FileRecord] {
+        guard !scannedFiles.isEmpty else {
+            return []
+        }
+
+        return try dbQueue.write { db in
+            var pendingRecords: [FileRecord] = []
+            pendingRecords.reserveCapacity(scannedFiles.count)
+
+            for scanned in scannedFiles {
+                var normalizedScanned = scanned
+                normalizedScanned.sourcePath = sourceRoot
+                normalizedScanned.scanToken = scanToken
+
+                if var existing = try FileRecord
+                    .filter(FileRecord.Columns.sourcePath == sourceRoot)
+                    .filter(FileRecord.Columns.relativePath == normalizedScanned.relativePath)
+                    .fetchOne(db) {
+                    existing.scanToken = scanToken
+
+                    if Self.hasContentChanged(existing: existing, comparedTo: normalizedScanned) {
+                        existing.fileSize = normalizedScanned.fileSize
+                        existing.modifiedAt = normalizedScanned.modifiedAt
+                        existing.sha256 = normalizedScanned.sha256
+                        existing.glacierKey = ""
+                        existing.uploadedAt = nil
+                        existing.storageClass = FileRecord.deepArchiveStorageClass
+                        try existing.update(db)
+                        pendingRecords.append(existing)
+                    } else {
+                        try existing.update(db)
+                        if existing.uploadedAt == nil {
+                            pendingRecords.append(existing)
+                        }
+                    }
+
+                    continue
+                }
+
+                var newRecord = normalizedScanned
+                newRecord.sourcePath = sourceRoot
+                newRecord.glacierKey = ""
+                newRecord.uploadedAt = nil
+                newRecord.storageClass = FileRecord.deepArchiveStorageClass
+                newRecord.scanToken = scanToken
+                try newRecord.insert(db)
+                pendingRecords.append(newRecord)
+            }
+
+            return pendingRecords
+        }
+    }
+
+    func finishScan(for sourceRoot: String, scanToken: String) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                DELETE FROM \(FileRecord.databaseTableName)
+                WHERE sourcePath = ?
+                  AND (scanToken IS NULL OR scanToken != ?)
+                """,
+                arguments: [sourceRoot, scanToken]
+            )
+        }
+    }
+
+    func markUploaded(id: Int64, glacierKey: String) throws {
+        try markUploaded(records: [(id: id, glacierKey: glacierKey)])
+    }
+
+    func markUploaded(records: [(id: Int64, glacierKey: String)]) throws {
+        guard !records.isEmpty else {
+            return
+        }
+
+        try dbQueue.write { db in
+            let uploadedAt = Date()
+            for record in records {
+                try db.execute(
+                    sql: """
+                    UPDATE \(FileRecord.databaseTableName)
+                    SET uploadedAt = ?, glacierKey = ?, storageClass = ?
+                    WHERE id = ?
+                    """,
+                    arguments: [uploadedAt, record.glacierKey, FileRecord.deepArchiveStorageClass, record.id]
+                )
+            }
         }
     }
 
@@ -286,6 +399,18 @@ final class DatabaseService {
             try db.alter(table: MultipartUploadRecord.databaseTableName) { table in
                 table.add(column: "resumeToken", .text).notNull().defaults(to: "")
             }
+        }
+
+        migrator.registerMigration("addFileRecordScanToken") { db in
+            try db.alter(table: FileRecord.databaseTableName) { table in
+                table.add(column: "scanToken", .text)
+            }
+
+            try db.create(
+                index: "idx_file_records_source_scan_token_uploaded_at",
+                on: FileRecord.databaseTableName,
+                columns: ["sourcePath", "scanToken", "uploadedAt"]
+            )
         }
 
         return migrator

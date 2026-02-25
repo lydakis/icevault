@@ -9,6 +9,10 @@ final class AppState: ObservableObject {
         static let minimumUploadConcurrency = 1
         static let maximumConcurrentFileUploads = 8
         static let maximumConcurrentMultipartPartUploads = 8
+        static let defaultMaxBufferedPendingPlans: Int? = nil
+        static let defaultManualMaxBufferedPendingPlans = 1024
+        static let minimumBufferedPendingPlans = 128
+        static let maximumBufferedPendingPlans = 32_768
 
         enum AuthenticationMethod: String, Codable, CaseIterable, Identifiable {
             case staticKeys
@@ -62,6 +66,7 @@ final class AppState: ObservableObject {
         var customIntervalHours: Int = 24
         var maxConcurrentFileUploads: Int = Settings.defaultMaxConcurrentFileUploads
         var maxConcurrentMultipartPartUploads: Int = Settings.defaultMaxConcurrentMultipartPartUploads
+        var maxBufferedPendingPlans: Int? = Settings.defaultMaxBufferedPendingPlans
 
         enum CodingKeys: String, CodingKey {
             case awsRegion
@@ -74,6 +79,7 @@ final class AppState: ObservableObject {
             case customIntervalHours
             case maxConcurrentFileUploads
             case maxConcurrentMultipartPartUploads
+            case maxBufferedPendingPlans
         }
 
         init(
@@ -89,7 +95,8 @@ final class AppState: ObservableObject {
             scheduleInterval: ScheduleInterval = .daily,
             customIntervalHours: Int = 24,
             maxConcurrentFileUploads: Int = Settings.defaultMaxConcurrentFileUploads,
-            maxConcurrentMultipartPartUploads: Int = Settings.defaultMaxConcurrentMultipartPartUploads
+            maxConcurrentMultipartPartUploads: Int = Settings.defaultMaxConcurrentMultipartPartUploads,
+            maxBufferedPendingPlans: Int? = Settings.defaultMaxBufferedPendingPlans
         ) {
             self.awsAccessKey = awsAccessKey
             self.awsSecretKey = awsSecretKey
@@ -104,6 +111,7 @@ final class AppState: ObservableObject {
             self.customIntervalHours = max(1, customIntervalHours)
             self.maxConcurrentFileUploads = Self.clampFileUploadConcurrency(maxConcurrentFileUploads)
             self.maxConcurrentMultipartPartUploads = Self.clampMultipartPartConcurrency(maxConcurrentMultipartPartUploads)
+            self.maxBufferedPendingPlans = Self.clampBufferedPendingPlans(maxBufferedPendingPlans)
         }
 
         init(from decoder: Decoder) throws {
@@ -126,6 +134,9 @@ final class AppState: ObservableObject {
                 try container.decodeIfPresent(Int.self, forKey: .maxConcurrentMultipartPartUploads)
                     ?? Self.defaultMaxConcurrentMultipartPartUploads
             )
+            maxBufferedPendingPlans = Self.clampBufferedPendingPlans(
+                try container.decodeIfPresent(Int.self, forKey: .maxBufferedPendingPlans)
+            )
         }
 
         func encode(to encoder: Encoder) throws {
@@ -140,6 +151,7 @@ final class AppState: ObservableObject {
             try container.encode(customIntervalHours, forKey: .customIntervalHours)
             try container.encode(maxConcurrentFileUploads, forKey: .maxConcurrentFileUploads)
             try container.encode(maxConcurrentMultipartPartUploads, forKey: .maxConcurrentMultipartPartUploads)
+            try container.encodeIfPresent(maxBufferedPendingPlans, forKey: .maxBufferedPendingPlans)
         }
 
         private static func clampFileUploadConcurrency(_ value: Int) -> Int {
@@ -148,6 +160,13 @@ final class AppState: ObservableObject {
 
         private static func clampMultipartPartConcurrency(_ value: Int) -> Int {
             min(max(value, minimumUploadConcurrency), maximumConcurrentMultipartPartUploads)
+        }
+
+        private static func clampBufferedPendingPlans(_ value: Int?) -> Int? {
+            guard let value else {
+                return nil
+            }
+            return min(max(value, minimumBufferedPendingPlans), maximumBufferedPendingPlans)
         }
     }
 
@@ -332,6 +351,14 @@ final class AppState: ObservableObject {
             max(sanitized.maxConcurrentMultipartPartUploads, Settings.minimumUploadConcurrency),
             Settings.maximumConcurrentMultipartPartUploads
         )
+        if let maxBufferedPendingPlans = sanitized.maxBufferedPendingPlans {
+            sanitized.maxBufferedPendingPlans = min(
+                max(maxBufferedPendingPlans, Settings.minimumBufferedPendingPlans),
+                Settings.maximumBufferedPendingPlans
+            )
+        } else {
+            sanitized.maxBufferedPendingPlans = nil
+        }
         settings = sanitized
         configureSSOTokenMonitor()
         refreshCredentialState()

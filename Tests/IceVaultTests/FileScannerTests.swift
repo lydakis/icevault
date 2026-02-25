@@ -25,7 +25,10 @@ final class FileScannerTests: XCTestCase {
         try Data("package-data".utf8).write(to: packageNestedFile)
         try Data("ignore".utf8).write(to: dsStoreFile)
 
-        let records = try FileScanner().scan(sourceRoot: tempDirectory.path)
+        var records: [FileRecord] = []
+        try FileScanner().scan(sourceRoot: tempDirectory.path) { record in
+            records.append(record)
+        }
         let relativePaths = Set(records.map(\.relativePath))
 
         XCTAssertTrue(relativePaths.contains("visible.txt"))
@@ -37,6 +40,25 @@ final class FileScannerTests: XCTestCase {
         let visibleRecord = try XCTUnwrap(records.first(where: { $0.relativePath == "visible.txt" }))
         XCTAssertEqual(visibleRecord.sha256, sha256Hex(of: Data("hello".utf8)))
         XCTAssertEqual(visibleRecord.sha256.count, 64)
+    }
+
+    func testStreamingScanPropagatesHandlerError() throws {
+        enum TestError: Error {
+            case stop
+        }
+
+        let tempDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        try Data("hello".utf8).write(to: tempDirectory.appendingPathComponent("file.txt"))
+
+        XCTAssertThrowsError(
+            try FileScanner().scan(sourceRoot: tempDirectory.path) { _ in
+                throw TestError.stop
+            }
+        ) { error in
+            XCTAssertTrue(error is TestError)
+        }
     }
 
     func testScanHashChangesWhenFileContentChangesWithSameSizeAndTimestamp() throws {
