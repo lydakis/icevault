@@ -93,16 +93,17 @@ final class BackupEngine: @unchecked Sendable {
     }
 
     /// Bounds scan-ahead so pending upload plans cannot grow unbounded in memory.
-    private final class PendingPlanBackpressureGate: @unchecked Sendable {
+    private actor PendingPlanBackpressureGate {
         private let maxBufferedPlans: Int
-        private let semaphore: DispatchSemaphore
-        private let stateLock = NSLock()
+        private var availableSlots: Int
         private var isCanceled = false
+        private var nextWaiterID: UInt64 = 0
+        private var waiters: [UInt64: CheckedContinuation<Void, Never>] = [:]
 
         init(maxBufferedPlans: Int) {
             let normalizedMaxBufferedPlans = max(1, maxBufferedPlans)
             self.maxBufferedPlans = normalizedMaxBufferedPlans
-            semaphore = DispatchSemaphore(value: normalizedMaxBufferedPlans)
+            availableSlots = normalizedMaxBufferedPlans
         }
 
         var maxReservableSlotsPerBatch: Int {
@@ -112,27 +113,36 @@ final class BackupEngine: @unchecked Sendable {
         func reserve(
             slots: Int,
             whileWaiting abortCheck: (() throws -> Void)? = nil
-        ) throws {
+        ) async throws {
             let normalizedSlots = max(0, slots)
             guard normalizedSlots > 0 else {
                 return
             }
 
-            var acquiredSlots = 0
-            do {
-                while acquiredSlots < normalizedSlots {
-                    try throwIfCanceled()
-                    try abortCheck?()
-                    let waitResult = semaphore.wait(timeout: .now() + .milliseconds(100))
-                    if waitResult == .success {
-                        acquiredSlots += 1
+            while true {
+                try throwIfCanceled()
+                try abortCheck?()
+
+                if availableSlots >= normalizedSlots {
+                    availableSlots -= normalizedSlots
+                    return
+                }
+
+                let waiterID = nextWaiterID
+                nextWaiterID += 1
+
+                await withTaskCancellationHandler(
+                    operation: {
+                        await withCheckedContinuation { continuation in
+                            waiters[waiterID] = continuation
+                        }
+                    },
+                    onCancel: {
+                        Task {
+                            await self.cancelWaiter(id: waiterID)
+                        }
                     }
-                }
-            } catch {
-                if acquiredSlots > 0 {
-                    release(slots: acquiredSlots)
-                }
-                throw error
+                )
             }
         }
 
@@ -141,31 +151,40 @@ final class BackupEngine: @unchecked Sendable {
                 return
             }
 
-            for _ in 0..<slots {
-                semaphore.signal()
-            }
+            availableSlots = min(maxBufferedPlans, availableSlots + slots)
+            resumeAllWaiters()
         }
 
         func cancel() {
-            stateLock.lock()
-            let shouldSignal = !isCanceled
-            isCanceled = true
-            stateLock.unlock()
-
-            guard shouldSignal else {
+            guard !isCanceled else {
                 return
             }
 
-            for _ in 0..<maxBufferedPlans {
-                semaphore.signal()
+            isCanceled = true
+            resumeAllWaiters()
+        }
+
+        private func cancelWaiter(id: UInt64) {
+            guard let continuation = waiters.removeValue(forKey: id) else {
+                return
+            }
+            continuation.resume()
+        }
+
+        private func resumeAllWaiters() {
+            guard !waiters.isEmpty else {
+                return
+            }
+
+            let continuations = waiters.values
+            waiters.removeAll(keepingCapacity: true)
+            for continuation in continuations {
+                continuation.resume()
             }
         }
 
         private func throwIfCanceled() throws {
-            stateLock.lock()
-            let canceled = isCanceled
-            stateLock.unlock()
-            if canceled || Task.isCancelled {
+            if isCanceled || Task.isCancelled {
                 throw CancellationError()
             }
         }
@@ -329,7 +348,7 @@ final class BackupEngine: @unchecked Sendable {
                         var didFlushInitialBatch = false
                         let initialFlushBatchSize = max(1, min(Self.scanSyncBatchSize, settings.maxConcurrentFileUploads))
 
-                        try scanner.scan(sourceRoot: sourceRoot) { record in
+                        try await scanner.scan(sourceRoot: sourceRoot) { record in
                             try Task.checkCancellation()
                             try uploadLoopFailureSignal.throwIfFailed()
                             scannedBatch.append(record)
@@ -338,7 +357,7 @@ final class BackupEngine: @unchecked Sendable {
                                 scannedBatch.count >= Self.scanSyncBatchSize ||
                                 (!didFlushInitialBatch && scannedBatch.count >= initialFlushBatchSize)
                             if shouldFlushBatch {
-                                let pendingPlans = try makePendingPlansForScannedBatch(
+                                let pendingPlans = try self.makePendingPlansForScannedBatch(
                                     scannedBatch,
                                     sourceRoot: sourceRoot,
                                     scanToken: scanToken,
@@ -347,7 +366,7 @@ final class BackupEngine: @unchecked Sendable {
                                 )
                                 scannedBatch.removeAll(keepingCapacity: true)
                                 didFlushInitialBatch = true
-                                try enqueuePendingPlans(
+                                try await self.enqueuePendingPlans(
                                     pendingPlans,
                                     into: pendingPlanChannel,
                                     backpressureGate: pendingPlanBackpressureGate,
@@ -366,7 +385,7 @@ final class BackupEngine: @unchecked Sendable {
                                 sourceRootURL: sourceRootURL,
                                 database: database
                             )
-                            try enqueuePendingPlans(
+                            try await enqueuePendingPlans(
                                 pendingPlans,
                                 into: pendingPlanChannel,
                                 backpressureGate: pendingPlanBackpressureGate,
@@ -383,7 +402,7 @@ final class BackupEngine: @unchecked Sendable {
                             database: database,
                             glacierClient: glacierClient,
                             onPendingPlansBatch: { pendingPlans in
-                                try self.enqueuePendingPlans(
+                                try await self.enqueuePendingPlans(
                                     pendingPlans,
                                     into: pendingPlanChannel,
                                     backpressureGate: pendingPlanBackpressureGate,
@@ -395,13 +414,15 @@ final class BackupEngine: @unchecked Sendable {
                         try await uploadLoopTask.value
                     },
                     onCancel: {
-                        pendingPlanBackpressureGate.cancel()
+                        Task {
+                            await pendingPlanBackpressureGate.cancel()
+                        }
                         uploadLoopTask.cancel()
                         pendingPlanChannel.continuation.finish(throwing: CancellationError())
                     }
                 )
             } catch {
-                pendingPlanBackpressureGate.cancel()
+                await pendingPlanBackpressureGate.cancel()
                 uploadLoopTask.cancel()
                 pendingPlanChannel.continuation.finish(throwing: error)
                 _ = try? await uploadLoopTask.value
@@ -460,18 +481,21 @@ final class BackupEngine: @unchecked Sendable {
     ) async throws {
         for try await plans in pendingPlanStream {
             try Task.checkCancellation()
-            defer {
-                backpressureGate.release(slots: plans.count)
+            do {
+                try await uploadPendingFiles(
+                    plans: plans,
+                    bucket: bucket,
+                    settings: settings,
+                    database: database,
+                    glacierClient: glacierClient,
+                    job: job,
+                    progressTracker: progressTracker
+                )
+                await backpressureGate.release(slots: plans.count)
+            } catch {
+                await backpressureGate.release(slots: plans.count)
+                throw error
             }
-            try await uploadPendingFiles(
-                plans: plans,
-                bucket: bucket,
-                settings: settings,
-                database: database,
-                glacierClient: glacierClient,
-                job: job,
-                progressTracker: progressTracker
-            )
         }
     }
 
@@ -480,12 +504,12 @@ final class BackupEngine: @unchecked Sendable {
         into channel: PendingPlanStreamChannel,
         backpressureGate: PendingPlanBackpressureGate,
         uploadLoopFailureSignal: UploadLoopFailureSignal
-    ) throws {
+    ) async throws {
         guard !plans.isEmpty else {
             return
         }
 
-        let chunkSize = max(1, backpressureGate.maxReservableSlotsPerBatch)
+        let chunkSize = max(1, await backpressureGate.maxReservableSlotsPerBatch)
         var nextChunkStart = plans.startIndex
         while nextChunkStart < plans.endIndex {
             try uploadLoopFailureSignal.throwIfFailed()
@@ -495,7 +519,7 @@ final class BackupEngine: @unchecked Sendable {
             var didReserveSlots = false
 
             do {
-                try backpressureGate.reserve(
+                try await backpressureGate.reserve(
                     slots: chunk.count,
                     whileWaiting: {
                         try uploadLoopFailureSignal.throwIfFailed()
@@ -510,7 +534,7 @@ final class BackupEngine: @unchecked Sendable {
                 }
             } catch {
                 if didReserveSlots {
-                    backpressureGate.release(slots: chunk.count)
+                    await backpressureGate.release(slots: chunk.count)
                 }
                 try uploadLoopFailureSignal.throwIfFailed()
                 throw error
@@ -662,7 +686,7 @@ final class BackupEngine: @unchecked Sendable {
         uploadedBefore: Date,
         database: DatabaseService,
         glacierClient: GlacierClient,
-        onPendingPlansBatch: (([PendingUploadPlan]) throws -> Void)? = nil
+        onPendingPlansBatch: (([PendingUploadPlan]) async throws -> Void)? = nil
     ) async throws {
         var lastRelativePath: String?
 
@@ -733,7 +757,7 @@ final class BackupEngine: @unchecked Sendable {
                 let orderedPendingPlans = pendingPlansFromBatch.sorted { lhs, rhs in
                     lhs.relativePath.localizedStandardCompare(rhs.relativePath) == .orderedAscending
                 }
-                try onPendingPlansBatch?(orderedPendingPlans)
+                try await onPendingPlansBatch?(orderedPendingPlans)
             }
         }
     }

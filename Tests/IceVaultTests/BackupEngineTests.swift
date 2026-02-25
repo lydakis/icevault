@@ -1837,6 +1837,16 @@ private final class StreamingOnlyFileScanner: FileScanner, @unchecked Sendable {
         }
     }
 
+    override func scan(
+        sourceRoot: String,
+        onRecord: @escaping (FileRecord) async throws -> Void
+    ) async throws {
+        streamingScanCallCount += 1
+        for record in records {
+            try await onRecord(record)
+        }
+    }
+
     override func scan(sourceRoot: String) throws -> [FileRecord] {
         arrayScanCallCount += 1
         XCTFail("Array-based scanner API should not be used by BackupEngine.")
@@ -1870,6 +1880,16 @@ private final class GatedAfterFirstRecordScanner: FileScanner, @unchecked Sendab
         continueAfterFirstRecordSemaphore.signal()
     }
 
+    private func waitForResumeAfterFirstRecord() {
+        continueAfterFirstRecordSemaphore.wait()
+    }
+
+    private func markProcessedSecondRecord() {
+        stateLock.lock()
+        hasProcessedSecondRecord = true
+        stateLock.unlock()
+    }
+
     override func scan(
         sourceRoot: String,
         onRecord: (FileRecord) throws -> Void
@@ -1880,13 +1900,29 @@ private final class GatedAfterFirstRecordScanner: FileScanner, @unchecked Sendab
 
         try onRecord(records[0])
         firstRecordProcessedSemaphore.signal()
-        continueAfterFirstRecordSemaphore.wait()
+        waitForResumeAfterFirstRecord()
 
         for record in records.dropFirst() {
-            stateLock.lock()
-            hasProcessedSecondRecord = true
-            stateLock.unlock()
+            markProcessedSecondRecord()
             try onRecord(record)
+        }
+    }
+
+    override func scan(
+        sourceRoot: String,
+        onRecord: @escaping (FileRecord) async throws -> Void
+    ) async throws {
+        guard !records.isEmpty else {
+            return
+        }
+
+        try await onRecord(records[0])
+        firstRecordProcessedSemaphore.signal()
+        waitForResumeAfterFirstRecord()
+
+        for record in records.dropFirst() {
+            markProcessedSecondRecord()
+            try await onRecord(record)
         }
     }
 }
@@ -1911,6 +1947,16 @@ private final class CompletionSignalingStreamingScanner: FileScanner, @unchecked
         defer { scanCompletionSemaphore.signal() }
         for record in records {
             try onRecord(record)
+        }
+    }
+
+    override func scan(
+        sourceRoot: String,
+        onRecord: @escaping (FileRecord) async throws -> Void
+    ) async throws {
+        defer { scanCompletionSemaphore.signal() }
+        for record in records {
+            try await onRecord(record)
         }
     }
 }
