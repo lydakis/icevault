@@ -154,15 +154,15 @@ final class AppState: ObservableObject {
             try container.encodeIfPresent(maxBufferedPendingPlans, forKey: .maxBufferedPendingPlans)
         }
 
-        private static func clampFileUploadConcurrency(_ value: Int) -> Int {
+        static func clampFileUploadConcurrency(_ value: Int) -> Int {
             min(max(value, minimumUploadConcurrency), maximumConcurrentFileUploads)
         }
 
-        private static func clampMultipartPartConcurrency(_ value: Int) -> Int {
+        static func clampMultipartPartConcurrency(_ value: Int) -> Int {
             min(max(value, minimumUploadConcurrency), maximumConcurrentMultipartPartUploads)
         }
 
-        private static func clampBufferedPendingPlans(_ value: Int?) -> Int? {
+        static func clampBufferedPendingPlans(_ value: Int?) -> Int? {
             guard let value else {
                 return nil
             }
@@ -343,22 +343,9 @@ final class AppState: ObservableObject {
         sanitized.bucket = Self.trimmed(sanitized.bucket)
         sanitized.sourcePath = Self.trimmed(sanitized.sourcePath)
         sanitized.customIntervalHours = min(max(sanitized.customIntervalHours, 1), 168)
-        sanitized.maxConcurrentFileUploads = min(
-            max(sanitized.maxConcurrentFileUploads, Settings.minimumUploadConcurrency),
-            Settings.maximumConcurrentFileUploads
-        )
-        sanitized.maxConcurrentMultipartPartUploads = min(
-            max(sanitized.maxConcurrentMultipartPartUploads, Settings.minimumUploadConcurrency),
-            Settings.maximumConcurrentMultipartPartUploads
-        )
-        if let maxBufferedPendingPlans = sanitized.maxBufferedPendingPlans {
-            sanitized.maxBufferedPendingPlans = min(
-                max(maxBufferedPendingPlans, Settings.minimumBufferedPendingPlans),
-                Settings.maximumBufferedPendingPlans
-            )
-        } else {
-            sanitized.maxBufferedPendingPlans = nil
-        }
+        sanitized.maxConcurrentFileUploads = Settings.clampFileUploadConcurrency(sanitized.maxConcurrentFileUploads)
+        sanitized.maxConcurrentMultipartPartUploads = Settings.clampMultipartPartConcurrency(sanitized.maxConcurrentMultipartPartUploads)
+        sanitized.maxBufferedPendingPlans = Settings.clampBufferedPendingPlans(sanitized.maxBufferedPendingPlans)
         settings = sanitized
         configureSSOTokenMonitor()
         refreshCredentialState()

@@ -323,10 +323,7 @@ struct SettingsView: View {
                 draft.maxBufferedPendingPlans ?? AppState.Settings.defaultManualMaxBufferedPendingPlans
             },
             set: { newValue in
-                draft.maxBufferedPendingPlans = min(
-                    max(newValue, AppState.Settings.minimumBufferedPendingPlans),
-                    AppState.Settings.maximumBufferedPendingPlans
-                )
+                draft.maxBufferedPendingPlans = AppState.Settings.clampBufferedPendingPlans(newValue)
             }
         )
     }
@@ -359,22 +356,9 @@ struct SettingsView: View {
             normalizedSettings.ssoProfileName = trimmed(draft.ssoProfileName)
             normalizedSettings.sourcePath = trimmed(draft.sourcePath)
             normalizedSettings.customIntervalHours = min(max(draft.customIntervalHours, 1), 168)
-            normalizedSettings.maxConcurrentFileUploads = min(
-                max(draft.maxConcurrentFileUploads, AppState.Settings.minimumUploadConcurrency),
-                AppState.Settings.maximumConcurrentFileUploads
-            )
-            normalizedSettings.maxConcurrentMultipartPartUploads = min(
-                max(draft.maxConcurrentMultipartPartUploads, AppState.Settings.minimumUploadConcurrency),
-                AppState.Settings.maximumConcurrentMultipartPartUploads
-            )
-            if let maxBufferedPendingPlans = draft.maxBufferedPendingPlans {
-                normalizedSettings.maxBufferedPendingPlans = min(
-                    max(maxBufferedPendingPlans, AppState.Settings.minimumBufferedPendingPlans),
-                    AppState.Settings.maximumBufferedPendingPlans
-                )
-            } else {
-                normalizedSettings.maxBufferedPendingPlans = nil
-            }
+            normalizedSettings.maxConcurrentFileUploads = AppState.Settings.clampFileUploadConcurrency(draft.maxConcurrentFileUploads)
+            normalizedSettings.maxConcurrentMultipartPartUploads = AppState.Settings.clampMultipartPartConcurrency(draft.maxConcurrentMultipartPartUploads)
+            normalizedSettings.maxBufferedPendingPlans = AppState.Settings.clampBufferedPendingPlans(draft.maxBufferedPendingPlans)
             appState.updateSettings(normalizedSettings)
             _ = try appState.applyScheduledBackups()
             scheduleInstalled = appState.scheduledBackupsInstalled()
