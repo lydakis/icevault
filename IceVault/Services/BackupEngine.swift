@@ -410,6 +410,8 @@ final class BackupEngine: @unchecked Sendable {
                                 )
                             }
                         )
+                        try Task.checkCancellation()
+                        try uploadLoopFailureSignal.throwIfFailed()
                         pendingPlanChannel.continuation.finish()
                         try await uploadLoopTask.value
                     },

@@ -955,6 +955,83 @@ final class BackupEngineTests: XCTestCase {
         }
     }
 
+    func testRunCancellationDuringRemoteValidationWithNoPendingUploadsFailsAsCanceled() async throws {
+        let sourceRoot = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let fileURL = sourceRoot.appendingPathComponent("one.txt")
+        let payload = Data("one".utf8)
+        try payload.write(to: fileURL)
+
+        let database = try makeDatabaseService()
+        var existingRecord = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "one.txt",
+            fileSize: Int64(payload.count),
+            modifiedAt: Date(),
+            sha256: sha256Hex(of: payload),
+            glacierKey: "one.txt",
+            uploadedAt: Date(),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&existingRecord)
+
+        let mockS3 = CancelIgnoringRemoteValidationBackupEngineS3Client(
+            output: HeadObjectOutput(
+                contentLength: payload.count,
+                metadata: [GlacierClient.sha256MetadataKey: sha256Hex(of: payload)],
+                storageClass: .deepArchive
+            )
+        )
+        let backupEngine = BackupEngine(
+            scanner: FileScanner(),
+            fileManager: .default,
+            database: database,
+            glacierClientFactory: { _, _, _, _, db in
+                GlacierClient(s3Client: mockS3, database: db)
+            }
+        )
+
+        let settings = AppState.Settings(
+            awsAccessKey: "access",
+            awsSecretKey: "secret",
+            awsRegion: "us-east-1",
+            bucket: "bucket",
+            sourcePath: sourceRoot.path,
+            maxConcurrentFileUploads: 1,
+            maxConcurrentMultipartPartUploads: 1
+        )
+        let job = await MainActor.run {
+            BackupJob(sourceRoot: sourceRoot.path, bucket: "bucket")
+        }
+
+        let runTask = Task {
+            try await backupEngine.run(job: job, settings: settings)
+        }
+
+        await mockS3.waitUntilRemoteValidationStarts()
+        runTask.cancel()
+        await mockS3.releaseRemoteValidation()
+
+        do {
+            try await runTask.value
+            XCTFail("Expected backup to be canceled")
+        } catch is CancellationError {
+            // Expected
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+
+        let headObjectCallCount = await mockS3.headObjectCallCount()
+        XCTAssertEqual(headObjectCallCount, 1)
+        XCTAssertEqual(try database.pendingFiles(for: sourceRoot.path).count, 0)
+
+        await MainActor.run {
+            XCTAssertEqual(job.status, .failed)
+            XCTAssertEqual(job.error, "Backup canceled")
+        }
+    }
+
     func testRunCancellationDoesNotScheduleAdditionalUploads() async throws {
         let sourceRoot = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: sourceRoot) }

@@ -17,6 +17,7 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
 
     private let fileManager: FileManager
     private let userDefaults: UserDefaults
+    private let notificationsEnabled: Bool
     private let ssoLoginRunner: SSOLoginRunner
     private let monitoringTimerFactory: MonitoringTimerFactory
 
@@ -49,6 +50,7 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
     init(
         fileManager: FileManager = .default,
         userDefaults: UserDefaults = .standard,
+        notificationsEnabled: Bool = true,
         autoStart: Bool = true,
         ssoLoginRunner: @escaping SSOLoginRunner = SSOTokenMonitor.runSSOLoginProcess,
         monitoringTimerFactory: @escaping MonitoringTimerFactory = { interval, repeats, block in
@@ -57,6 +59,7 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
     ) {
         self.fileManager = fileManager
         self.userDefaults = userDefaults
+        self.notificationsEnabled = notificationsEnabled
         self.ssoLoginRunner = ssoLoginRunner
         self.monitoringTimerFactory = monitoringTimerFactory
         self.status = nil
@@ -67,11 +70,13 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
         super.init()
 
         if autoStart {
-            configureNotificationCenter()
             startMonitoringTimer()
 
-            Task { [weak self] in
-                await self?.refreshNotificationAuthorizationStatus()
+            if notificationsEnabled {
+                configureNotificationCenter()
+                Task { [weak self] in
+                    await self?.refreshNotificationAuthorizationStatus()
+                }
             }
         }
     }
@@ -94,7 +99,7 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
     }
 
     func requestNotificationPermissionIfNeeded() {
-        guard Self.supportsUserNotifications else {
+        guard notificationsEnabled, Self.supportsUserNotifications else {
             notificationsAuthorized = false
             return
         }
@@ -203,7 +208,7 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
     }
 
     private func configureNotificationCenter() {
-        guard Self.supportsUserNotifications else {
+        guard notificationsEnabled, Self.supportsUserNotifications else {
             // Running outside a proper .app bundle (e.g. swift run) — all notifications are a no-op.
             return
         }
@@ -225,7 +230,7 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
     }
 
     private func refreshNotificationAuthorizationStatus() async {
-        guard Self.supportsUserNotifications else {
+        guard notificationsEnabled, Self.supportsUserNotifications else {
             notificationsAuthorized = false
             return
         }
@@ -307,7 +312,7 @@ final class SSOTokenMonitor: NSObject, ObservableObject {
         body: String,
         profileName: String
     ) {
-        guard Self.supportsUserNotifications else {
+        guard notificationsEnabled, Self.supportsUserNotifications else {
             return
         }
 

@@ -345,6 +345,70 @@ final class DatabaseServiceTests: XCTestCase {
         XCTAssertEqual(pending?.resumeToken, "")
     }
 
+    func testStreamingSyncScannedFilesRemovesStaleRecords() throws {
+        let database = try makeDatabaseService()
+        let sourceRoot = "/tmp/source"
+        let fixedDate = Date(timeIntervalSince1970: 1_700_000_600)
+
+        var staleRecord = FileRecord(
+            sourcePath: sourceRoot,
+            relativePath: "stale.txt",
+            fileSize: 1,
+            modifiedAt: fixedDate,
+            sha256: "old",
+            glacierKey: "old-key",
+            uploadedAt: Date(),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&staleRecord)
+
+        let freshRecord = FileRecord(
+            sourcePath: sourceRoot,
+            relativePath: "fresh.txt",
+            fileSize: 2,
+            modifiedAt: fixedDate,
+            sha256: "new",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+
+        try database.syncScannedFiles(for: sourceRoot) { upsertRecord in
+            try upsertRecord(freshRecord)
+        }
+
+        let allFiles = try database.allFiles()
+        XCTAssertEqual(allFiles.count, 1)
+        XCTAssertEqual(allFiles.first?.relativePath, "fresh.txt")
+    }
+
+    func testPendingSummaryAndBatchQuery() throws {
+        let database = try makeDatabaseService()
+        let sourceRoot = "/tmp/source"
+        let fixedDate = Date(timeIntervalSince1970: 1_700_000_700)
+
+        for index in 0..<3 {
+            var record = FileRecord(
+                sourcePath: sourceRoot,
+                relativePath: "file-\(index).txt",
+                fileSize: Int64(index + 1),
+                modifiedAt: fixedDate,
+                sha256: "hash-\(index)",
+                glacierKey: "",
+                uploadedAt: nil,
+                storageClass: FileRecord.deepArchiveStorageClass
+            )
+            try database.insertFile(&record)
+        }
+
+        XCTAssertEqual(try database.pendingFileCount(for: sourceRoot), 3)
+        XCTAssertEqual(try database.pendingTotalBytes(for: sourceRoot), 6)
+
+        let firstBatch = try database.pendingFiles(for: sourceRoot, limit: 2)
+        XCTAssertEqual(firstBatch.count, 2)
+        XCTAssertEqual(firstBatch.map(\.relativePath), ["file-0.txt", "file-1.txt"])
+    }
+
     private func makeDatabaseService() throws -> DatabaseService {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("IceVaultTests-DB-\(UUID().uuidString)", isDirectory: true)

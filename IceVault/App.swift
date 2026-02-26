@@ -7,9 +7,9 @@ struct IceVaultApp: App {
     @StateObject private var appState: AppState
 
     init() {
-        let runtimeAppState = AppState()
-        _appState = StateObject(wrappedValue: runtimeAppState)
         let isHeadlessBackupMode = CommandLine.arguments.contains("--backup")
+        let runtimeAppState = AppState(ssoNotificationsEnabled: !isHeadlessBackupMode)
+        _appState = StateObject(wrappedValue: runtimeAppState)
 
         if !isHeadlessBackupMode {
             runtimeAppState.requestNotificationPermissionIfNeeded()

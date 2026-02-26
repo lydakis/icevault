@@ -212,13 +212,18 @@ final class AppState: ObservableObject {
         backupEngine: BackupEngine = BackupEngine(),
         keychainService: KeychainService = KeychainService(),
         launchAgent: LaunchAgent = LaunchAgent(),
-        ssoTokenMonitor: SSOTokenMonitor? = nil
+        ssoTokenMonitor: SSOTokenMonitor? = nil,
+        ssoNotificationsEnabled: Bool = true
     ) {
         self.userDefaults = userDefaults
         self.backupEngine = backupEngine
         self.keychainService = keychainService
         self.launchAgent = launchAgent
-        self.ssoTokenMonitor = ssoTokenMonitor ?? SSOTokenMonitor(userDefaults: userDefaults)
+        self.ssoTokenMonitor = ssoTokenMonitor
+            ?? SSOTokenMonitor(
+                userDefaults: userDefaults,
+                notificationsEnabled: ssoNotificationsEnabled
+            )
         self.settings = Self.loadSettings(from: userDefaults, key: Self.settingsKey)
         self.history = Self.loadHistory(from: userDefaults, key: Self.historyKey)
         self.hasAvailableCredentials = false

@@ -109,6 +109,41 @@ final class FileScannerTests: XCTestCase {
         XCTAssertFalse(relativePaths.contains("unreadable.txt"))
     }
 
+    func testStreamingScanMatchesArrayScan() throws {
+        let tempDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let files: [(String, String)] = [
+            ("a.txt", "alpha"),
+            ("nested/b.txt", "bravo"),
+            (".hidden/c.txt", "charlie")
+        ]
+
+        for (relativePath, contents) in files {
+            let fileURL = tempDirectory.appendingPathComponent(relativePath)
+            try FileManager.default.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Data(contents.utf8).write(to: fileURL)
+        }
+
+        let scanner = FileScanner()
+        let arrayScan = try scanner.scan(sourceRoot: tempDirectory.path)
+
+        var streamingScan: [FileRecord] = []
+        try scanner.scan(sourceRoot: tempDirectory.path) { record in
+            streamingScan.append(record)
+        }
+
+        let sortedStreaming = streamingScan.sorted {
+            $0.relativePath.localizedStandardCompare($1.relativePath) == .orderedAscending
+        }
+
+        XCTAssertEqual(arrayScan.map(\.relativePath), sortedStreaming.map(\.relativePath))
+        XCTAssertEqual(arrayScan.map(\.sha256), sortedStreaming.map(\.sha256))
+    }
+
     private func makeTempDirectory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("IceVaultTests-\(UUID().uuidString)", isDirectory: true)

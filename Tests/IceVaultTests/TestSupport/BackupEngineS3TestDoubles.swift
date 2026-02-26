@@ -285,3 +285,61 @@ final class CancelIgnoringSequencedBackupEngineS3Client: GlacierS3Client {
         HeadBucketOutput()
     }
 }
+
+final class CancelIgnoringRemoteValidationBackupEngineS3Client: GlacierS3Client {
+    private let validationStartedSignal = AsyncSignal()
+    private let releaseValidationSignal = AsyncSignal()
+    private let headObjectCallCounter = InvocationCounter()
+    private let output: HeadObjectOutput
+
+    init(output: HeadObjectOutput) {
+        self.output = output
+    }
+
+    func waitUntilRemoteValidationStarts() async {
+        await validationStartedSignal.wait()
+    }
+
+    func releaseRemoteValidation() async {
+        await releaseValidationSignal.signal()
+    }
+
+    func headObjectCallCount() async -> Int {
+        await headObjectCallCounter.value()
+    }
+
+    func createMultipartUpload(input: CreateMultipartUploadInput) async throws -> CreateMultipartUploadOutput {
+        CreateMultipartUploadOutput(uploadId: "upload-id")
+    }
+
+    func uploadPart(input: UploadPartInput) async throws -> UploadPartOutput {
+        UploadPartOutput(eTag: "\"etag\"")
+    }
+
+    func completeMultipartUpload(input: CompleteMultipartUploadInput) async throws -> CompleteMultipartUploadOutput {
+        CompleteMultipartUploadOutput()
+    }
+
+    func abortMultipartUpload(input: AbortMultipartUploadInput) async throws -> AbortMultipartUploadOutput {
+        AbortMultipartUploadOutput()
+    }
+
+    func listParts(input: ListPartsInput) async throws -> ListPartsOutput {
+        ListPartsOutput(isTruncated: false, nextPartNumberMarker: nil, parts: [])
+    }
+
+    func putObject(input: PutObjectInput) async throws -> PutObjectOutput {
+        PutObjectOutput()
+    }
+
+    func headObject(input: HeadObjectInput) async throws -> HeadObjectOutput {
+        await headObjectCallCounter.increment()
+        await validationStartedSignal.signal()
+        await releaseValidationSignal.wait()
+        return output
+    }
+
+    func headBucket(input: HeadBucketInput) async throws -> HeadBucketOutput {
+        HeadBucketOutput()
+    }
+}
