@@ -298,13 +298,14 @@ final class BackupEngineTests: XCTestCase {
         try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         let payload = Data("hello-world".utf8)
         try payload.write(to: fileURL)
+        let fileModifiedAt = try fileModificationDate(for: fileURL)
 
         let database = try makeDatabaseService()
         var existingRecord = FileRecord(
             sourcePath: sourceRoot.path,
             relativePath: "nested/file.txt",
             fileSize: Int64(payload.count),
-            modifiedAt: Date(),
+            modifiedAt: fileModifiedAt,
             sha256: sha256Hex(of: payload),
             glacierKey: "nested/file.txt",
             uploadedAt: Date(),
@@ -365,13 +366,14 @@ final class BackupEngineTests: XCTestCase {
         try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         let payload = Data("hello-world".utf8)
         try payload.write(to: fileURL)
+        let fileModifiedAt = try fileModificationDate(for: fileURL)
 
         let database = try makeDatabaseService()
         var existingRecord = FileRecord(
             sourcePath: sourceRoot.path,
             relativePath: "nested/file.txt",
             fileSize: Int64(payload.count),
-            modifiedAt: Date(),
+            modifiedAt: fileModifiedAt,
             sha256: sha256Hex(of: payload),
             glacierKey: "nested/file.txt",
             uploadedAt: Date(),
@@ -513,13 +515,14 @@ final class BackupEngineTests: XCTestCase {
         let pendingFileURL = sourceRoot.appendingPathComponent("pending.txt")
         try Data("existing-data".utf8).write(to: existingFileURL)
         try Data("pending-data".utf8).write(to: pendingFileURL)
+        let existingFileModifiedAt = try fileModificationDate(for: existingFileURL)
 
         let database = try makeDatabaseService()
         var existingRecord = FileRecord(
             sourcePath: sourceRoot.path,
             relativePath: "existing.txt",
             fileSize: Int64(Data("existing-data".utf8).count),
-            modifiedAt: Date(),
+            modifiedAt: existingFileModifiedAt,
             sha256: sha256Hex(of: Data("existing-data".utf8)),
             glacierKey: "existing.txt",
             uploadedAt: Date(),
@@ -580,13 +583,14 @@ final class BackupEngineTests: XCTestCase {
         try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         let payload = Data("hello-world".utf8)
         try payload.write(to: fileURL)
+        let fileModifiedAt = try fileModificationDate(for: fileURL)
 
         let database = try makeDatabaseService()
         var existingRecord = FileRecord(
             sourcePath: sourceRoot.path,
             relativePath: "nested/file.txt",
             fileSize: Int64(payload.count),
-            modifiedAt: Date(),
+            modifiedAt: fileModifiedAt,
             sha256: sha256Hex(of: payload),
             glacierKey: "nested/file.txt",
             uploadedAt: Date(),
@@ -637,13 +641,14 @@ final class BackupEngineTests: XCTestCase {
         try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         let payload = Data("hello-world".utf8)
         try payload.write(to: fileURL)
+        let fileModifiedAt = try fileModificationDate(for: fileURL)
 
         let database = try makeDatabaseService()
         var existingRecord = FileRecord(
             sourcePath: sourceRoot.path,
             relativePath: "nested/file.txt",
             fileSize: Int64(payload.count),
-            modifiedAt: Date(),
+            modifiedAt: fileModifiedAt,
             sha256: sha256Hex(of: payload),
             glacierKey: "archive-prefix/nested/file.txt",
             uploadedAt: Date(),
@@ -751,13 +756,14 @@ final class BackupEngineTests: XCTestCase {
         try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         let payload = Data("hello-world".utf8)
         try payload.write(to: fileURL)
+        let fileModifiedAt = try fileModificationDate(for: fileURL)
 
         let database = try makeDatabaseService()
         var existingRecord = FileRecord(
             sourcePath: sourceRoot.path,
             relativePath: "nested/file.txt",
             fileSize: Int64(payload.count),
-            modifiedAt: Date(),
+            modifiedAt: fileModifiedAt,
             sha256: sha256Hex(of: payload),
             glacierKey: "archive-prefix/nested/file.txt",
             uploadedAt: Date(),
@@ -950,7 +956,7 @@ final class BackupEngineTests: XCTestCase {
         }
     }
 
-    func testRunUploadsEarlierFileBeforeFailingWhenLaterFileDisappears() async throws {
+    func testRunUploadsEarlierFileAndSkipsLaterFileWhenItDisappearsBeforeLazyHash() async throws {
         let sourceRoot = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: sourceRoot) }
 
@@ -984,10 +990,7 @@ final class BackupEngineTests: XCTestCase {
             BackupJob(sourceRoot: sourceRoot.path, bucket: "bucket")
         }
 
-        do {
-            try await backupEngine.run(job: job, settings: settings)
-            XCTFail("Expected backup to fail when one source file is missing")
-        } catch {}
+        try await backupEngine.run(job: job, settings: settings)
 
         XCTAssertEqual(mockS3.putObjectInputs.count, 1)
         XCTAssertEqual(mockS3.putObjectInputs.first?.key, "a.txt")
@@ -998,9 +1001,10 @@ final class BackupEngineTests: XCTestCase {
         let missingRecord = try XCTUnwrap(files.first(where: { $0.relativePath == "z.txt" }))
         XCTAssertNotNil(firstRecord.uploadedAt)
         XCTAssertNil(missingRecord.uploadedAt)
+        XCTAssertEqual(missingRecord.sha256, "")
 
         await MainActor.run {
-            XCTAssertEqual(job.status, .failed)
+            XCTAssertEqual(job.status, .completed)
         }
     }
 
@@ -1011,13 +1015,14 @@ final class BackupEngineTests: XCTestCase {
         let fileURL = sourceRoot.appendingPathComponent("one.txt")
         let payload = Data("one".utf8)
         try payload.write(to: fileURL)
+        let fileModifiedAt = try fileModificationDate(for: fileURL)
 
         let database = try makeDatabaseService()
         var existingRecord = FileRecord(
             sourcePath: sourceRoot.path,
             relativePath: "one.txt",
             fileSize: Int64(payload.count),
-            modifiedAt: Date(),
+            modifiedAt: fileModifiedAt,
             sha256: sha256Hex(of: payload),
             glacierKey: "one.txt",
             uploadedAt: Date(),
@@ -1268,7 +1273,7 @@ final class BackupEngineTests: XCTestCase {
                     relativePath: "streaming.txt",
                     fileSize: Int64(payload.count),
                     modifiedAt: Date(timeIntervalSince1970: 1_700_001_000),
-                    sha256: sha256Hex(of: payload),
+                    sha256: "",
                     glacierKey: "",
                     uploadedAt: nil,
                     storageClass: FileRecord.deepArchiveStorageClass
@@ -1299,10 +1304,16 @@ final class BackupEngineTests: XCTestCase {
 
         try await backupEngine.run(job: job, settings: settings)
 
-        XCTAssertEqual(scanner.streamingScanCallCount, 1)
+        XCTAssertEqual(scanner.metadataScanCallCount, 1)
+        XCTAssertEqual(scanner.streamingScanCallCount, 0)
         XCTAssertEqual(scanner.arrayScanCallCount, 0)
         XCTAssertEqual(mockS3.putObjectInputs.count, 1)
         XCTAssertEqual(mockS3.putObjectInputs.first?.key, "streaming.txt")
+
+        let storedRecords = try database.allFiles()
+        let storedRecord = try XCTUnwrap(storedRecords.first(where: { $0.relativePath == "streaming.txt" }))
+        XCTAssertEqual(storedRecord.sha256, sha256Hex(of: payload))
+
         await MainActor.run {
             XCTAssertEqual(job.discoveryEstimatedFiles, 1)
             XCTAssertEqual(job.discoveryEstimatedBytes, Int64(payload.count))
@@ -1858,6 +1869,11 @@ final class BackupEngineTests: XCTestCase {
             .joined()
     }
 
+    private func fileModificationDate(for fileURL: URL) throws -> Date {
+        let resourceValues = try fileURL.resourceValues(forKeys: [.contentModificationDateKey])
+        return try XCTUnwrap(resourceValues.contentModificationDate)
+    }
+
     private func makeDatabaseService() throws -> DatabaseService {
         let directory = try makeTempDirectory()
         let databaseURL = directory.appendingPathComponent("icevault.sqlite")
@@ -1951,6 +1967,7 @@ private final class SelectivelyMissingFileManager: FileManager {
 private final class StreamingOnlyFileScanner: FileScanner, @unchecked Sendable {
     private let records: [FileRecord]
 
+    private(set) var metadataScanCallCount = 0
     private(set) var streamingScanCallCount = 0
     private(set) var arrayScanCallCount = 0
 
@@ -1983,6 +2000,18 @@ private final class StreamingOnlyFileScanner: FileScanner, @unchecked Sendable {
         arrayScanCallCount += 1
         XCTFail("Array-based scanner API should not be used by BackupEngine.")
         return []
+    }
+
+    override func scanMetadata(
+        sourceRoot: String,
+        onRecord: @escaping (FileRecord) async throws -> Void
+    ) async throws {
+        metadataScanCallCount += 1
+        for record in records {
+            var metadataRecord = record
+            metadataRecord.sha256 = ""
+            try await onRecord(metadataRecord)
+        }
     }
 }
 
@@ -2057,6 +2086,28 @@ private final class GatedAfterFirstRecordScanner: FileScanner, @unchecked Sendab
             try await onRecord(record)
         }
     }
+
+    override func scanMetadata(
+        sourceRoot: String,
+        onRecord: @escaping (FileRecord) async throws -> Void
+    ) async throws {
+        guard !records.isEmpty else {
+            return
+        }
+
+        var firstRecord = records[0]
+        firstRecord.sha256 = ""
+        try await onRecord(firstRecord)
+        firstRecordProcessedSemaphore.signal()
+        waitForResumeAfterFirstRecord()
+
+        for record in records.dropFirst() {
+            markProcessedSecondRecord()
+            var metadataRecord = record
+            metadataRecord.sha256 = ""
+            try await onRecord(metadataRecord)
+        }
+    }
 }
 
 private final class CompletionSignalingStreamingScanner: FileScanner, @unchecked Sendable {
@@ -2089,6 +2140,18 @@ private final class CompletionSignalingStreamingScanner: FileScanner, @unchecked
         defer { scanCompletionSemaphore.signal() }
         for record in records {
             try await onRecord(record)
+        }
+    }
+
+    override func scanMetadata(
+        sourceRoot: String,
+        onRecord: @escaping (FileRecord) async throws -> Void
+    ) async throws {
+        defer { scanCompletionSemaphore.signal() }
+        for record in records {
+            var metadataRecord = record
+            metadataRecord.sha256 = ""
+            try await onRecord(metadataRecord)
         }
     }
 }

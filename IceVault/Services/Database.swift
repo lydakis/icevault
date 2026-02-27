@@ -5,6 +5,8 @@ final class DatabaseService: @unchecked Sendable {
     typealias ScannedFileConsumer = (FileRecord) throws -> Void
     typealias ScannedFileStream = (_ consume: ScannedFileConsumer) throws -> Void
 
+    private static let metadataTimestampTolerance: TimeInterval = 0.001
+
     private let dbQueue: DatabaseQueue
 
     init(databaseURL: URL? = nil) throws {
@@ -48,6 +50,20 @@ final class DatabaseService: @unchecked Sendable {
         let mutableRecord = record
         try dbQueue.write { db in
             try mutableRecord.update(db)
+        }
+    }
+
+    func updateFileSHA256(id: Int64, sha256: String) throws {
+        let normalizedSHA256 = sha256.trimmingCharacters(in: .whitespacesAndNewlines)
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                UPDATE \(FileRecord.databaseTableName)
+                SET sha256 = ?
+                WHERE id = ?
+                """,
+                arguments: [normalizedSHA256, id]
+            )
         }
     }
 
@@ -255,6 +271,7 @@ final class DatabaseService: @unchecked Sendable {
                 var normalizedScanned = scanned
                 normalizedScanned.sourcePath = sourceRoot
                 normalizedScanned.scanToken = scanToken
+                normalizedScanned.sha256 = normalizedScanned.sha256.trimmingCharacters(in: .whitespacesAndNewlines)
 
                 if var existing = try FileRecord
                     .filter(FileRecord.Columns.sourcePath == sourceRoot)
@@ -262,19 +279,44 @@ final class DatabaseService: @unchecked Sendable {
                     .fetchOne(db) {
                     existing.scanToken = scanToken
 
-                    if Self.hasContentChanged(existing: existing, comparedTo: normalizedScanned) {
-                        existing.fileSize = normalizedScanned.fileSize
-                        existing.modifiedAt = normalizedScanned.modifiedAt
-                        existing.sha256 = normalizedScanned.sha256
-                        existing.glacierKey = ""
-                        existing.uploadedAt = nil
-                        existing.storageClass = FileRecord.deepArchiveStorageClass
-                        try existing.update(db)
-                        pendingRecords.append(existing)
-                    } else {
-                        try existing.update(db)
-                        if existing.uploadedAt == nil {
+                    if normalizedScanned.sha256.isEmpty {
+                        if Self.hasLikelyMetadataChanged(existing: existing, comparedTo: normalizedScanned) {
+                            existing.fileSize = normalizedScanned.fileSize
+                            existing.modifiedAt = normalizedScanned.modifiedAt
+                            // Hash becomes unknown until lazy hashing resolves it near upload.
+                            existing.sha256 = ""
+                            existing.glacierKey = ""
+                            existing.uploadedAt = nil
+                            existing.storageClass = FileRecord.deepArchiveStorageClass
+                            try existing.update(db)
                             pendingRecords.append(existing)
+                        } else {
+                            try existing.update(db)
+                            let hasMissingStoredHash = existing.sha256
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                                .isEmpty
+                            if existing.uploadedAt == nil || hasMissingStoredHash {
+                                pendingRecords.append(existing)
+                            }
+                        }
+                    } else {
+                        if Self.hasContentChanged(existing: existing, comparedTo: normalizedScanned) {
+                            existing.fileSize = normalizedScanned.fileSize
+                            existing.modifiedAt = normalizedScanned.modifiedAt
+                            existing.sha256 = normalizedScanned.sha256
+                            existing.glacierKey = ""
+                            existing.uploadedAt = nil
+                            existing.storageClass = FileRecord.deepArchiveStorageClass
+                            try existing.update(db)
+                            pendingRecords.append(existing)
+                        } else {
+                            // Keep metadata in sync even when hash confirms the object is unchanged.
+                            existing.fileSize = normalizedScanned.fileSize
+                            existing.modifiedAt = normalizedScanned.modifiedAt
+                            try existing.update(db)
+                            if existing.uploadedAt == nil {
+                                pendingRecords.append(existing)
+                            }
                         }
                     }
 
@@ -470,6 +512,19 @@ final class DatabaseService: @unchecked Sendable {
         }
 
         if existing.sha256 != scanned.sha256 {
+            return true
+        }
+
+        return false
+    }
+
+    private static func hasLikelyMetadataChanged(existing: FileRecord, comparedTo scanned: FileRecord) -> Bool {
+        if existing.fileSize != scanned.fileSize {
+            return true
+        }
+
+        let modifiedAtDelta = abs(existing.modifiedAt.timeIntervalSince(scanned.modifiedAt))
+        if modifiedAtDelta > metadataTimestampTolerance {
             return true
         }
 

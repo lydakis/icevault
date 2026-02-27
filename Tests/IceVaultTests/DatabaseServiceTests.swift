@@ -113,6 +113,165 @@ final class DatabaseServiceTests: XCTestCase {
         XCTAssertTrue(pending.isEmpty)
     }
 
+    func testMetadataOnlySyncDoesNotRequeueUploadedFileWhenSizeAndTimestampMatch() throws {
+        let database = try makeDatabaseService()
+        let sourceRoot = "/tmp/source"
+        let fixedDate = Date(timeIntervalSince1970: 1_700_000_325)
+
+        var existing = FileRecord(
+            sourcePath: sourceRoot,
+            relativePath: "unchanged.txt",
+            fileSize: 6,
+            modifiedAt: fixedDate,
+            sha256: "existing-hash",
+            glacierKey: "unchanged.txt",
+            uploadedAt: Date(),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&existing)
+
+        let metadataOnlyScan = FileRecord(
+            sourcePath: sourceRoot,
+            relativePath: "unchanged.txt",
+            fileSize: 6,
+            modifiedAt: fixedDate,
+            sha256: "",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.syncScannedFiles([metadataOnlyScan], for: sourceRoot)
+
+        XCTAssertTrue(try database.pendingFiles(for: sourceRoot).isEmpty)
+        let stored = try XCTUnwrap(
+            database.allFiles().first(where: { $0.sourcePath == sourceRoot && $0.relativePath == "unchanged.txt" })
+        )
+        XCTAssertEqual(stored.sha256, "existing-hash")
+        XCTAssertNotNil(stored.uploadedAt)
+    }
+
+    func testMetadataOnlySyncDoesNotRequeueUploadedFileWhenTimestampDiffIsWithinPrecisionTolerance() throws {
+        let database = try makeDatabaseService()
+        let sourceRoot = "/tmp/source"
+        let storedDate = Date(timeIntervalSince1970: 1_700_000_326.123)
+        let scannedDate = Date(timeIntervalSince1970: 1_700_000_326.1234)
+
+        var existing = FileRecord(
+            sourcePath: sourceRoot,
+            relativePath: "precision.txt",
+            fileSize: 6,
+            modifiedAt: storedDate,
+            sha256: "existing-hash",
+            glacierKey: "precision.txt",
+            uploadedAt: Date(),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&existing)
+
+        let metadataOnlyScan = FileRecord(
+            sourcePath: sourceRoot,
+            relativePath: "precision.txt",
+            fileSize: 6,
+            modifiedAt: scannedDate,
+            sha256: "",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.syncScannedFiles([metadataOnlyScan], for: sourceRoot)
+
+        XCTAssertTrue(try database.pendingFiles(for: sourceRoot).isEmpty)
+        let stored = try XCTUnwrap(
+            database.allFiles().first(where: { $0.sourcePath == sourceRoot && $0.relativePath == "precision.txt" })
+        )
+        XCTAssertEqual(stored.sha256, "existing-hash")
+        XCTAssertNotNil(stored.uploadedAt)
+    }
+
+    func testMetadataOnlySyncMarksUploadedFilePendingAndClearsHashWhenMetadataChanges() throws {
+        let database = try makeDatabaseService()
+        let sourceRoot = "/tmp/source"
+        let originalDate = Date(timeIntervalSince1970: 1_700_000_340)
+        let newerDate = Date(timeIntervalSince1970: 1_700_000_341)
+
+        var existing = FileRecord(
+            sourcePath: sourceRoot,
+            relativePath: "candidate.txt",
+            fileSize: 10,
+            modifiedAt: originalDate,
+            sha256: "old-hash",
+            glacierKey: "candidate.txt",
+            uploadedAt: Date(),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&existing)
+
+        let metadataOnlyScan = FileRecord(
+            sourcePath: sourceRoot,
+            relativePath: "candidate.txt",
+            fileSize: 10,
+            modifiedAt: newerDate,
+            sha256: "",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.syncScannedFiles([metadataOnlyScan], for: sourceRoot)
+
+        let pending = try database.pendingFiles(for: sourceRoot)
+        let updated = try XCTUnwrap(pending.first)
+        XCTAssertEqual(pending.count, 1)
+        XCTAssertEqual(updated.modifiedAt, newerDate)
+        XCTAssertEqual(updated.sha256, "")
+        XCTAssertEqual(updated.glacierKey, "")
+        XCTAssertNil(updated.uploadedAt)
+    }
+
+    func testMetadataOnlySyncRequeuesUploadedLegacyRecordWhenStoredHashIsEmpty() throws {
+        let database = try makeDatabaseService()
+        let sourceRoot = "/tmp/source"
+        let fixedDate = Date(timeIntervalSince1970: 1_700_000_345)
+
+        var existing = FileRecord(
+            sourcePath: sourceRoot,
+            relativePath: "legacy-empty-hash.txt",
+            fileSize: 9,
+            modifiedAt: fixedDate,
+            sha256: "",
+            glacierKey: "legacy-empty-hash.txt",
+            uploadedAt: Date(),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&existing)
+
+        let scanToken = try database.beginScan(for: sourceRoot)
+        let metadataOnlyScan = FileRecord(
+            sourcePath: sourceRoot,
+            relativePath: "legacy-empty-hash.txt",
+            fileSize: 9,
+            modifiedAt: fixedDate,
+            sha256: "",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+
+        let pendingFromBatch = try database.syncScannedFilesBatch(
+            [metadataOnlyScan],
+            for: sourceRoot,
+            scanToken: scanToken
+        )
+
+        XCTAssertEqual(pendingFromBatch.map(\.relativePath), ["legacy-empty-hash.txt"])
+        let stored = try XCTUnwrap(
+            database.allFiles().first(where: {
+                $0.sourcePath == sourceRoot && $0.relativePath == "legacy-empty-hash.txt"
+            })
+        )
+        XCTAssertEqual(stored.sha256, "")
+        XCTAssertNotNil(stored.uploadedAt)
+    }
+
     func testStreamingSyncPreservesIncrementalDiffBehavior() throws {
         let database = try makeDatabaseService()
         let sourceRoot = "/tmp/source"

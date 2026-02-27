@@ -174,6 +174,24 @@ final class FileScannerTests: XCTestCase {
         )
     }
 
+    func testScanMetadataEmitsRecordsWithoutHashes() async throws {
+        let tempDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let payload = Data("metadata-only".utf8)
+        let fileURL = tempDirectory.appendingPathComponent("file.txt")
+        try payload.write(to: fileURL)
+
+        var records: [FileRecord] = []
+        try await FileScanner().scanMetadata(sourceRoot: tempDirectory.path) { record in
+            records.append(record)
+        }
+
+        let scannedRecord = try XCTUnwrap(records.first(where: { $0.relativePath == "file.txt" }))
+        XCTAssertEqual(scannedRecord.fileSize, Int64(payload.count))
+        XCTAssertEqual(scannedRecord.sha256, "")
+    }
+
     private func makeTempDirectory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("IceVaultTests-\(UUID().uuidString)", isDirectory: true)

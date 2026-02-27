@@ -4,7 +4,6 @@ enum BackupEngineError: LocalizedError {
     case invalidSettings(String)
     case databaseUnavailable(String)
     case missingFileRecordID(String)
-    case sourceFileMissing(String)
 
     var errorDescription: String? {
         switch self {
@@ -14,8 +13,6 @@ enum BackupEngineError: LocalizedError {
             return "Backup database unavailable: \(message)"
         case .missingFileRecordID(let relativePath):
             return "Missing database identifier for pending file: \(relativePath)"
-        case .sourceFileMissing(let path):
-            return "Source file disappeared before upload: \(path)"
         }
     }
 }
@@ -451,7 +448,7 @@ final class BackupEngine: @unchecked Sendable {
                         var discoveredByteCount: Int64 = 0
                         let initialFlushBatchSize = max(1, min(Self.scanSyncBatchSize, settings.maxConcurrentFileUploads))
 
-                        try await scanner.scan(sourceRoot: sourceRoot) { record in
+                        try await scanner.scanMetadata(sourceRoot: sourceRoot) { record in
                             try Task.checkCancellation()
                             try uploadLoopFailureSignal.throwIfFailed()
                             discoveredFileCount += 1
@@ -585,7 +582,11 @@ final class BackupEngine: @unchecked Sendable {
             for: sourceRoot,
             scanToken: scanToken
         )
-        return try makeUploadPlans(pendingFiles: pendingFiles, sourceRootURL: sourceRootURL)
+        return try makeUploadPlans(
+            pendingFiles: pendingFiles,
+            sourceRootURL: sourceRootURL,
+            database: database
+        )
     }
 
     private func uploadPendingPlansFromStream(
@@ -702,7 +703,11 @@ final class BackupEngine: @unchecked Sendable {
         )
     }
 
-    private func makeUploadPlans(pendingFiles: [FileRecord], sourceRootURL: URL) throws -> [PendingUploadPlan] {
+    private func makeUploadPlans(
+        pendingFiles: [FileRecord],
+        sourceRootURL: URL,
+        database: DatabaseService
+    ) throws -> [PendingUploadPlan] {
         let orderedPendingFiles = pendingFiles.sorted { lhs, rhs in
             lhs.relativePath.localizedStandardCompare(rhs.relativePath) == .orderedAscending
         }
@@ -711,11 +716,19 @@ final class BackupEngine: @unchecked Sendable {
         plans.reserveCapacity(orderedPendingFiles.count)
 
         for record in orderedPendingFiles {
+            try Task.checkCancellation()
             guard let recordID = record.id else {
                 throw BackupEngineError.missingFileRecordID(record.relativePath)
             }
 
             let localFileURL = sourceRootURL.appendingPathComponent(record.relativePath)
+            guard let resolvedSHA256 = try resolvedPendingPlanSHA256(
+                for: record,
+                localFileURL: localFileURL,
+                database: database
+            ) else {
+                continue
+            }
             let objectKey = record.glacierKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? Self.objectKey(from: record.relativePath)
                 : record.glacierKey
@@ -726,12 +739,41 @@ final class BackupEngine: @unchecked Sendable {
                     localPath: localFileURL.path,
                     objectKey: objectKey,
                     fileSize: max(record.fileSize, 0),
-                    sha256: record.sha256
+                    sha256: resolvedSHA256
                 )
             )
         }
 
         return plans
+    }
+
+    private func resolvedPendingPlanSHA256(
+        for record: FileRecord,
+        localFileURL: URL,
+        database: DatabaseService
+    ) throws -> String? {
+        let normalizedSHA256 = record.sha256.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !normalizedSHA256.isEmpty {
+            return normalizedSHA256
+        }
+
+        guard fileManager.fileExists(atPath: localFileURL.path) else {
+            return nil
+        }
+
+        let computedSHA256: String
+        do {
+            computedSHA256 = try scanner.sha256Hex(for: localFileURL)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            return nil
+        }
+        guard let recordID = record.id else {
+            throw BackupEngineError.missingFileRecordID(record.relativePath)
+        }
+        try database.updateFileSHA256(id: recordID, sha256: computedSHA256)
+        return computedSHA256
     }
 
     private func uploadPendingFiles(
