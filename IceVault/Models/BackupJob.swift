@@ -32,6 +32,11 @@ final class BackupJob: ObservableObject, Identifiable {
     @Published var isScanInProgress: Bool
     @Published var completedAt: Date?
     @Published var error: String?
+    @Published var deferredUploadFailureCount: Int
+    @Published var deferredUploadPendingFiles: Int
+    @Published var deferredUploadRetryPassCount: Int
+    @Published var deferredUploadLastError: String?
+    @Published var isRetryingDeferredUploads: Bool
 
     init(
         id: UUID = UUID(),
@@ -49,7 +54,12 @@ final class BackupJob: ObservableObject, Identifiable {
         uploadBytesPerSecond: Double = 0,
         startedAt: Date = Date(),
         completedAt: Date? = nil,
-        error: String? = nil
+        error: String? = nil,
+        deferredUploadFailureCount: Int = 0,
+        deferredUploadPendingFiles: Int = 0,
+        deferredUploadRetryPassCount: Int = 0,
+        deferredUploadLastError: String? = nil,
+        isRetryingDeferredUploads: Bool = false
     ) {
         self.id = id
         self.sourceRoot = sourceRoot
@@ -68,6 +78,11 @@ final class BackupJob: ObservableObject, Identifiable {
         self.startedAt = startedAt
         self.completedAt = completedAt
         self.error = error
+        self.deferredUploadFailureCount = max(deferredUploadFailureCount, 0)
+        self.deferredUploadPendingFiles = max(deferredUploadPendingFiles, 0)
+        self.deferredUploadRetryPassCount = max(deferredUploadRetryPassCount, 0)
+        self.deferredUploadLastError = deferredUploadLastError
+        self.isRetryingDeferredUploads = isRetryingDeferredUploads
     }
 
     var isRunning: Bool {
@@ -104,6 +119,10 @@ final class BackupJob: ObservableObject, Identifiable {
 
     var hasDiscoveryEstimate: Bool {
         discoveryEstimatedFiles != nil && discoveryEstimatedBytes != nil
+    }
+
+    var hasDeferredUploadIssues: Bool {
+        deferredUploadFailureCount > 0 || deferredUploadPendingFiles > 0 || isRetryingDeferredUploads
     }
 
     func setScanTotals(fileCount: Int, byteCount: Int64) {
@@ -167,14 +186,48 @@ final class BackupJob: ObservableObject, Identifiable {
     func markCompleted() {
         status = .completed
         isScanInProgress = false
+        isRetryingDeferredUploads = false
         completedAt = Date()
     }
 
     func markFailed(_ message: String) {
         status = .failed
         isScanInProgress = false
+        isRetryingDeferredUploads = false
         error = message
         completedAt = Date()
+    }
+
+    func resetDeferredUploadTelemetry() {
+        deferredUploadFailureCount = 0
+        deferredUploadPendingFiles = 0
+        deferredUploadRetryPassCount = 0
+        deferredUploadLastError = nil
+        isRetryingDeferredUploads = false
+    }
+
+    func markDeferredUploadFailure(_ message: String?, pendingFiles: Int? = nil) {
+        deferredUploadFailureCount += 1
+        if let pendingFiles {
+            deferredUploadPendingFiles = max(pendingFiles, 0)
+        }
+        let normalizedMessage = message?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let normalizedMessage, !normalizedMessage.isEmpty {
+            deferredUploadLastError = normalizedMessage
+        }
+    }
+
+    func setDeferredUploadPendingFiles(_ count: Int) {
+        deferredUploadPendingFiles = max(count, 0)
+    }
+
+    func markDeferredRetryPassStarted() {
+        deferredUploadRetryPassCount += 1
+        isRetryingDeferredUploads = true
+    }
+
+    func markDeferredRetryPassCompleted() {
+        isRetryingDeferredUploads = false
     }
 
     func historyEntry() -> BackupHistoryEntry {
@@ -187,7 +240,11 @@ final class BackupJob: ObservableObject, Identifiable {
             status: status,
             sourceRoot: sourceRoot,
             bucket: bucket,
-            error: error
+            error: error,
+            deferredUploadFailureCount: max(deferredUploadFailureCount, 0),
+            deferredUploadPendingFiles: max(deferredUploadPendingFiles, 0),
+            deferredUploadRetryPassCount: max(deferredUploadRetryPassCount, 0),
+            deferredUploadLastError: deferredUploadLastError
         )
     }
 
@@ -206,6 +263,10 @@ struct BackupHistoryEntry: Identifiable, Codable {
     let sourceRoot: String
     let bucket: String
     let error: String?
+    let deferredUploadFailureCount: Int
+    let deferredUploadPendingFiles: Int
+    let deferredUploadRetryPassCount: Int
+    let deferredUploadLastError: String?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -218,6 +279,10 @@ struct BackupHistoryEntry: Identifiable, Codable {
         case sourceRoot
         case bucket
         case error
+        case deferredUploadFailureCount
+        case deferredUploadPendingFiles
+        case deferredUploadRetryPassCount
+        case deferredUploadLastError
     }
 
     init(
@@ -229,7 +294,11 @@ struct BackupHistoryEntry: Identifiable, Codable {
         status: BackupJob.Status,
         sourceRoot: String,
         bucket: String,
-        error: String?
+        error: String?,
+        deferredUploadFailureCount: Int = 0,
+        deferredUploadPendingFiles: Int = 0,
+        deferredUploadRetryPassCount: Int = 0,
+        deferredUploadLastError: String? = nil
     ) {
         self.id = id
         self.startedAt = startedAt
@@ -240,6 +309,10 @@ struct BackupHistoryEntry: Identifiable, Codable {
         self.sourceRoot = sourceRoot
         self.bucket = bucket
         self.error = error
+        self.deferredUploadFailureCount = max(deferredUploadFailureCount, 0)
+        self.deferredUploadPendingFiles = max(deferredUploadPendingFiles, 0)
+        self.deferredUploadRetryPassCount = max(deferredUploadRetryPassCount, 0)
+        self.deferredUploadLastError = deferredUploadLastError
     }
 
     init(from decoder: Decoder) throws {
@@ -259,6 +332,19 @@ struct BackupHistoryEntry: Identifiable, Codable {
         sourceRoot = try container.decode(String.self, forKey: .sourceRoot)
         bucket = try container.decode(String.self, forKey: .bucket)
         error = try container.decodeIfPresent(String.self, forKey: .error)
+        deferredUploadFailureCount = max(
+            try container.decodeIfPresent(Int.self, forKey: .deferredUploadFailureCount) ?? 0,
+            0
+        )
+        deferredUploadPendingFiles = max(
+            try container.decodeIfPresent(Int.self, forKey: .deferredUploadPendingFiles) ?? 0,
+            0
+        )
+        deferredUploadRetryPassCount = max(
+            try container.decodeIfPresent(Int.self, forKey: .deferredUploadRetryPassCount) ?? 0,
+            0
+        )
+        deferredUploadLastError = try container.decodeIfPresent(String.self, forKey: .deferredUploadLastError)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -273,6 +359,10 @@ struct BackupHistoryEntry: Identifiable, Codable {
         try container.encode(sourceRoot, forKey: .sourceRoot)
         try container.encode(bucket, forKey: .bucket)
         try container.encodeIfPresent(error, forKey: .error)
+        try container.encode(deferredUploadFailureCount, forKey: .deferredUploadFailureCount)
+        try container.encode(deferredUploadPendingFiles, forKey: .deferredUploadPendingFiles)
+        try container.encode(deferredUploadRetryPassCount, forKey: .deferredUploadRetryPassCount)
+        try container.encodeIfPresent(deferredUploadLastError, forKey: .deferredUploadLastError)
     }
 
     var fileCount: Int {

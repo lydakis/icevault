@@ -126,6 +126,36 @@ final class BackupJobTests: XCTestCase {
         XCTAssertNotNil(job.completedAt)
     }
 
+    func testDeferredUploadTelemetryTracksFailuresPendingCountsAndRetryPasses() {
+        let job = BackupJob(sourceRoot: "/tmp/source", bucket: "bucket")
+
+        XCTAssertFalse(job.hasDeferredUploadIssues)
+
+        job.markDeferredUploadFailure("transient", pendingFiles: 3)
+        XCTAssertEqual(job.deferredUploadFailureCount, 1)
+        XCTAssertEqual(job.deferredUploadPendingFiles, 3)
+        XCTAssertEqual(job.deferredUploadLastError, "transient")
+        XCTAssertTrue(job.hasDeferredUploadIssues)
+
+        job.markDeferredRetryPassStarted()
+        XCTAssertEqual(job.deferredUploadRetryPassCount, 1)
+        XCTAssertTrue(job.isRetryingDeferredUploads)
+
+        job.markDeferredRetryPassCompleted()
+        XCTAssertFalse(job.isRetryingDeferredUploads)
+
+        job.setDeferredUploadPendingFiles(0)
+        XCTAssertEqual(job.deferredUploadPendingFiles, 0)
+
+        job.resetDeferredUploadTelemetry()
+        XCTAssertEqual(job.deferredUploadFailureCount, 0)
+        XCTAssertEqual(job.deferredUploadPendingFiles, 0)
+        XCTAssertEqual(job.deferredUploadRetryPassCount, 0)
+        XCTAssertNil(job.deferredUploadLastError)
+        XCTAssertFalse(job.isRetryingDeferredUploads)
+        XCTAssertFalse(job.hasDeferredUploadIssues)
+    }
+
     func testHistoryEntryClampsNegativeCounts() {
         let job = BackupJob(
             sourceRoot: "/tmp/source",
@@ -137,6 +167,24 @@ final class BackupJobTests: XCTestCase {
         let entry = job.historyEntry()
         XCTAssertEqual(entry.filesUploaded, 0)
         XCTAssertEqual(entry.bytesUploaded, 0)
+    }
+
+    func testHistoryEntryPreservesDeferredUploadTelemetry() {
+        let job = BackupJob(
+            sourceRoot: "/tmp/source",
+            bucket: "bucket",
+            filesUploaded: 2,
+            bytesUploaded: 20
+        )
+        job.markDeferredUploadFailure("timeout", pendingFiles: 4)
+        job.markDeferredRetryPassStarted()
+        job.markDeferredRetryPassCompleted()
+
+        let entry = job.historyEntry()
+        XCTAssertEqual(entry.deferredUploadFailureCount, 1)
+        XCTAssertEqual(entry.deferredUploadPendingFiles, 4)
+        XCTAssertEqual(entry.deferredUploadRetryPassCount, 1)
+        XCTAssertEqual(entry.deferredUploadLastError, "timeout")
     }
 
     func testBackupHistoryEntryDecodesLegacyFileCountAndClampsNegativeValues() throws {
@@ -162,6 +210,10 @@ final class BackupJobTests: XCTestCase {
         XCTAssertEqual(entry.filesUploaded, 0)
         XCTAssertEqual(entry.bytesUploaded, 0)
         XCTAssertEqual(entry.fileCount, 0)
+        XCTAssertEqual(entry.deferredUploadFailureCount, 0)
+        XCTAssertEqual(entry.deferredUploadPendingFiles, 0)
+        XCTAssertEqual(entry.deferredUploadRetryPassCount, 0)
+        XCTAssertNil(entry.deferredUploadLastError)
     }
 
     func testBackupHistoryEntryDurationNeverNegative() {

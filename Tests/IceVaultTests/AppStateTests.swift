@@ -292,6 +292,31 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(appState.idleStatusText, "Last backup failed")
         XCTAssertNil(appState.lastBackupDate)
 
+        let deferredFailedEntry = BackupHistoryEntry(
+            id: UUID(),
+            startedAt: Date(timeIntervalSince1970: 1_700_002_000),
+            completedAt: Date(timeIntervalSince1970: 1_700_002_200),
+            filesUploaded: 10,
+            bytesUploaded: 10_000,
+            status: .failed,
+            sourceRoot: "/tmp/source",
+            bucket: "bucket",
+            error: "upload deferred",
+            deferredUploadFailureCount: 3,
+            deferredUploadPendingFiles: 7,
+            deferredUploadRetryPassCount: 1,
+            deferredUploadLastError: "S3 putObject failed: timeout"
+        )
+        appState.history = [deferredFailedEntry]
+        XCTAssertEqual(appState.statusText, "Idle")
+        XCTAssertEqual(appState.statusBadgeText, "RETRY")
+        XCTAssertEqual(appState.idleStatusText, "7 pending uploads")
+        XCTAssertTrue(appState.hasPendingDeferredUploads)
+        XCTAssertEqual(appState.latestDeferredUploadPendingFiles, 7)
+        XCTAssertTrue(appState.latestDeferredUploadStatusText?.contains("7 file(s) still pending upload") == true)
+        XCTAssertTrue(appState.latestDeferredUploadStatusText?.contains("Last error:") == true)
+        XCTAssertNil(appState.lastBackupDate)
+
         let expectedImages: [(BackupJob.Status, String)] = [
             (.idle, "archivebox"),
             (.scanning, "magnifyingglass.circle"),

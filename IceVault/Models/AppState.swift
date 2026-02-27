@@ -254,6 +254,29 @@ final class AppState: ObservableObject {
         history.first?.status
     }
 
+    var latestDeferredUploadPendingFiles: Int {
+        max(history.first?.deferredUploadPendingFiles ?? 0, 0)
+    }
+
+    var hasPendingDeferredUploads: Bool {
+        latestBackupStatus == .failed && latestDeferredUploadPendingFiles > 0
+    }
+
+    var latestDeferredUploadStatusText: String? {
+        guard hasPendingDeferredUploads, let latestEntry = history.first else {
+            return nil
+        }
+
+        let pendingCount = max(latestEntry.deferredUploadPendingFiles, 0)
+        var summary = "\(pendingCount.formatted(.number.grouping(.automatic))) file(s) still pending upload. Run Backup Now to retry."
+        let lastError = latestEntry.deferredUploadLastError?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !lastError.isEmpty {
+            summary += " Last error: \(lastError)"
+        }
+
+        return summary
+    }
+
     var idleStatusText: String {
         guard isConfigured else {
             return "Not configured"
@@ -263,6 +286,9 @@ final class AppState: ObservableObject {
         case .some(.completed):
             return "All backed up ✓"
         case .some(.failed):
+            if hasPendingDeferredUploads {
+                return "\(latestDeferredUploadPendingFiles.formatted(.number.grouping(.automatic))) pending uploads"
+            }
             return "Last backup failed"
         case .some(.idle), .some(.scanning), .some(.uploading), .none:
             return "Ready to back up"
@@ -282,6 +308,9 @@ final class AppState: ObservableObject {
         case .some(.completed):
             return "HEALTHY"
         case .some(.failed):
+            if hasPendingDeferredUploads {
+                return "RETRY"
+            }
             return "ATTENTION"
         case .some(.idle), .some(.scanning), .some(.uploading), .none:
             return "READY"

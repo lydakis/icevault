@@ -60,6 +60,18 @@ struct HistoryView: View {
                             Text("\(formattedBytes(entry.bytesUploaded)) uploaded")
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
+
+                            if entry.deferredUploadPendingFiles > 0 {
+                                Text("Deferred pending uploads: \(formattedCount(entry.deferredUploadPendingFiles))")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.orange)
+                            }
+
+                            if entry.deferredUploadFailureCount > 0 {
+                                Text("Recoverable upload errors: \(formattedCount(entry.deferredUploadFailureCount))")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.orange)
+                            }
                         }
 
                         Spacer()

@@ -472,6 +472,7 @@ final class BackupEngine: @unchecked Sendable {
                 job.setDiscoveryEstimate(fileCount: nil, byteCount: nil)
                 job.uploadBytesPerSecond = 0
                 job.isScanInProgress = true
+                job.resetDeferredUploadTelemetry()
             }
 
             try Task.checkCancellation()
@@ -624,6 +625,10 @@ final class BackupEngine: @unchecked Sendable {
                         if let deferredSummary = await deferredUploadFailureTracker.summary() {
                             let pendingCount = try database.pendingFileCount(for: sourceRoot)
                             if pendingCount > 0 {
+                                await MainActor.run {
+                                    job.setDeferredUploadPendingFiles(pendingCount)
+                                    job.markDeferredRetryPassCompleted()
+                                }
                                 throw BackupEngineError.uploadsDeferred(
                                     pendingCount: pendingCount,
                                     firstErrorDescription: deferredSummary.firstErrorDescription
@@ -722,7 +727,13 @@ final class BackupEngine: @unchecked Sendable {
             } catch {
                 await backpressureGate.release(slots: plans.count)
                 if Self.shouldDeferUploadFailure(error) {
-                    await deferredFailureTracker.record(error)
+                    await recordDeferredUploadFailure(
+                        error,
+                        sourceRoot: sourceRoot,
+                        database: database,
+                        job: job,
+                        deferredFailureTracker: deferredFailureTracker
+                    )
                     continue
                 }
                 throw error
@@ -730,18 +741,36 @@ final class BackupEngine: @unchecked Sendable {
         }
 
         if await deferredFailureTracker.summary() != nil {
-            try await retryDeferredPendingUploads(
-                sourceRoot: sourceRoot,
-                sourceRootURL: sourceRootURL,
-                bucket: bucket,
-                settings: settings,
-                database: database,
-                glacierClient: glacierClient,
-                job: job,
-                progressTracker: progressTracker,
-                throughputTracker: throughputTracker,
-                deferredFailureTracker: deferredFailureTracker
-            )
+            await MainActor.run {
+                job.markDeferredRetryPassStarted()
+            }
+            do {
+                try await retryDeferredPendingUploads(
+                    sourceRoot: sourceRoot,
+                    sourceRootURL: sourceRootURL,
+                    bucket: bucket,
+                    settings: settings,
+                    database: database,
+                    glacierClient: glacierClient,
+                    job: job,
+                    progressTracker: progressTracker,
+                    throughputTracker: throughputTracker,
+                    deferredFailureTracker: deferredFailureTracker
+                )
+                await refreshDeferredPendingCount(
+                    sourceRoot: sourceRoot,
+                    database: database,
+                    job: job
+                )
+                await MainActor.run {
+                    job.markDeferredRetryPassCompleted()
+                }
+            } catch {
+                await MainActor.run {
+                    job.markDeferredRetryPassCompleted()
+                }
+                throw error
+            }
         }
     }
 
@@ -795,10 +824,21 @@ final class BackupEngine: @unchecked Sendable {
                     progressTracker: progressTracker,
                     throughputTracker: throughputTracker
                 )
+                await refreshDeferredPendingCount(
+                    sourceRoot: sourceRoot,
+                    database: database,
+                    job: job
+                )
                 lastRelativePath = batchLastRelativePath
             } catch {
                 if Self.shouldDeferUploadFailure(error) {
-                    await deferredFailureTracker.record(error)
+                    await recordDeferredUploadFailure(
+                        error,
+                        sourceRoot: sourceRoot,
+                        database: database,
+                        job: job,
+                        deferredFailureTracker: deferredFailureTracker
+                    )
                     let pendingPlansAfterFailure = try pendingRetryPlansStillPending(
                         retryPlans,
                         database: database
@@ -824,7 +864,13 @@ final class BackupEngine: @unchecked Sendable {
                             )
                         } catch {
                             if Self.shouldDeferUploadFailure(error) {
-                                await deferredFailureTracker.record(error)
+                                await recordDeferredUploadFailure(
+                                    error,
+                                    sourceRoot: sourceRoot,
+                                    database: database,
+                                    job: job,
+                                    deferredFailureTracker: deferredFailureTracker
+                                )
                             } else {
                                 throw error
                             }
@@ -858,6 +904,31 @@ final class BackupEngine: @unchecked Sendable {
         }
 
         return pendingPlans
+    }
+
+    private func recordDeferredUploadFailure(
+        _ error: Error,
+        sourceRoot: String,
+        database: DatabaseService,
+        job: BackupJob,
+        deferredFailureTracker: DeferredUploadFailureTracker
+    ) async {
+        await deferredFailureTracker.record(error)
+        let pendingCount = (try? database.pendingFileCount(for: sourceRoot)) ?? 0
+        await MainActor.run {
+            job.markDeferredUploadFailure(error.localizedDescription, pendingFiles: pendingCount)
+        }
+    }
+
+    private func refreshDeferredPendingCount(
+        sourceRoot: String,
+        database: DatabaseService,
+        job: BackupJob
+    ) async {
+        let pendingCount = (try? database.pendingFileCount(for: sourceRoot)) ?? 0
+        await MainActor.run {
+            job.setDeferredUploadPendingFiles(pendingCount)
+        }
     }
 
     private func enqueuePendingPlans(

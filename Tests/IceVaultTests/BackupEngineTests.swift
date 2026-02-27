@@ -953,6 +953,11 @@ final class BackupEngineTests: XCTestCase {
 
         await MainActor.run {
             XCTAssertEqual(job.status, .failed)
+            XCTAssertEqual(job.deferredUploadPendingFiles, 1)
+            XCTAssertGreaterThanOrEqual(job.deferredUploadFailureCount, 1)
+            XCTAssertNotNil(job.deferredUploadLastError)
+            XCTAssertGreaterThanOrEqual(job.deferredUploadRetryPassCount, 1)
+            XCTAssertFalse(job.isRetryingDeferredUploads)
         }
     }
 
@@ -1727,6 +1732,11 @@ final class BackupEngineTests: XCTestCase {
             XCTAssertEqual(job.filesUploaded, 1)
             XCTAssertEqual(job.bytesTotal, Int64(payload.count))
             XCTAssertEqual(job.bytesUploaded, Int64(payload.count))
+            XCTAssertEqual(job.deferredUploadFailureCount, 1)
+            XCTAssertEqual(job.deferredUploadPendingFiles, 0)
+            XCTAssertEqual(job.deferredUploadRetryPassCount, 1)
+            XCTAssertNotNil(job.deferredUploadLastError)
+            XCTAssertFalse(job.isRetryingDeferredUploads)
         }
     }
 

@@ -116,6 +116,10 @@ struct MenuBarView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
+
+            if job.hasDeferredUploadIssues {
+                deferredUploadTelemetryContent(job: job)
+            }
         }
     }
 
@@ -132,6 +136,12 @@ struct MenuBarView: View {
             Text(appState.idleStatusText)
                 .font(.subheadline.weight(.medium))
                 .foregroundStyle(idleStatusColor)
+
+            if let latestDeferredUploadStatusText = appState.latestDeferredUploadStatusText {
+                Label(latestDeferredUploadStatusText, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
         }
     }
 
@@ -197,6 +207,10 @@ struct MenuBarView: View {
     }
 
     private var statusColor: Color {
+        if appState.currentJob?.hasDeferredUploadIssues == true {
+            return .orange
+        }
+
         switch appState.currentJob?.status ?? .idle {
         case .idle:
             return .secondary
@@ -213,6 +227,10 @@ struct MenuBarView: View {
 
     private var statusBadgeColor: Color {
         if let job = appState.currentJob {
+            if job.hasDeferredUploadIssues {
+                return .orange
+            }
+
             switch job.status {
             case .idle:
                 return .secondary
@@ -235,6 +253,9 @@ struct MenuBarView: View {
         case .some(.completed):
             return .green
         case .some(.failed):
+            if appState.hasPendingDeferredUploads {
+                return .orange
+            }
             return .red
         case .some(.idle), .some(.scanning), .some(.uploading), .none:
             return .secondary
@@ -244,6 +265,10 @@ struct MenuBarView: View {
     private var idleStatusColor: Color {
         guard appState.isConfigured else {
             return .secondary
+        }
+
+        if appState.hasPendingDeferredUploads {
+            return .orange
         }
 
         switch appState.latestBackupStatus {
@@ -266,6 +291,32 @@ struct MenuBarView: View {
 
     private func formattedRate(_ value: Double) -> String {
         value.formatted(.number.precision(.fractionLength(1)))
+    }
+
+    @ViewBuilder
+    private func deferredUploadTelemetryContent(job: BackupJob) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if job.isRetryingDeferredUploads {
+                Label(
+                    "Retrying deferred uploads (pass \(formattedCount(job.deferredUploadRetryPassCount)))",
+                    systemImage: "arrow.clockwise.circle.fill"
+                )
+            } else {
+                Label("Deferred uploads detected", systemImage: "exclamationmark.triangle.fill")
+            }
+
+            Text("Recoverable upload errors: \(formattedCount(job.deferredUploadFailureCount))")
+            Text("Pending uploads: \(formattedCount(job.deferredUploadPendingFiles))")
+
+            if let deferredUploadLastError = job.deferredUploadLastError, !deferredUploadLastError.isEmpty {
+                Text("Last error: \(deferredUploadLastError)")
+                    .lineLimit(2)
+            }
+        }
+        .font(.caption2)
+        .foregroundStyle(.orange)
+        .padding(8)
+        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
     }
 
     private func discoverySummaryText(for job: BackupJob) -> String {
