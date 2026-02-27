@@ -73,6 +73,24 @@ final class BackupJobTests: XCTestCase {
         XCTAssertEqual(job.discoveredBytes, 40)
     }
 
+    func testDiscoveryEstimateTracksPrepassAndStaysAtLeastDiscoveredCounts() {
+        let job = BackupJob(sourceRoot: "/tmp/source", bucket: "bucket")
+
+        XCTAssertFalse(job.hasDiscoveryEstimate)
+
+        job.setDiscoveryEstimate(fileCount: 10, byteCount: 100)
+        XCTAssertTrue(job.hasDiscoveryEstimate)
+        XCTAssertEqual(job.discoveryEstimatedFiles, 10)
+        XCTAssertEqual(job.discoveryEstimatedBytes, 100)
+
+        job.markDiscovered(fileCount: 12, byteCount: 120)
+        XCTAssertEqual(job.discoveryEstimatedFiles, 12)
+        XCTAssertEqual(job.discoveryEstimatedBytes, 120)
+
+        job.setDiscoveryEstimate(fileCount: nil, byteCount: nil)
+        XCTAssertFalse(job.hasDiscoveryEstimate)
+    }
+
     func testSetUploadRateClampsNegativeValues() {
         let job = BackupJob(sourceRoot: "/tmp/source", bucket: "bucket")
 

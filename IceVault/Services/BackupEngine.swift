@@ -383,12 +383,33 @@ final class BackupEngine: @unchecked Sendable {
                 job.bytesUploaded = 0
                 job.discoveredFiles = 0
                 job.discoveredBytes = 0
+                job.setDiscoveryEstimate(fileCount: nil, byteCount: nil)
                 job.uploadBytesPerSecond = 0
                 job.isScanInProgress = true
             }
 
             try Task.checkCancellation()
             let sourceRootURL = URL(fileURLWithPath: sourceRoot, isDirectory: true)
+            let discoveryEstimate: FileScanner.InventoryStats?
+            do {
+                discoveryEstimate = try scanner.inventoryStats(
+                    sourceRoot: sourceRoot,
+                    abortCheck: { try Task.checkCancellation() }
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                discoveryEstimate = nil
+            }
+            if let discoveryEstimate {
+                await MainActor.run {
+                    job.setDiscoveryEstimate(
+                        fileCount: discoveryEstimate.fileCount,
+                        byteCount: discoveryEstimate.totalBytes
+                    )
+                }
+            }
+
             let progressTracker = UploadProgressTracker()
             let uploadThroughputTracker = UploadThroughputTracker()
             let remoteAuditUploadedBefore = Date()

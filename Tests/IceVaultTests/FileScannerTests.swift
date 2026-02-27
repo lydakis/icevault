@@ -144,6 +144,36 @@ final class FileScannerTests: XCTestCase {
         XCTAssertEqual(arrayScan.map(\.sha256), sortedStreaming.map(\.sha256))
     }
 
+    func testInventoryStatsCountsFilesAndBytesWithoutHashes() throws {
+        let tempDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let visibleFile = tempDirectory.appendingPathComponent("visible.txt")
+        let hiddenFile = tempDirectory.appendingPathComponent(".hidden")
+        let hiddenDirectory = tempDirectory.appendingPathComponent(".config", isDirectory: true)
+        let hiddenNestedFile = hiddenDirectory.appendingPathComponent("settings.json")
+        let packageDirectory = tempDirectory.appendingPathComponent("Sample.app", isDirectory: true)
+        let packageNestedFile = packageDirectory.appendingPathComponent("Contents.txt")
+        let dsStoreFile = tempDirectory.appendingPathComponent(".DS_Store")
+
+        try FileManager.default.createDirectory(at: hiddenDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: packageDirectory, withIntermediateDirectories: true)
+
+        try Data("hello".utf8).write(to: visibleFile)
+        try Data("secret".utf8).write(to: hiddenFile)
+        try Data("{}".utf8).write(to: hiddenNestedFile)
+        try Data("package-data".utf8).write(to: packageNestedFile)
+        try Data("ignore".utf8).write(to: dsStoreFile)
+
+        let stats = try FileScanner().inventoryStats(sourceRoot: tempDirectory.path)
+
+        XCTAssertEqual(stats.fileCount, 4)
+        XCTAssertEqual(
+            stats.totalBytes,
+            Int64("hello".utf8.count + "secret".utf8.count + "{}".utf8.count + "package-data".utf8.count)
+        )
+    }
+
     private func makeTempDirectory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("IceVaultTests-\(UUID().uuidString)", isDirectory: true)

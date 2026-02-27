@@ -101,7 +101,7 @@ struct MenuBarView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            Text("Discovered: \(formattedCount(job.discoveredFiles)) files (\(formattedBytes(job.discoveredBytes)))")
+            Text(discoverySummaryText(for: job))
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -266,5 +266,16 @@ struct MenuBarView: View {
 
     private func formattedRate(_ value: Double) -> String {
         value.formatted(.number.precision(.fractionLength(1)))
+    }
+
+    private func discoverySummaryText(for job: BackupJob) -> String {
+        if
+            let estimatedFiles = job.discoveryEstimatedFiles,
+            let estimatedBytes = job.discoveryEstimatedBytes
+        {
+            return "Discovered: \(formattedCount(job.discoveredFiles)) / \(formattedCount(estimatedFiles)) files (\(formattedBytes(job.discoveredBytes)) / \(formattedBytes(estimatedBytes)))"
+        }
+
+        return "Discovered: \(formattedCount(job.discoveredFiles)) files (\(formattedBytes(job.discoveredBytes)))"
     }
 }

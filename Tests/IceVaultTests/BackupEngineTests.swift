@@ -1303,6 +1303,12 @@ final class BackupEngineTests: XCTestCase {
         XCTAssertEqual(scanner.arrayScanCallCount, 0)
         XCTAssertEqual(mockS3.putObjectInputs.count, 1)
         XCTAssertEqual(mockS3.putObjectInputs.first?.key, "streaming.txt")
+        await MainActor.run {
+            XCTAssertEqual(job.discoveryEstimatedFiles, 1)
+            XCTAssertEqual(job.discoveryEstimatedBytes, Int64(payload.count))
+            XCTAssertEqual(job.discoveredFiles, 1)
+            XCTAssertEqual(job.discoveredBytes, Int64(payload.count))
+        }
     }
 
     func testRunStartsUploadingBeforeScanCompletes() async throws {

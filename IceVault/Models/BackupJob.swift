@@ -26,6 +26,8 @@ final class BackupJob: ObservableObject, Identifiable {
     @Published var bytesUploaded: Int64
     @Published var discoveredFiles: Int
     @Published var discoveredBytes: Int64
+    @Published var discoveryEstimatedFiles: Int?
+    @Published var discoveryEstimatedBytes: Int64?
     @Published var uploadBytesPerSecond: Double
     @Published var isScanInProgress: Bool
     @Published var completedAt: Date?
@@ -42,6 +44,8 @@ final class BackupJob: ObservableObject, Identifiable {
         bytesUploaded: Int64 = 0,
         discoveredFiles: Int = 0,
         discoveredBytes: Int64 = 0,
+        discoveryEstimatedFiles: Int? = nil,
+        discoveryEstimatedBytes: Int64? = nil,
         uploadBytesPerSecond: Double = 0,
         startedAt: Date = Date(),
         completedAt: Date? = nil,
@@ -57,6 +61,8 @@ final class BackupJob: ObservableObject, Identifiable {
         self.bytesUploaded = bytesUploaded
         self.discoveredFiles = discoveredFiles
         self.discoveredBytes = discoveredBytes
+        self.discoveryEstimatedFiles = discoveryEstimatedFiles.map { max($0, 0) }
+        self.discoveryEstimatedBytes = discoveryEstimatedBytes.map { max($0, 0) }
         self.uploadBytesPerSecond = max(uploadBytesPerSecond, 0)
         self.isScanInProgress = status == .scanning
         self.startedAt = startedAt
@@ -96,6 +102,10 @@ final class BackupJob: ObservableObject, Identifiable {
         isScanInProgress
     }
 
+    var hasDiscoveryEstimate: Bool {
+        discoveryEstimatedFiles != nil && discoveryEstimatedBytes != nil
+    }
+
     func setScanTotals(fileCount: Int, byteCount: Int64) {
         status = .scanning
         isScanInProgress = true
@@ -109,9 +119,39 @@ final class BackupJob: ObservableObject, Identifiable {
         isScanInProgress = false
     }
 
+    func setDiscoveryEstimate(fileCount: Int?, byteCount: Int64?) {
+        if let fileCount {
+            discoveryEstimatedFiles = max(fileCount, 0)
+        } else {
+            discoveryEstimatedFiles = nil
+        }
+
+        if let byteCount {
+            discoveryEstimatedBytes = max(byteCount, 0)
+        } else {
+            discoveryEstimatedBytes = nil
+        }
+
+        if let discoveryEstimatedFiles, discoveredFiles > discoveryEstimatedFiles {
+            self.discoveryEstimatedFiles = discoveredFiles
+        }
+
+        if let discoveryEstimatedBytes, discoveredBytes > discoveryEstimatedBytes {
+            self.discoveryEstimatedBytes = discoveredBytes
+        }
+    }
+
     func markDiscovered(fileCount: Int, byteCount: Int64) {
         discoveredFiles = max(discoveredFiles, max(fileCount, 0))
         discoveredBytes = max(discoveredBytes, max(byteCount, 0))
+
+        if let discoveryEstimatedFiles, discoveredFiles > discoveryEstimatedFiles {
+            self.discoveryEstimatedFiles = discoveredFiles
+        }
+
+        if let discoveryEstimatedBytes, discoveredBytes > discoveryEstimatedBytes {
+            self.discoveryEstimatedBytes = discoveredBytes
+        }
     }
 
     func setUploadRate(bytesPerSecond: Double) {
