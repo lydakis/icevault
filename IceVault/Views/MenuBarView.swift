@@ -16,105 +16,16 @@ struct MenuBarView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
-                Image(systemName: appState.menuBarSystemImage)
-                    .foregroundStyle(statusColor)
-                Text(appState.statusText)
-                    .font(.headline)
-            }
-
-            if let ssoSessionStatusText = appState.ssoSessionStatusText {
-                Text(ssoSessionStatusText)
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(appState.isSSOSessionExpired ? .red : .secondary)
-            }
-
-            if let job = appState.currentJob {
-                ProgressView(value: job.fileProgressFraction)
-
-                Text("\(formattedCount(job.filesUploaded)) / \(formattedCount(job.filesTotal)) files")
-                    .font(.subheadline)
-
-                Text("\(formattedBytes(job.bytesUploaded)) / \(formattedBytes(job.bytesTotal))")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                Text("Discovered: \(formattedCount(job.discoveredFiles)) files (\(formattedBytes(job.discoveredBytes)))")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                if job.shouldShowDiscoveryRate {
-                    Text("Discovering at \(formattedRate(job.discoveryFilesPerSecond)) files/s (\(formattedBytes(Int64(job.discoveryBytesPerSecond)))/s)")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-
-                if job.uploadBytesPerSecond > 0 {
-                    Text("Uploading at \(formattedBytes(Int64(job.uploadBytesPerSecond)))/s")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-            } else {
-                if let lastBackupDate = appState.lastBackupDate {
-                    Text("Last backup: \(lastBackupDate.formatted(date: .abbreviated, time: .shortened))")
-                        .font(.subheadline)
-                } else {
-                    Text("Last backup: Never")
-                        .font(.subheadline)
-                }
-
-                Text(appState.isConfigured ? "All backed up ✓" : "Not configured")
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(appState.isConfigured ? .green : .secondary)
-            }
-
-            if appState.usesSSOAuthentication {
-                Button("Refresh Login") {
-                    appState.refreshSSOLogin()
-                }
-                .buttonStyle(.bordered)
-                .disabled(!appState.canRefreshSSOLogin)
-            }
-
-            Button("Backup Now") {
-                appState.startBackup()
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(
-                appState.currentJob?.isRunning == true
-                    || !appState.isConfigured
-                    || appState.isBackupBlockedBySSOExpiry
-            )
-
-            if let backupBlockedReason = appState.backupBlockedReason {
-                Text(backupBlockedReason)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            if let authenticationPromptMessage = appState.authenticationPromptMessage {
-                Text(authenticationPromptMessage)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-            }
-
-            if appState.currentJob?.isRunning == true {
-                Button("Cancel Backup") {
-                    appState.cancelBackup()
-                }
-                .buttonStyle(.bordered)
-            }
+            statusHeader
+            ssoSessionStatusView
+            backupContent
+            actionButtons
+            backupBlockedReasonView
+            authenticationPromptView
+            cancelButton
 
             Divider()
-
-            HStack {
-                Button("Settings") {
-                    openSettings()
-                }
-                Button("History") {
-                    openWindow(id: "history")
-                }
-            }
+            footerButtons
         }
         .padding(14)
         .frame(width: 340)
@@ -143,6 +54,148 @@ struct MenuBarView: View {
         }
     }
 
+    private var statusHeader: some View {
+        HStack(spacing: 8) {
+            Image(systemName: appState.menuBarSystemImage)
+                .foregroundStyle(statusColor)
+            Text(appState.statusText)
+                .font(.headline)
+
+            Spacer()
+
+            Text(appState.statusBadgeText)
+                .font(.caption2.weight(.semibold))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(statusBadgeColor.opacity(0.2), in: Capsule())
+                .foregroundStyle(statusBadgeColor)
+        }
+    }
+
+    @ViewBuilder
+    private var ssoSessionStatusView: some View {
+        if let ssoSessionStatusText = appState.ssoSessionStatusText {
+            Text(ssoSessionStatusText)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(appState.isSSOSessionExpired ? .red : .secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var backupContent: some View {
+        if let job = appState.currentJob {
+            runningBackupContent(job: job)
+        } else {
+            idleBackupContent
+        }
+    }
+
+    private func runningBackupContent(job: BackupJob) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ProgressView(value: job.fileProgressFraction)
+
+            Text("\(formattedCount(job.filesUploaded)) / \(formattedCount(job.filesTotal)) files")
+                .font(.subheadline)
+
+            Text("\(formattedBytes(job.bytesUploaded)) / \(formattedBytes(job.bytesTotal))")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Text("Discovered: \(formattedCount(job.discoveredFiles)) files (\(formattedBytes(job.discoveredBytes)))")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if job.shouldShowDiscoveryRate {
+                Text("Discovering at \(formattedRate(job.discoveryFilesPerSecond)) files/s (\(formattedBytes(Int64(job.discoveryBytesPerSecond)))/s)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            if job.uploadBytesPerSecond > 0 {
+                Text("Uploading at \(formattedBytes(Int64(job.uploadBytesPerSecond)))/s")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var idleBackupContent: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let lastBackupDate = appState.lastBackupDate {
+                Text("Last successful backup: \(lastBackupDate.formatted(date: .abbreviated, time: .shortened))")
+                    .font(.subheadline)
+            } else {
+                Text("Last successful backup: Never")
+                    .font(.subheadline)
+            }
+
+            Text(appState.idleStatusText)
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(idleStatusColor)
+        }
+    }
+
+    private var actionButtons: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if appState.usesSSOAuthentication {
+                Button("Refresh Login") {
+                    appState.refreshSSOLogin()
+                }
+                .buttonStyle(.bordered)
+                .disabled(!appState.canRefreshSSOLogin)
+            }
+
+            Button("Backup Now") {
+                appState.startBackup()
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(
+                appState.currentJob?.isRunning == true
+                    || !appState.isConfigured
+                    || appState.isBackupBlockedBySSOExpiry
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var backupBlockedReasonView: some View {
+        if let backupBlockedReason = appState.backupBlockedReason {
+            Text(backupBlockedReason)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var authenticationPromptView: some View {
+        if let authenticationPromptMessage = appState.authenticationPromptMessage {
+            Text(authenticationPromptMessage)
+                .font(.caption)
+                .foregroundStyle(.red)
+        }
+    }
+
+    @ViewBuilder
+    private var cancelButton: some View {
+        if appState.currentJob?.isRunning == true {
+            Button("Cancel Backup") {
+                appState.cancelBackup()
+            }
+            .buttonStyle(.bordered)
+        }
+    }
+
+    private var footerButtons: some View {
+        HStack {
+            Button("Settings") {
+                openSettings()
+            }
+            Button("History") {
+                openWindow(id: "history")
+            }
+        }
+    }
+
     private var statusColor: Color {
         switch appState.currentJob?.status ?? .idle {
         case .idle:
@@ -155,6 +208,51 @@ struct MenuBarView: View {
             return .green
         case .failed:
             return .red
+        }
+    }
+
+    private var statusBadgeColor: Color {
+        if let job = appState.currentJob {
+            switch job.status {
+            case .idle:
+                return .secondary
+            case .scanning:
+                return .yellow
+            case .uploading:
+                return .blue
+            case .completed:
+                return .green
+            case .failed:
+                return .red
+            }
+        }
+
+        guard appState.isConfigured else {
+            return .secondary
+        }
+
+        switch appState.latestBackupStatus {
+        case .some(.completed):
+            return .green
+        case .some(.failed):
+            return .red
+        case .some(.idle), .some(.scanning), .some(.uploading), .none:
+            return .secondary
+        }
+    }
+
+    private var idleStatusColor: Color {
+        guard appState.isConfigured else {
+            return .secondary
+        }
+
+        switch appState.latestBackupStatus {
+        case .some(.completed):
+            return .green
+        case .some(.failed):
+            return .red
+        case .some(.idle), .some(.scanning), .some(.uploading), .none:
+            return .secondary
         }
     }
 

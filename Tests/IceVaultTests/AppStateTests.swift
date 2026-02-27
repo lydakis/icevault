@@ -239,6 +239,10 @@ final class AppStateTests: XCTestCase {
             launchAgent: LaunchAgent(launchctlRunner: { _, _ in 0 }),
             ssoTokenMonitor: SSOTokenMonitor(userDefaults: userDefaults, autoStart: false)
         )
+        XCTAssertFalse(appState.isConfigured)
+        XCTAssertEqual(appState.statusText, "Not Configured")
+        XCTAssertEqual(appState.statusBadgeText, "SETUP")
+
         appState.updateSettings(
             AppState.Settings(
                 awsRegion: "us-east-1",
@@ -249,8 +253,10 @@ final class AppStateTests: XCTestCase {
 
         XCTAssertTrue(appState.isConfigured)
         XCTAssertEqual(appState.statusText, "Idle")
+        XCTAssertEqual(appState.statusBadgeText, "READY")
         XCTAssertEqual(appState.menuBarSystemImage, "archivebox")
         XCTAssertNil(appState.lastBackupDate)
+        XCTAssertEqual(appState.idleStatusText, "Ready to back up")
 
         let historyEntry = BackupHistoryEntry(
             id: UUID(),
@@ -264,8 +270,27 @@ final class AppStateTests: XCTestCase {
             error: nil
         )
         appState.history = [historyEntry]
-        XCTAssertEqual(appState.statusText, "Last: Completed")
+        XCTAssertEqual(appState.statusText, "Idle")
+        XCTAssertEqual(appState.statusBadgeText, "HEALTHY")
+        XCTAssertEqual(appState.idleStatusText, "All backed up ✓")
         XCTAssertEqual(appState.lastBackupDate, historyEntry.displayDate)
+
+        let failedHistoryEntry = BackupHistoryEntry(
+            id: UUID(),
+            startedAt: Date(timeIntervalSince1970: 1_700_001_000),
+            completedAt: Date(timeIntervalSince1970: 1_700_001_100),
+            filesUploaded: 0,
+            bytesUploaded: 0,
+            status: .failed,
+            sourceRoot: "/tmp/source",
+            bucket: "bucket",
+            error: "network down"
+        )
+        appState.history = [failedHistoryEntry]
+        XCTAssertEqual(appState.statusText, "Idle")
+        XCTAssertEqual(appState.statusBadgeText, "ATTENTION")
+        XCTAssertEqual(appState.idleStatusText, "Last backup failed")
+        XCTAssertNil(appState.lastBackupDate)
 
         let expectedImages: [(BackupJob.Status, String)] = [
             (.idle, "archivebox"),

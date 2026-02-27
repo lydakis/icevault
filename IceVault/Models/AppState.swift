@@ -247,11 +247,45 @@ final class AppState: ObservableObject {
             return "Not Configured"
         }
 
-        if let last = history.first {
-            return "Last: \(last.status.displayName)"
+        return "Idle"
+    }
+
+    var latestBackupStatus: BackupJob.Status? {
+        history.first?.status
+    }
+
+    var idleStatusText: String {
+        guard isConfigured else {
+            return "Not configured"
         }
 
-        return "Idle"
+        switch latestBackupStatus {
+        case .some(.completed):
+            return "All backed up ✓"
+        case .some(.failed):
+            return "Last backup failed"
+        case .some(.idle), .some(.scanning), .some(.uploading), .none:
+            return "Ready to back up"
+        }
+    }
+
+    var statusBadgeText: String {
+        if let currentJob {
+            return currentJob.status.displayName.uppercased()
+        }
+
+        guard isConfigured else {
+            return "SETUP"
+        }
+
+        switch latestBackupStatus {
+        case .some(.completed):
+            return "HEALTHY"
+        case .some(.failed):
+            return "ATTENTION"
+        case .some(.idle), .some(.scanning), .some(.uploading), .none:
+            return "READY"
+        }
     }
 
     var menuBarSystemImage: String {
@@ -270,7 +304,7 @@ final class AppState: ObservableObject {
     }
 
     var lastBackupDate: Date? {
-        history.first?.displayDate
+        history.first(where: { $0.status == .completed })?.displayDate
     }
 
     var isConfigured: Bool {
