@@ -57,6 +57,47 @@ final class BackupJobTests: XCTestCase {
         XCTAssertEqual(job.bytesUploaded, 10)
     }
 
+    func testMarkDiscoveredIsMonotonicAndClampsNegativeValues() {
+        let job = BackupJob(sourceRoot: "/tmp/source", bucket: "bucket")
+
+        job.markDiscovered(fileCount: 4, byteCount: 40)
+        XCTAssertEqual(job.discoveredFiles, 4)
+        XCTAssertEqual(job.discoveredBytes, 40)
+
+        job.markDiscovered(fileCount: 2, byteCount: 20)
+        XCTAssertEqual(job.discoveredFiles, 4)
+        XCTAssertEqual(job.discoveredBytes, 40)
+
+        job.markDiscovered(fileCount: -10, byteCount: -99)
+        XCTAssertEqual(job.discoveredFiles, 4)
+        XCTAssertEqual(job.discoveredBytes, 40)
+    }
+
+    func testSetUploadRateClampsNegativeValues() {
+        let job = BackupJob(sourceRoot: "/tmp/source", bucket: "bucket")
+
+        job.setUploadRate(bytesPerSecond: 1_024)
+        XCTAssertEqual(job.uploadBytesPerSecond, 1_024)
+
+        job.setUploadRate(bytesPerSecond: -10)
+        XCTAssertEqual(job.uploadBytesPerSecond, 0)
+    }
+
+    func testShouldShowDiscoveryRateWhileScanIsInProgress() {
+        let job = BackupJob(sourceRoot: "/tmp/source", bucket: "bucket")
+
+        XCTAssertFalse(job.shouldShowDiscoveryRate)
+
+        job.setScanTotals(fileCount: 1, byteCount: 1)
+        XCTAssertTrue(job.shouldShowDiscoveryRate)
+
+        job.status = .uploading
+        XCTAssertTrue(job.shouldShowDiscoveryRate)
+
+        job.markCompleted()
+        XCTAssertFalse(job.shouldShowDiscoveryRate)
+    }
+
     func testMarkFailedSetsErrorAndCompletionDate() {
         let job = BackupJob(sourceRoot: "/tmp/source", bucket: "bucket")
 

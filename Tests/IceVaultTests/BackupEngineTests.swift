@@ -184,6 +184,54 @@ final class BackupEngineTests: XCTestCase {
         XCTAssertNotNil(stored.first?.uploadedAt)
     }
 
+    func testRunClearsUploadRateAfterAllTransfersFinish() async throws {
+        let sourceRoot = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let fileURL = sourceRoot.appendingPathComponent("nested/file.txt")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let payload = Data("hello-world".utf8)
+        try payload.write(to: fileURL)
+
+        let database = try makeDatabaseService()
+        let s3Client = ConcurrencyTrackingBackupEngineS3Client(putObjectDelayNanoseconds: 120_000_000)
+        let backupEngine = BackupEngine(
+            scanner: FileScanner(),
+            fileManager: .default,
+            database: database,
+            glacierClientFactory: { _, _, _, _, db in
+                GlacierClient(s3Client: s3Client, database: db)
+            }
+        )
+
+        let settings = AppState.Settings(
+            awsAccessKey: "access",
+            awsSecretKey: "secret",
+            awsRegion: "us-east-1",
+            bucket: "bucket",
+            sourcePath: sourceRoot.path,
+            maxConcurrentFileUploads: 1,
+            maxConcurrentMultipartPartUploads: 1
+        )
+        let job = await MainActor.run {
+            BackupJob(sourceRoot: sourceRoot.path, bucket: "bucket")
+        }
+
+        try await backupEngine.run(job: job, settings: settings)
+
+        await MainActor.run {
+            XCTAssertEqual(job.status, .completed)
+            XCTAssertEqual(job.filesTotal, 1)
+            XCTAssertEqual(job.filesUploaded, 1)
+            XCTAssertEqual(job.bytesTotal, Int64(payload.count))
+            XCTAssertEqual(job.bytesUploaded, Int64(payload.count))
+            XCTAssertEqual(job.uploadBytesPerSecond, 0)
+        }
+
+        let stats = await s3Client.stats()
+        XCTAssertEqual(stats.putObjectCallCount, 1)
+    }
+
     func testRunSkipsReuploadWhenRemoteObjectAlreadyMatches() async throws {
         let sourceRoot = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: sourceRoot) }
@@ -229,6 +277,7 @@ final class BackupEngineTests: XCTestCase {
             XCTAssertEqual(job.filesUploaded, 1)
             XCTAssertEqual(job.bytesTotal, Int64(payload.count))
             XCTAssertEqual(job.bytesUploaded, Int64(payload.count))
+            XCTAssertEqual(job.uploadBytesPerSecond, 0)
         }
 
         XCTAssertEqual(mockS3.putObjectInputs.count, 0)

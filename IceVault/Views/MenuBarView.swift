@@ -38,6 +38,22 @@ struct MenuBarView: View {
                 Text("\(formattedBytes(job.bytesUploaded)) / \(formattedBytes(job.bytesTotal))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                Text("Discovered: \(formattedCount(job.discoveredFiles)) files (\(formattedBytes(job.discoveredBytes)))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if job.shouldShowDiscoveryRate {
+                    Text("Discovering at \(formattedRate(job.discoveryFilesPerSecond)) files/s (\(formattedBytes(Int64(job.discoveryBytesPerSecond)))/s)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
+                if job.uploadBytesPerSecond > 0 {
+                    Text("Uploading at \(formattedBytes(Int64(job.uploadBytesPerSecond)))/s")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             } else {
                 if let lastBackupDate = appState.lastBackupDate {
                     Text("Last backup: \(lastBackupDate.formatted(date: .abbreviated, time: .shortened))")
@@ -148,5 +164,9 @@ struct MenuBarView: View {
 
     private func formattedBytes(_ value: Int64) -> String {
         Self.byteFormatter.string(fromByteCount: max(value, 0))
+    }
+
+    private func formattedRate(_ value: Double) -> String {
+        value.formatted(.number.precision(.fractionLength(1)))
     }
 }

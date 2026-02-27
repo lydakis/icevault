@@ -34,6 +34,7 @@ final class BackupEngine: @unchecked Sendable {
     private static let staleMultipartUploadThreshold: TimeInterval = 24 * 60 * 60
     private static let remoteValidationConcurrency = 4
     private static let scanSyncBatchSize = 128
+    private static let discoveryProgressUpdateBatchSize = 128
     private static let remoteAuditBatchSize = 256
     private static let pendingPlanBufferOverrideEnvironmentKey = "ICEVAULT_MAX_BUFFERED_PENDING_PLANS"
 
@@ -249,6 +250,71 @@ final class BackupEngine: @unchecked Sendable {
         }
     }
 
+    private actor UploadThroughputTracker {
+        private var uploadedBytesByRecordID: [Int64: Int64] = [:]
+        private var activeUploadRecordIDs: Set<Int64> = []
+        private var totalTransferredBytes: Int64 = 0
+        private var lastTimestamp: Date?
+        private var lastTransferredBytes: Int64 = 0
+        private var smoothedBytesPerSecond: Double = 0
+
+        func observe(
+            recordID: Int64,
+            uploadedBytesForRecord: Int64,
+            at timestamp: Date = Date()
+        ) -> Double {
+            let normalizedUploadedBytes = max(uploadedBytesForRecord, 0)
+            let previousUploadedBytes = uploadedBytesByRecordID[recordID]
+            activeUploadRecordIDs.insert(recordID)
+
+            if let previousUploadedBytes {
+                let transferredDelta = max(0, normalizedUploadedBytes - previousUploadedBytes)
+                totalTransferredBytes += transferredDelta
+                uploadedBytesByRecordID[recordID] = max(previousUploadedBytes, normalizedUploadedBytes)
+            } else {
+                // The first progress callback can include resumed bytes from a prior run.
+                uploadedBytesByRecordID[recordID] = normalizedUploadedBytes
+            }
+
+            guard let lastTimestamp else {
+                self.lastTimestamp = timestamp
+                lastTransferredBytes = totalTransferredBytes
+                return 0
+            }
+
+            let elapsed = timestamp.timeIntervalSince(lastTimestamp)
+            guard elapsed > 0 else {
+                return smoothedBytesPerSecond
+            }
+
+            let transferredDelta = max(0, totalTransferredBytes - lastTransferredBytes)
+            let instantaneousBytesPerSecond = Double(transferredDelta) / elapsed
+            if smoothedBytesPerSecond <= 0 {
+                smoothedBytesPerSecond = instantaneousBytesPerSecond
+            } else {
+                smoothedBytesPerSecond = (smoothedBytesPerSecond * 0.8) + (instantaneousBytesPerSecond * 0.2)
+            }
+
+            self.lastTimestamp = timestamp
+            lastTransferredBytes = totalTransferredBytes
+            return smoothedBytesPerSecond
+        }
+
+        func markCompleted(recordID: Int64) -> Double {
+            activeUploadRecordIDs.remove(recordID)
+            uploadedBytesByRecordID.removeValue(forKey: recordID)
+
+            guard activeUploadRecordIDs.isEmpty else {
+                return smoothedBytesPerSecond
+            }
+
+            smoothedBytesPerSecond = 0
+            lastTimestamp = nil
+            lastTransferredBytes = totalTransferredBytes
+            return smoothedBytesPerSecond
+        }
+    }
+
     private let scanner: FileScanner
     private let fileManager: FileManager
     private let databaseState: DatabaseState
@@ -307,11 +373,16 @@ final class BackupEngine: @unchecked Sendable {
                 job.filesUploaded = 0
                 job.bytesTotal = 0
                 job.bytesUploaded = 0
+                job.discoveredFiles = 0
+                job.discoveredBytes = 0
+                job.uploadBytesPerSecond = 0
+                job.isScanInProgress = true
             }
 
             try Task.checkCancellation()
             let sourceRootURL = URL(fileURLWithPath: sourceRoot, isDirectory: true)
             let progressTracker = UploadProgressTracker()
+            let uploadThroughputTracker = UploadThroughputTracker()
             let remoteAuditUploadedBefore = Date()
 
             let scanToken = try database.beginScan(for: sourceRoot)
@@ -332,6 +403,7 @@ final class BackupEngine: @unchecked Sendable {
                         glacierClient: glacierClient,
                         job: job,
                         progressTracker: progressTracker,
+                        throughputTracker: uploadThroughputTracker,
                         backpressureGate: pendingPlanBackpressureGate
                     )
                 } catch {
@@ -346,11 +418,23 @@ final class BackupEngine: @unchecked Sendable {
                         var scannedBatch: [FileRecord] = []
                         scannedBatch.reserveCapacity(Self.scanSyncBatchSize)
                         var didFlushInitialBatch = false
+                        var discoveredFileCount = 0
+                        var discoveredByteCount: Int64 = 0
                         let initialFlushBatchSize = max(1, min(Self.scanSyncBatchSize, settings.maxConcurrentFileUploads))
 
                         try await scanner.scan(sourceRoot: sourceRoot) { record in
                             try Task.checkCancellation()
                             try uploadLoopFailureSignal.throwIfFailed()
+                            discoveredFileCount += 1
+                            discoveredByteCount += max(record.fileSize, 0)
+                            if discoveredFileCount % Self.discoveryProgressUpdateBatchSize == 0 {
+                                await MainActor.run {
+                                    job.markDiscovered(
+                                        fileCount: discoveredFileCount,
+                                        byteCount: discoveredByteCount
+                                    )
+                                }
+                            }
                             scannedBatch.append(record)
 
                             let shouldFlushBatch =
@@ -373,6 +457,10 @@ final class BackupEngine: @unchecked Sendable {
                                     uploadLoopFailureSignal: uploadLoopFailureSignal
                                 )
                             }
+                        }
+                        await MainActor.run {
+                            job.markDiscovered(fileCount: discoveredFileCount, byteCount: discoveredByteCount)
+                            job.markScanCompleted()
                         }
                         try Task.checkCancellation()
                         try uploadLoopFailureSignal.throwIfFailed()
@@ -479,6 +567,7 @@ final class BackupEngine: @unchecked Sendable {
         glacierClient: GlacierClient,
         job: BackupJob,
         progressTracker: UploadProgressTracker,
+        throughputTracker: UploadThroughputTracker,
         backpressureGate: PendingPlanBackpressureGate
     ) async throws {
         for try await plans in pendingPlanStream {
@@ -491,7 +580,8 @@ final class BackupEngine: @unchecked Sendable {
                     database: database,
                     glacierClient: glacierClient,
                     job: job,
-                    progressTracker: progressTracker
+                    progressTracker: progressTracker,
+                    throughputTracker: throughputTracker
                 )
                 await backpressureGate.release(slots: plans.count)
             } catch {
@@ -622,7 +712,8 @@ final class BackupEngine: @unchecked Sendable {
         database: DatabaseService,
         glacierClient: GlacierClient,
         job: BackupJob,
-        progressTracker: UploadProgressTracker
+        progressTracker: UploadProgressTracker,
+        throughputTracker: UploadThroughputTracker
     ) async throws {
         guard !plans.isEmpty else {
             return
@@ -662,8 +753,13 @@ final class BackupEngine: @unchecked Sendable {
                             recordID: plan.recordID,
                             uploadedBytes: uploadedBytesForCurrentFile
                         )
+                        let uploadBytesPerSecond = await throughputTracker.observe(
+                            recordID: plan.recordID,
+                            uploadedBytesForRecord: uploadedBytesForCurrentFile
+                        )
                         await MainActor.run {
                             Self.applyProgressSnapshot(snapshot, to: job)
+                            job.setUploadRate(bytesPerSecond: uploadBytesPerSecond)
                         }
                     }
                     return plan
@@ -674,8 +770,10 @@ final class BackupEngine: @unchecked Sendable {
                 try database.markUploaded(id: completedPlan.recordID, glacierKey: completedPlan.objectKey)
 
                 let snapshot = await progressTracker.markCompleted(recordID: completedPlan.recordID)
+                let uploadBytesPerSecond = await throughputTracker.markCompleted(recordID: completedPlan.recordID)
                 await MainActor.run {
                     Self.applyProgressSnapshot(snapshot, to: job)
+                    job.setUploadRate(bytesPerSecond: uploadBytesPerSecond)
                 }
             }
         )

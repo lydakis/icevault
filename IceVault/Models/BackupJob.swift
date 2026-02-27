@@ -24,6 +24,10 @@ final class BackupJob: ObservableObject, Identifiable {
     @Published var filesUploaded: Int
     @Published var bytesTotal: Int64
     @Published var bytesUploaded: Int64
+    @Published var discoveredFiles: Int
+    @Published var discoveredBytes: Int64
+    @Published var uploadBytesPerSecond: Double
+    @Published var isScanInProgress: Bool
     @Published var completedAt: Date?
     @Published var error: String?
 
@@ -36,6 +40,9 @@ final class BackupJob: ObservableObject, Identifiable {
         filesUploaded: Int = 0,
         bytesTotal: Int64 = 0,
         bytesUploaded: Int64 = 0,
+        discoveredFiles: Int = 0,
+        discoveredBytes: Int64 = 0,
+        uploadBytesPerSecond: Double = 0,
         startedAt: Date = Date(),
         completedAt: Date? = nil,
         error: String? = nil
@@ -48,6 +55,10 @@ final class BackupJob: ObservableObject, Identifiable {
         self.filesUploaded = filesUploaded
         self.bytesTotal = bytesTotal
         self.bytesUploaded = bytesUploaded
+        self.discoveredFiles = discoveredFiles
+        self.discoveredBytes = discoveredBytes
+        self.uploadBytesPerSecond = max(uploadBytesPerSecond, 0)
+        self.isScanInProgress = status == .scanning
         self.startedAt = startedAt
         self.completedAt = completedAt
         self.error = error
@@ -73,12 +84,38 @@ final class BackupJob: ObservableObject, Identifiable {
         return min(1, Double(bytesUploaded) / Double(bytesTotal))
     }
 
+    var discoveryFilesPerSecond: Double {
+        Double(discoveredFiles) / runtimeDuration
+    }
+
+    var discoveryBytesPerSecond: Double {
+        Double(discoveredBytes) / runtimeDuration
+    }
+
+    var shouldShowDiscoveryRate: Bool {
+        isScanInProgress
+    }
+
     func setScanTotals(fileCount: Int, byteCount: Int64) {
         status = .scanning
+        isScanInProgress = true
         filesTotal = max(fileCount, 0)
         bytesTotal = max(byteCount, 0)
         filesUploaded = 0
         bytesUploaded = 0
+    }
+
+    func markScanCompleted() {
+        isScanInProgress = false
+    }
+
+    func markDiscovered(fileCount: Int, byteCount: Int64) {
+        discoveredFiles = max(discoveredFiles, max(fileCount, 0))
+        discoveredBytes = max(discoveredBytes, max(byteCount, 0))
+    }
+
+    func setUploadRate(bytesPerSecond: Double) {
+        uploadBytesPerSecond = max(bytesPerSecond, 0)
     }
 
     func markUploaded(fileCount: Int = 1, byteCount: Int64) {
@@ -89,11 +126,13 @@ final class BackupJob: ObservableObject, Identifiable {
 
     func markCompleted() {
         status = .completed
+        isScanInProgress = false
         completedAt = Date()
     }
 
     func markFailed(_ message: String) {
         status = .failed
+        isScanInProgress = false
         error = message
         completedAt = Date()
     }
@@ -110,6 +149,10 @@ final class BackupJob: ObservableObject, Identifiable {
             bucket: bucket,
             error: error
         )
+    }
+
+    private var runtimeDuration: TimeInterval {
+        max((completedAt ?? Date()).timeIntervalSince(startedAt), 0.001)
     }
 }
 
