@@ -192,50 +192,58 @@ final class BackupEngine: @unchecked Sendable {
     }
 
     private actor UploadProgressTracker {
-        private var trackedRecordIDs: Set<Int64> = []
-        private var fileSizesByRecordID: [Int64: Int64] = [:]
+        private struct InFlightProgress: Sendable {
+            let fileSize: Int64
+            var uploadedBytes: Int64
+        }
+
         private var totalFiles: Int = 0
         private var totalBytes: Int64 = 0
-        private var completedRecordIDs: Set<Int64> = []
-        private var inFlightBytesByRecordID: [Int64: Int64] = [:]
-        private var inFlightBytesTotal: Int64 = 0
+        private var completedFiles: Int = 0
         private var completedBytes: Int64 = 0
+        // Keep only active uploads in memory so long-running backups stay bounded.
+        private var inFlightByRecordID: [Int64: InFlightProgress] = [:]
+        private var inFlightBytesTotal: Int64 = 0
 
         func register(plans: [PendingUploadPlan]) -> UploadProgressSnapshot {
-            for plan in plans where !trackedRecordIDs.contains(plan.recordID) {
-                trackedRecordIDs.insert(plan.recordID)
-                fileSizesByRecordID[plan.recordID] = plan.fileSize
+            for plan in plans {
+                let normalizedFileSize = max(plan.fileSize, 0)
                 totalFiles += 1
-                totalBytes += max(plan.fileSize, 0)
+                totalBytes += normalizedFileSize
+
+                if let existingProgress = inFlightByRecordID[plan.recordID] {
+                    inFlightBytesTotal -= existingProgress.uploadedBytes
+                }
+
+                inFlightByRecordID[plan.recordID] = InFlightProgress(
+                    fileSize: normalizedFileSize,
+                    uploadedBytes: 0
+                )
             }
             return snapshot()
         }
 
         func update(recordID: Int64, uploadedBytes: Int64) -> UploadProgressSnapshot {
-            guard
-                !completedRecordIDs.contains(recordID),
-                let fileSize = fileSizesByRecordID[recordID]
-            else {
+            guard var inFlightProgress = inFlightByRecordID[recordID] else {
                 return snapshot()
             }
 
-            let boundedProgress = min(max(uploadedBytes, 0), max(fileSize, 0))
-            let previousProgress = inFlightBytesByRecordID[recordID] ?? 0
-            let nextProgress = max(previousProgress, boundedProgress)
-            inFlightBytesByRecordID[recordID] = nextProgress
-            inFlightBytesTotal += nextProgress - previousProgress
+            let boundedProgress = min(max(uploadedBytes, 0), inFlightProgress.fileSize)
+            let nextProgress = max(inFlightProgress.uploadedBytes, boundedProgress)
+            inFlightBytesTotal += nextProgress - inFlightProgress.uploadedBytes
+            inFlightProgress.uploadedBytes = nextProgress
+            inFlightByRecordID[recordID] = inFlightProgress
             return snapshot()
         }
 
         func markCompleted(recordID: Int64) -> UploadProgressSnapshot {
-            guard !completedRecordIDs.contains(recordID) else {
+            guard let inFlightProgress = inFlightByRecordID.removeValue(forKey: recordID) else {
                 return snapshot()
             }
 
-            completedRecordIDs.insert(recordID)
-            let previousInFlightProgress = inFlightBytesByRecordID.removeValue(forKey: recordID) ?? 0
-            inFlightBytesTotal -= previousInFlightProgress
-            completedBytes += max(fileSizesByRecordID[recordID] ?? 0, 0)
+            inFlightBytesTotal -= inFlightProgress.uploadedBytes
+            completedFiles += 1
+            completedBytes += inFlightProgress.fileSize
             return snapshot()
         }
 
@@ -244,7 +252,7 @@ final class BackupEngine: @unchecked Sendable {
             return UploadProgressSnapshot(
                 filesTotal: totalFiles,
                 bytesTotal: totalBytes,
-                filesUploaded: completedRecordIDs.count,
+                filesUploaded: min(totalFiles, completedFiles),
                 bytesUploaded: uploadedBytes
             )
         }
