@@ -1502,16 +1502,17 @@ final class BackupEngineTests: XCTestCase {
         }
     }
 
-    func testRunFailsPromptlyWhenUploadLoopFailsUnderBackpressure() async throws {
+    func testRunDefersRecoverableUploadFailuresWithoutStoppingScan() async throws {
         let sourceRoot = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: sourceRoot) }
 
+        let failingRelativePath = "000-failing.txt"
         let totalFileCount = 400
         var records: [FileRecord] = []
         records.reserveCapacity(totalFileCount)
 
         for index in 0..<totalFileCount {
-            let relativePath = index == 0 ? "one.txt" : String(format: "file-%03d.txt", index)
+            let relativePath = index == 0 ? failingRelativePath : String(format: "zzz-%03d.txt", index)
             let payload = Data("payload-\(index)".utf8)
             try payload.write(to: sourceRoot.appendingPathComponent(relativePath))
             records.append(
@@ -1532,7 +1533,7 @@ final class BackupEngineTests: XCTestCase {
         let database = try makeDatabaseService()
         let mockS3 = DeterministicFailureBackupEngineS3Client(
             blockedKey: "never-blocked.txt",
-            failingKey: "one.txt"
+            failingKey: failingRelativePath
         )
         let backupEngine = BackupEngine(
             scanner: scanner,
@@ -1564,26 +1565,390 @@ final class BackupEngineTests: XCTestCase {
 
         let runOutcome = await waitForRunTaskOutcome(
             runTask,
-            timeoutNanoseconds: 2_000_000_000
+            timeoutNanoseconds: 10_000_000_000
         )
         switch runOutcome {
         case .failed(let error):
-            XCTAssertFalse(
-                error is CancellationError,
-                "Upload failures should preserve the underlying error instead of becoming cancellation."
-            )
+            guard case .uploadsDeferred(let pendingCount, let firstErrorDescription) = (error as? BackupEngineError) else {
+                return XCTFail("Expected uploadsDeferred error, got \(error)")
+            }
+            XCTAssertEqual(pendingCount, 1)
+            XCTAssertNotNil(firstErrorDescription)
         case .succeeded:
-            XCTFail("Expected backup to fail after upload error.")
+            XCTFail("Expected backup to fail with deferred uploads after recoverable upload failure.")
         case .timedOut:
             runTask.cancel()
             _ = try? await runTask.value
-            XCTFail("Timed out waiting for backup failure after upload loop error.")
+            XCTFail("Timed out waiting for backup result after recoverable upload failure.")
         }
 
         XCTAssertTrue(
             scanner.waitUntilScanCompletes(timeout: .now() + 2),
-            "Scan should stop quickly after upload loop failure."
+            "Scan should complete after recoverable upload failures."
         )
+        XCTAssertEqual(scanner.processedRecordCount(), totalFileCount)
+        let pendingFiles = try database.pendingFiles(for: sourceRoot.path)
+        XCTAssertEqual(pendingFiles.map(\.relativePath), [failingRelativePath])
+
+        await MainActor.run {
+            XCTAssertEqual(job.status, .failed)
+        }
+    }
+
+    func testRunFailsFastForForbiddenS3OperationFailure() async throws {
+        let sourceRoot = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let failingRelativePath = "000-forbidden.txt"
+        let totalFileCount = 400
+        var records: [FileRecord] = []
+        records.reserveCapacity(totalFileCount)
+
+        for index in 0..<totalFileCount {
+            let relativePath = index == 0 ? failingRelativePath : String(format: "zzz-%03d.txt", index)
+            let payload = Data("payload-\(index)".utf8)
+            try payload.write(to: sourceRoot.appendingPathComponent(relativePath))
+            records.append(
+                FileRecord(
+                    sourcePath: sourceRoot.path,
+                    relativePath: relativePath,
+                    fileSize: Int64(payload.count),
+                    modifiedAt: Date(timeIntervalSince1970: 1_700_010_000 + TimeInterval(index)),
+                    sha256: sha256Hex(of: payload),
+                    glacierKey: "",
+                    uploadedAt: nil,
+                    storageClass: FileRecord.deepArchiveStorageClass
+                )
+            )
+        }
+
+        let scanner = CompletionSignalingStreamingScanner(records: records)
+        let database = try makeDatabaseService()
+        let s3Client = ForbiddenFailureBackupEngineS3Client(failingKey: failingRelativePath)
+        let backupEngine = BackupEngine(
+            scanner: scanner,
+            fileManager: .default,
+            database: database,
+            glacierClientFactory: { _, _, _, _, db in
+                GlacierClient(s3Client: s3Client, database: db)
+            }
+        )
+
+        let settings = AppState.Settings(
+            awsAccessKey: "access",
+            awsSecretKey: "secret",
+            awsRegion: "us-east-1",
+            bucket: "bucket",
+            sourcePath: sourceRoot.path,
+            maxConcurrentFileUploads: 1,
+            maxConcurrentMultipartPartUploads: 1
+        )
+        let job = await MainActor.run {
+            BackupJob(sourceRoot: sourceRoot.path, bucket: "bucket")
+        }
+
+        let runTask = Task {
+            try await backupEngine.run(job: job, settings: settings)
+        }
+
+        await s3Client.waitUntilFailureTriggered()
+        let runOutcome = await waitForRunTaskOutcome(
+            runTask,
+            timeoutNanoseconds: 10_000_000_000
+        )
+
+        switch runOutcome {
+        case .failed(let error):
+            guard case .s3OperationFailed(_, let underlying) = (error as? GlacierClientError) else {
+                return XCTFail("Expected s3OperationFailed error, got \(error)")
+            }
+            let statusCode = (underlying as? MockHTTPStatusCodeError)?.httpResponse.statusCode.rawValue
+            XCTAssertEqual(statusCode, 403)
+        case .succeeded:
+            XCTFail("Expected backup to fail fast for forbidden S3 upload failure.")
+        case .timedOut:
+            runTask.cancel()
+            _ = try? await runTask.value
+            XCTFail("Timed out waiting for forbidden S3 upload failure.")
+        }
+
+        XCTAssertLessThan(
+            scanner.processedRecordCount(),
+            totalFileCount,
+            "Scan should stop promptly on non-recoverable upload failures."
+        )
+
+        await MainActor.run {
+            XCTAssertEqual(job.status, .failed)
+        }
+    }
+
+    func testRunRetriesDeferredUploadAfterTransientRecoverableFailure() async throws {
+        let sourceRoot = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let relativePath = "one.txt"
+        let payload = Data("payload".utf8)
+        try payload.write(to: sourceRoot.appendingPathComponent(relativePath))
+
+        let database = try makeDatabaseService()
+        let mockS3 = FailOnceBackupEngineS3Client(transientFailureKey: relativePath)
+        let backupEngine = BackupEngine(
+            scanner: FileScanner(),
+            fileManager: .default,
+            database: database,
+            glacierClientFactory: { _, _, _, _, db in
+                GlacierClient(s3Client: mockS3, database: db)
+            }
+        )
+
+        let settings = AppState.Settings(
+            awsAccessKey: "access",
+            awsSecretKey: "secret",
+            awsRegion: "us-east-1",
+            bucket: "bucket",
+            sourcePath: sourceRoot.path,
+            maxConcurrentFileUploads: 1,
+            maxConcurrentMultipartPartUploads: 1
+        )
+        let job = await MainActor.run {
+            BackupJob(sourceRoot: sourceRoot.path, bucket: "bucket")
+        }
+
+        try await backupEngine.run(job: job, settings: settings)
+
+        let putObjectCallCount = await mockS3.putObjectCallCount()
+        XCTAssertEqual(putObjectCallCount, 2)
+        XCTAssertEqual(try database.pendingFiles(for: sourceRoot.path).count, 0)
+
+        await MainActor.run {
+            XCTAssertEqual(job.status, .completed)
+            XCTAssertEqual(job.filesTotal, 1)
+            XCTAssertEqual(job.filesUploaded, 1)
+            XCTAssertEqual(job.bytesTotal, Int64(payload.count))
+            XCTAssertEqual(job.bytesUploaded, Int64(payload.count))
+        }
+    }
+
+    func testRunDeferredRetryDoesNotSkipLexicographicallyEarlierSibling() async throws {
+        let sourceRoot = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let failingRelativePath = "file-2.txt"
+        let siblingRelativePath = "file-10.txt"
+        try Data("failing".utf8).write(to: sourceRoot.appendingPathComponent(failingRelativePath))
+        try Data("sibling".utf8).write(to: sourceRoot.appendingPathComponent(siblingRelativePath))
+
+        let database = try makeDatabaseService()
+        let s3Client = DeterministicFailureBackupEngineS3Client(
+            blockedKey: "never-blocked.txt",
+            failingKey: failingRelativePath
+        )
+        let backupEngine = BackupEngine(
+            scanner: FileScanner(),
+            fileManager: .default,
+            database: database,
+            glacierClientFactory: { _, _, _, _, db in
+                GlacierClient(s3Client: s3Client, database: db)
+            }
+        )
+
+        let settings = AppState.Settings(
+            awsAccessKey: "access",
+            awsSecretKey: "secret",
+            awsRegion: "us-east-1",
+            bucket: "bucket",
+            sourcePath: sourceRoot.path,
+            maxConcurrentFileUploads: 1,
+            maxConcurrentMultipartPartUploads: 1
+        )
+        let job = await MainActor.run {
+            BackupJob(sourceRoot: sourceRoot.path, bucket: "bucket")
+        }
+
+        let runTask = Task {
+            try await backupEngine.run(job: job, settings: settings)
+        }
+        let runOutcome = await waitForRunTaskOutcome(
+            runTask,
+            timeoutNanoseconds: 10_000_000_000
+        )
+
+        switch runOutcome {
+        case .failed(let error):
+            guard case .uploadsDeferred(let pendingCount, _) = (error as? BackupEngineError) else {
+                return XCTFail("Expected uploadsDeferred error, got \(error)")
+            }
+            XCTAssertEqual(pendingCount, 1)
+        case .succeeded:
+            XCTFail("Expected backup to fail with one persistent deferred upload.")
+        case .timedOut:
+            runTask.cancel()
+            _ = try? await runTask.value
+            XCTFail("Backup run timed out while retrying deferred uploads.")
+        }
+
+        XCTAssertEqual(
+            try database.pendingFiles(for: sourceRoot.path).map(\.relativePath),
+            [failingRelativePath]
+        )
+    }
+
+    func testRunDeferredRetryDoesNotSkipCanceledFirstPendingFile() async throws {
+        let sourceRoot = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let delayedRelativePath = "a-delayed.txt"
+        let failingRelativePath = "b-failing.txt"
+        try Data("delayed".utf8).write(to: sourceRoot.appendingPathComponent(delayedRelativePath))
+        try Data("failing".utf8).write(to: sourceRoot.appendingPathComponent(failingRelativePath))
+
+        let database = try makeDatabaseService()
+        let s3Client = DelayedSuccessAndDeterministicFailureBackupEngineS3Client(
+            delayedKey: delayedRelativePath,
+            failingKey: failingRelativePath
+        )
+        let backupEngine = BackupEngine(
+            scanner: FileScanner(),
+            fileManager: .default,
+            database: database,
+            glacierClientFactory: { _, _, _, _, db in
+                GlacierClient(s3Client: s3Client, database: db)
+            }
+        )
+
+        let settings = AppState.Settings(
+            awsAccessKey: "access",
+            awsSecretKey: "secret",
+            awsRegion: "us-east-1",
+            bucket: "bucket",
+            sourcePath: sourceRoot.path,
+            maxConcurrentFileUploads: 2,
+            maxConcurrentMultipartPartUploads: 1
+        )
+        let job = await MainActor.run {
+            BackupJob(sourceRoot: sourceRoot.path, bucket: "bucket")
+        }
+
+        let runTask = Task {
+            try await backupEngine.run(job: job, settings: settings)
+        }
+        let runOutcome = await waitForRunTaskOutcome(
+            runTask,
+            timeoutNanoseconds: 10_000_000_000
+        )
+
+        switch runOutcome {
+        case .failed(let error):
+            guard case .uploadsDeferred(let pendingCount, _) = (error as? BackupEngineError) else {
+                return XCTFail("Expected uploadsDeferred error, got \(error)")
+            }
+            XCTAssertEqual(pendingCount, 1)
+        case .succeeded:
+            XCTFail("Expected backup to fail with one persistent deferred upload.")
+        case .timedOut:
+            runTask.cancel()
+            _ = try? await runTask.value
+            XCTFail("Backup run timed out while retrying deferred uploads after cancellation.")
+        }
+
+        XCTAssertEqual(
+            try database.pendingFiles(for: sourceRoot.path).map(\.relativePath),
+            [failingRelativePath]
+        )
+    }
+
+    func testRunPrefersNonDeferableErrorWhenBatchContainsMixedFailures() async throws {
+        let sourceRoot = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let recoverableRelativePath = "recoverable.txt"
+        let multipartFailureRelativePath = "multipart-failure.bin"
+        let recoverablePayload = Data("recoverable".utf8)
+        try recoverablePayload.write(to: sourceRoot.appendingPathComponent(recoverableRelativePath))
+        try createSparseFile(
+            at: sourceRoot.appendingPathComponent(multipartFailureRelativePath),
+            size: GlacierClient.multipartThresholdBytes + 1
+        )
+
+        let fixedDate = Date(timeIntervalSince1970: 1_700_009_000)
+        let database = try makeDatabaseService()
+        var recoverableRecord = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: recoverableRelativePath,
+            fileSize: Int64(recoverablePayload.count),
+            modifiedAt: fixedDate,
+            sha256: "recoverable-sha",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&recoverableRecord)
+
+        var multipartFailureRecord = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: multipartFailureRelativePath,
+            fileSize: GlacierClient.multipartThresholdBytes + 1,
+            modifiedAt: fixedDate.addingTimeInterval(1),
+            sha256: "multipart-sha",
+            glacierKey: multipartFailureRelativePath,
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&multipartFailureRecord)
+
+        let scanner = CompletionSignalingStreamingScanner(records: [
+            recoverableRecord,
+            multipartFailureRecord
+        ])
+        let s3Client = RecoverableAndMultipartFailureBackupEngineS3Client(
+            recoverableFailureKey: recoverableRelativePath,
+            multipartFailureKey: multipartFailureRelativePath
+        )
+        let backupEngine = BackupEngine(
+            scanner: scanner,
+            fileManager: .default,
+            database: database,
+            glacierClientFactory: { _, _, _, _, db in
+                GlacierClient(s3Client: s3Client, database: db)
+            }
+        )
+
+        let settings = AppState.Settings(
+            awsAccessKey: "access",
+            awsSecretKey: "secret",
+            awsRegion: "us-east-1",
+            bucket: "bucket",
+            sourcePath: sourceRoot.path,
+            maxConcurrentFileUploads: 2,
+            maxConcurrentMultipartPartUploads: 1
+        )
+        let job = await MainActor.run {
+            BackupJob(sourceRoot: sourceRoot.path, bucket: "bucket")
+        }
+
+        let runTask = Task {
+            try await backupEngine.run(job: job, settings: settings)
+        }
+        await s3Client.waitUntilRecoverableFailureTriggered()
+        await s3Client.releaseMultipartFailure()
+        let runOutcome = await waitForRunTaskOutcome(
+            runTask,
+            timeoutNanoseconds: 10_000_000_000
+        )
+
+        switch runOutcome {
+        case .failed(let error):
+            guard case .missingMultipartETag = (error as? GlacierClientError) else {
+                return XCTFail("Expected missingMultipartETag error, got \(error)")
+            }
+        case .succeeded:
+            XCTFail("Expected backup to fail with non-deferable multipart error.")
+        case .timedOut:
+            runTask.cancel()
+            _ = try? await runTask.value
+            XCTFail("Timed out waiting for mixed-failure backup outcome.")
+        }
 
         await MainActor.run {
             XCTAssertEqual(job.status, .failed)
@@ -1831,6 +2196,93 @@ final class BackupEngineTests: XCTestCase {
         XCTAssertEqual(try database.pendingFiles(for: sourceRoot.path).count, 0)
     }
 
+    func testRunRetriesRemainingAuditBatchAfterDeferredFailure() async throws {
+        let sourceRoot = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let totalFileCount = 260
+        let uploadedAt = Date(timeIntervalSince1970: 1_700_007_000)
+        let failingRelativePath = "file-000.txt"
+        let database = try makeDatabaseService()
+
+        for index in 0..<totalFileCount {
+            let relativePath = String(format: "file-%03d.txt", index)
+            let payload = Data("payload-\(index)".utf8)
+            let fileURL = sourceRoot.appendingPathComponent(relativePath)
+            try payload.write(to: fileURL)
+
+            var uploadedRecord = FileRecord(
+                sourcePath: sourceRoot.path,
+                relativePath: relativePath,
+                fileSize: Int64(payload.count),
+                modifiedAt: Date(timeIntervalSince1970: 1_700_007_000 + TimeInterval(index)),
+                sha256: sha256Hex(of: payload),
+                glacierKey: relativePath,
+                uploadedAt: uploadedAt,
+                storageClass: FileRecord.deepArchiveStorageClass
+            )
+            try database.insertFile(&uploadedRecord)
+        }
+
+        let s3Client = DeterministicFailureBackupEngineS3Client(
+            blockedKey: "never-blocked.txt",
+            failingKey: failingRelativePath
+        )
+        let backupEngine = BackupEngine(
+            scanner: FileScanner(),
+            fileManager: .default,
+            database: database,
+            glacierClientFactory: { _, _, _, _, db in
+                GlacierClient(s3Client: s3Client, database: db)
+            }
+        )
+
+        let settings = AppState.Settings(
+            awsAccessKey: "access",
+            awsSecretKey: "secret",
+            awsRegion: "us-east-1",
+            bucket: "bucket",
+            sourcePath: sourceRoot.path,
+            maxConcurrentFileUploads: 1,
+            maxConcurrentMultipartPartUploads: 1,
+            maxBufferedPendingPlans: AppState.Settings.minimumBufferedPendingPlans
+        )
+        let job = await MainActor.run {
+            BackupJob(sourceRoot: sourceRoot.path, bucket: "bucket")
+        }
+
+        let runTask = Task {
+            try await backupEngine.run(job: job, settings: settings)
+        }
+        let runOutcome = await waitForRunTaskOutcome(
+            runTask,
+            timeoutNanoseconds: 10_000_000_000
+        )
+
+        switch runOutcome {
+        case .failed(let error):
+            guard case .uploadsDeferred(let pendingCount, _) = (error as? BackupEngineError) else {
+                return XCTFail("Expected uploadsDeferred error, got \(error)")
+            }
+            XCTAssertEqual(pendingCount, 1)
+        case .succeeded:
+            XCTFail("Expected backup to fail with one persistent deferred upload.")
+        case .timedOut:
+            runTask.cancel()
+            _ = try? await runTask.value
+            XCTFail("Backup run timed out while retrying deferred remote-audit uploads.")
+        }
+
+        XCTAssertEqual(
+            try database.pendingFiles(for: sourceRoot.path).map(\.relativePath),
+            [failingRelativePath]
+        )
+
+        await MainActor.run {
+            XCTAssertEqual(job.status, .failed)
+        }
+    }
+
     func testApplyMonotonicProgressIgnoresOutOfOrderSnapshots() async {
         let job = await MainActor.run {
             BackupJob(
@@ -1901,6 +2353,18 @@ final class BackupEngineTests: XCTestCase {
         }
 
         return try await operation()
+    }
+
+    private func createSparseFile(at fileURL: URL, size: Int64) throws {
+        guard size > 0 else {
+            return
+        }
+
+        _ = FileManager.default.createFile(atPath: fileURL.path, contents: nil)
+        let fileHandle = try FileHandle(forWritingTo: fileURL)
+        defer { try? fileHandle.close() }
+        try fileHandle.seek(toOffset: UInt64(size - 1))
+        try fileHandle.write(contentsOf: Data([0]))
     }
 
     private func waitForRunTaskOutcome(
@@ -2113,6 +2577,8 @@ private final class GatedAfterFirstRecordScanner: FileScanner, @unchecked Sendab
 private final class CompletionSignalingStreamingScanner: FileScanner, @unchecked Sendable {
     private let records: [FileRecord]
     private let scanCompletionSemaphore = DispatchSemaphore(value: 0)
+    private let processedRecordCountLock = NSLock()
+    private var processedRecordCountValue = 0
 
     init(records: [FileRecord]) {
         self.records = records
@@ -2123,6 +2589,18 @@ private final class CompletionSignalingStreamingScanner: FileScanner, @unchecked
         scanCompletionSemaphore.wait(timeout: timeout) == .success
     }
 
+    func processedRecordCount() -> Int {
+        processedRecordCountLock.lock()
+        defer { processedRecordCountLock.unlock() }
+        return processedRecordCountValue
+    }
+
+    private func incrementProcessedRecordCount() {
+        processedRecordCountLock.lock()
+        processedRecordCountValue += 1
+        processedRecordCountLock.unlock()
+    }
+
     override func scan(
         sourceRoot: String,
         onRecord: (FileRecord) throws -> Void
@@ -2130,6 +2608,7 @@ private final class CompletionSignalingStreamingScanner: FileScanner, @unchecked
         defer { scanCompletionSemaphore.signal() }
         for record in records {
             try onRecord(record)
+            incrementProcessedRecordCount()
         }
     }
 
@@ -2140,6 +2619,7 @@ private final class CompletionSignalingStreamingScanner: FileScanner, @unchecked
         defer { scanCompletionSemaphore.signal() }
         for record in records {
             try await onRecord(record)
+            incrementProcessedRecordCount()
         }
     }
 
@@ -2152,6 +2632,7 @@ private final class CompletionSignalingStreamingScanner: FileScanner, @unchecked
             var metadataRecord = record
             metadataRecord.sha256 = ""
             try await onRecord(metadataRecord)
+            incrementProcessedRecordCount()
         }
     }
 }

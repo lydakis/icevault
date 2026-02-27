@@ -1,9 +1,11 @@
 import Foundation
+import protocol ClientRuntime.HTTPError
 
 enum BackupEngineError: LocalizedError {
     case invalidSettings(String)
     case databaseUnavailable(String)
     case missingFileRecordID(String)
+    case uploadsDeferred(pendingCount: Int, firstErrorDescription: String?)
 
     var errorDescription: String? {
         switch self {
@@ -13,6 +15,12 @@ enum BackupEngineError: LocalizedError {
             return "Backup database unavailable: \(message)"
         case .missingFileRecordID(let relativePath):
             return "Missing database identifier for pending file: \(relativePath)"
+        case .uploadsDeferred(let pendingCount, let firstErrorDescription):
+            let normalizedPendingCount = max(pendingCount, 0)
+            guard let firstErrorDescription, !firstErrorDescription.isEmpty else {
+                return "Backup finished scanning, but \(normalizedPendingCount) file(s) remain pending after upload failures."
+            }
+            return "Backup finished scanning, but \(normalizedPendingCount) file(s) remain pending after upload failures. First error: \(firstErrorDescription)"
         }
     }
 }
@@ -87,6 +95,66 @@ final class BackupEngine: @unchecked Sendable {
             if let recordedError {
                 throw recordedError
             }
+        }
+    }
+
+    /// Tracks recoverable upload-loop failures so the run can complete scanning and report pending work.
+    private actor DeferredUploadFailureTracker {
+        private var failureCount = 0
+        private var firstErrorDescription: String?
+
+        func record(_ error: Error) {
+            failureCount += 1
+            if firstErrorDescription == nil {
+                firstErrorDescription = error.localizedDescription
+            }
+        }
+
+        func summary() -> (failureCount: Int, firstErrorDescription: String?)? {
+            guard failureCount > 0 else {
+                return nil
+            }
+            return (failureCount, firstErrorDescription)
+        }
+    }
+
+    /// Captures non-deferable upload errors that can be hidden by first-failure semantics.
+    private final class UploadBatchFailureSignal: @unchecked Sendable {
+        private let stateLock = NSLock()
+        private var firstNonDeferableError: Error?
+
+        func record(_ error: Error, isDeferable: Bool) {
+            guard !isDeferable, !(error is CancellationError) else {
+                return
+            }
+
+            stateLock.lock()
+            if firstNonDeferableError == nil {
+                firstNonDeferableError = error
+            }
+            stateLock.unlock()
+        }
+
+        func nonDeferableError() -> Error? {
+            stateLock.lock()
+            let recordedError = firstNonDeferableError
+            stateLock.unlock()
+            return recordedError
+        }
+    }
+
+    /// Tracks per-batch completion so failed upload attempts can release in-flight progress state.
+    private actor CompletedPlanTracker {
+        private var completedRecordIDs: Set<Int64> = []
+
+        func markCompleted(recordID: Int64) {
+            completedRecordIDs.insert(recordID)
+        }
+
+        func incompleteRecordIDs(from plans: [PendingUploadPlan]) -> [Int64] {
+            plans
+                .map(\.recordID)
+                .filter { !completedRecordIDs.contains($0) }
         }
     }
 
@@ -198,6 +266,7 @@ final class BackupEngine: @unchecked Sendable {
         private var totalBytes: Int64 = 0
         private var completedFiles: Int = 0
         private var completedBytes: Int64 = 0
+        private var trackedFileSizeByRecordID: [Int64: Int64] = [:]
         // Keep only active uploads in memory so long-running backups stay bounded.
         private var inFlightByRecordID: [Int64: InFlightProgress] = [:]
         private var inFlightBytesTotal: Int64 = 0
@@ -205,8 +274,11 @@ final class BackupEngine: @unchecked Sendable {
         func register(plans: [PendingUploadPlan]) -> UploadProgressSnapshot {
             for plan in plans {
                 let normalizedFileSize = max(plan.fileSize, 0)
-                totalFiles += 1
-                totalBytes += normalizedFileSize
+                if trackedFileSizeByRecordID[plan.recordID] == nil {
+                    trackedFileSizeByRecordID[plan.recordID] = normalizedFileSize
+                    totalFiles += 1
+                    totalBytes += normalizedFileSize
+                }
 
                 if let existingProgress = inFlightByRecordID[plan.recordID] {
                     inFlightBytesTotal -= existingProgress.uploadedBytes
@@ -241,6 +313,15 @@ final class BackupEngine: @unchecked Sendable {
             inFlightBytesTotal -= inFlightProgress.uploadedBytes
             completedFiles += 1
             completedBytes += inFlightProgress.fileSize
+            return snapshot()
+        }
+
+        func markFailed(recordID: Int64) -> UploadProgressSnapshot {
+            guard let inFlightProgress = inFlightByRecordID.removeValue(forKey: recordID) else {
+                return snapshot()
+            }
+
+            inFlightBytesTotal -= inFlightProgress.uploadedBytes
             return snapshot()
         }
 
@@ -306,6 +387,14 @@ final class BackupEngine: @unchecked Sendable {
         }
 
         func markCompleted(recordID: Int64) -> Double {
+            finishActiveUpload(recordID: recordID)
+        }
+
+        func markFailed(recordID: Int64) -> Double {
+            finishActiveUpload(recordID: recordID)
+        }
+
+        private func finishActiveUpload(recordID: Int64) -> Double {
             activeUploadRecordIDs.remove(recordID)
             uploadedBytesByRecordID.removeValue(forKey: recordID)
 
@@ -418,11 +507,14 @@ final class BackupEngine: @unchecked Sendable {
                 maxBufferedPlans: maxBufferedPendingPlans
             )
             let uploadLoopFailureSignal = UploadLoopFailureSignal()
+            let deferredUploadFailureTracker = DeferredUploadFailureTracker()
 
             let uploadLoopTask = Task {
                 do {
                     try await self.uploadPendingPlansFromStream(
                         pendingPlanStream: pendingPlanChannel.stream,
+                        sourceRoot: sourceRoot,
+                        sourceRootURL: sourceRootURL,
                         bucket: bucket,
                         settings: settings,
                         database: database,
@@ -430,7 +522,8 @@ final class BackupEngine: @unchecked Sendable {
                         job: job,
                         progressTracker: progressTracker,
                         throughputTracker: uploadThroughputTracker,
-                        backpressureGate: pendingPlanBackpressureGate
+                        backpressureGate: pendingPlanBackpressureGate,
+                        deferredFailureTracker: deferredUploadFailureTracker
                     )
                 } catch {
                     uploadLoopFailureSignal.record(error)
@@ -528,6 +621,15 @@ final class BackupEngine: @unchecked Sendable {
                         try uploadLoopFailureSignal.throwIfFailed()
                         pendingPlanChannel.continuation.finish()
                         try await uploadLoopTask.value
+                        if let deferredSummary = await deferredUploadFailureTracker.summary() {
+                            let pendingCount = try database.pendingFileCount(for: sourceRoot)
+                            if pendingCount > 0 {
+                                throw BackupEngineError.uploadsDeferred(
+                                    pendingCount: pendingCount,
+                                    firstErrorDescription: deferredSummary.firstErrorDescription
+                                )
+                            }
+                        }
                     },
                     onCancel: {
                         Task {
@@ -591,6 +693,8 @@ final class BackupEngine: @unchecked Sendable {
 
     private func uploadPendingPlansFromStream(
         pendingPlanStream: AsyncThrowingStream<[PendingUploadPlan], Error>,
+        sourceRoot: String,
+        sourceRootURL: URL,
         bucket: String,
         settings: AppState.Settings,
         database: DatabaseService,
@@ -598,7 +702,8 @@ final class BackupEngine: @unchecked Sendable {
         job: BackupJob,
         progressTracker: UploadProgressTracker,
         throughputTracker: UploadThroughputTracker,
-        backpressureGate: PendingPlanBackpressureGate
+        backpressureGate: PendingPlanBackpressureGate,
+        deferredFailureTracker: DeferredUploadFailureTracker
     ) async throws {
         for try await plans in pendingPlanStream {
             try Task.checkCancellation()
@@ -616,9 +721,143 @@ final class BackupEngine: @unchecked Sendable {
                 await backpressureGate.release(slots: plans.count)
             } catch {
                 await backpressureGate.release(slots: plans.count)
+                if Self.shouldDeferUploadFailure(error) {
+                    await deferredFailureTracker.record(error)
+                    continue
+                }
                 throw error
             }
         }
+
+        if await deferredFailureTracker.summary() != nil {
+            try await retryDeferredPendingUploads(
+                sourceRoot: sourceRoot,
+                sourceRootURL: sourceRootURL,
+                bucket: bucket,
+                settings: settings,
+                database: database,
+                glacierClient: glacierClient,
+                job: job,
+                progressTracker: progressTracker,
+                throughputTracker: throughputTracker,
+                deferredFailureTracker: deferredFailureTracker
+            )
+        }
+    }
+
+    private func retryDeferredPendingUploads(
+        sourceRoot: String,
+        sourceRootURL: URL,
+        bucket: String,
+        settings: AppState.Settings,
+        database: DatabaseService,
+        glacierClient: GlacierClient,
+        job: BackupJob,
+        progressTracker: UploadProgressTracker,
+        throughputTracker: UploadThroughputTracker,
+        deferredFailureTracker: DeferredUploadFailureTracker
+    ) async throws {
+        var lastRelativePath: String?
+
+        while true {
+            try Task.checkCancellation()
+            let pendingFiles = try database.pendingFiles(
+                for: sourceRoot,
+                afterRelativePath: lastRelativePath,
+                limit: Self.remoteAuditBatchSize
+            )
+
+            guard !pendingFiles.isEmpty else {
+                return
+            }
+
+            let batchFirstRelativePath = pendingFiles.first?.relativePath
+            let batchLastRelativePath = pendingFiles.last?.relativePath
+            let retryPlans = try makeUploadPlans(
+                pendingFiles: pendingFiles,
+                sourceRootURL: sourceRootURL,
+                database: database
+            )
+
+            guard !retryPlans.isEmpty else {
+                lastRelativePath = batchLastRelativePath
+                continue
+            }
+
+            do {
+                try await uploadPendingFiles(
+                    plans: retryPlans,
+                    bucket: bucket,
+                    settings: settings,
+                    database: database,
+                    glacierClient: glacierClient,
+                    job: job,
+                    progressTracker: progressTracker,
+                    throughputTracker: throughputTracker
+                )
+                lastRelativePath = batchLastRelativePath
+            } catch {
+                if Self.shouldDeferUploadFailure(error) {
+                    await deferredFailureTracker.record(error)
+                    let pendingPlansAfterFailure = try pendingRetryPlansStillPending(
+                        retryPlans,
+                        database: database
+                    )
+                    guard !pendingPlansAfterFailure.isEmpty else {
+                        lastRelativePath = batchLastRelativePath
+                        continue
+                    }
+
+                    if let batchFirstRelativePath,
+                       pendingPlansAfterFailure.first?.relativePath == batchFirstRelativePath,
+                       let firstPendingPlan = pendingPlansAfterFailure.first {
+                        do {
+                            try await uploadPendingFiles(
+                                plans: [firstPendingPlan],
+                                bucket: bucket,
+                                settings: settings,
+                                database: database,
+                                glacierClient: glacierClient,
+                                job: job,
+                                progressTracker: progressTracker,
+                                throughputTracker: throughputTracker
+                            )
+                        } catch {
+                            if Self.shouldDeferUploadFailure(error) {
+                                await deferredFailureTracker.record(error)
+                            } else {
+                                throw error
+                            }
+                        }
+                    }
+
+                    // Move past the first path in this batch so a persistent failure does not
+                    // starve sibling files that were canceled when concurrency was bounded.
+                    lastRelativePath = batchFirstRelativePath
+                    continue
+                }
+                throw error
+            }
+        }
+    }
+
+    private func pendingRetryPlansStillPending(
+        _ plans: [PendingUploadPlan],
+        database: DatabaseService
+    ) throws -> [PendingUploadPlan] {
+        var pendingPlans: [PendingUploadPlan] = []
+        pendingPlans.reserveCapacity(plans.count)
+
+        for plan in plans {
+            guard let storedRecord = try database.fetchFile(id: plan.recordID) else {
+                continue
+            }
+            if storedRecord.uploadedAt == nil {
+                pendingPlans.append(plan)
+            }
+        }
+
+        return pendingPlans
     }
 
     private func enqueuePendingPlans(
@@ -709,7 +948,7 @@ final class BackupEngine: @unchecked Sendable {
         database: DatabaseService
     ) throws -> [PendingUploadPlan] {
         let orderedPendingFiles = pendingFiles.sorted { lhs, rhs in
-            lhs.relativePath.localizedStandardCompare(rhs.relativePath) == .orderedAscending
+            lhs.relativePath < rhs.relativePath
         }
 
         var plans: [PendingUploadPlan] = []
@@ -792,62 +1031,98 @@ final class BackupEngine: @unchecked Sendable {
 
         let fileConcurrency = max(1, min(settings.maxConcurrentFileUploads, plans.count))
         let multipartPartConcurrency = max(1, settings.maxConcurrentMultipartPartUploads)
+        let completedPlanTracker = CompletedPlanTracker()
+        let uploadBatchFailureSignal = UploadBatchFailureSignal()
 
         let registeredSnapshot = await progressTracker.register(plans: plans)
         await MainActor.run {
             Self.applyProgressSnapshot(registeredSnapshot, to: job)
         }
 
-        try await BoundedTaskRunner.run(
-            inputs: plans,
-            maxConcurrentTasks: fileConcurrency,
-            operation: { [self] plan in
-                let remoteValidation = try await self.preflightRemoteValidation(
-                    for: plan,
-                    bucket: bucket,
-                    glacierClient: glacierClient
-                )
+        do {
+            try await BoundedTaskRunner.run(
+                inputs: plans,
+                maxConcurrentTasks: fileConcurrency,
+                operation: { [self] plan in
+                    do {
+                        let remoteValidation = try await self.preflightRemoteValidation(
+                            for: plan,
+                            bucket: bucket,
+                            glacierClient: glacierClient
+                        )
 
-                switch remoteValidation {
-                case .valid:
-                    return plan
-                case .missing, .mismatch, .inaccessible:
-                    _ = try await glacierClient.uploadFile(
-                        localPath: plan.localPath,
-                        bucket: bucket,
-                        key: plan.objectKey,
-                        storageClass: FileRecord.deepArchiveStorageClass,
-                        fileRecordId: plan.recordID,
-                        multipartPartConcurrency: multipartPartConcurrency
-                    ) { uploadedBytesForCurrentFile in
-                        let snapshot = await progressTracker.update(
-                            recordID: plan.recordID,
-                            uploadedBytes: uploadedBytesForCurrentFile
-                        )
-                        let uploadBytesPerSecond = await throughputTracker.observe(
-                            recordID: plan.recordID,
-                            uploadedBytesForRecord: uploadedBytesForCurrentFile
-                        )
+                        switch remoteValidation {
+                        case .valid:
+                            return plan
+                        case .missing, .mismatch, .inaccessible:
+                            _ = try await glacierClient.uploadFile(
+                                localPath: plan.localPath,
+                                bucket: bucket,
+                                key: plan.objectKey,
+                                storageClass: FileRecord.deepArchiveStorageClass,
+                                fileRecordId: plan.recordID,
+                                multipartPartConcurrency: multipartPartConcurrency
+                            ) { uploadedBytesForCurrentFile in
+                                let snapshot = await progressTracker.update(
+                                    recordID: plan.recordID,
+                                    uploadedBytes: uploadedBytesForCurrentFile
+                                )
+                                let uploadBytesPerSecond = await throughputTracker.observe(
+                                    recordID: plan.recordID,
+                                    uploadedBytesForRecord: uploadedBytesForCurrentFile
+                                )
+                                await MainActor.run {
+                                    Self.applyProgressSnapshot(snapshot, to: job)
+                                    job.setUploadRate(bytesPerSecond: uploadBytesPerSecond)
+                                }
+                            }
+                            return plan
+                        }
+                    } catch {
+                        uploadBatchFailureSignal.record(error, isDeferable: Self.shouldDeferUploadFailure(error))
+                        throw error
+                    }
+                },
+                onSuccess: { completedPlan in
+                    do {
+                        // Persist each completion immediately so interrupted runs remain resume-safe.
+                        try database.markUploaded(id: completedPlan.recordID, glacierKey: completedPlan.objectKey)
+
+                        let snapshot = await progressTracker.markCompleted(recordID: completedPlan.recordID)
+                        let uploadBytesPerSecond = await throughputTracker.markCompleted(recordID: completedPlan.recordID)
                         await MainActor.run {
                             Self.applyProgressSnapshot(snapshot, to: job)
                             job.setUploadRate(bytesPerSecond: uploadBytesPerSecond)
                         }
+                        await completedPlanTracker.markCompleted(recordID: completedPlan.recordID)
+                    } catch {
+                        uploadBatchFailureSignal.record(error, isDeferable: false)
+                        throw error
                     }
-                    return plan
                 }
-            },
-            onSuccess: { completedPlan in
-                // Persist each completion immediately so interrupted runs remain resume-safe.
-                try database.markUploaded(id: completedPlan.recordID, glacierKey: completedPlan.objectKey)
+            )
+        } catch {
+            let incompleteRecordIDs = await completedPlanTracker.incompleteRecordIDs(from: plans)
+            if !incompleteRecordIDs.isEmpty {
+                var latestSnapshot: UploadProgressSnapshot?
+                var latestUploadRate: Double?
+                for recordID in incompleteRecordIDs {
+                    latestSnapshot = await progressTracker.markFailed(recordID: recordID)
+                    latestUploadRate = await throughputTracker.markFailed(recordID: recordID)
+                }
 
-                let snapshot = await progressTracker.markCompleted(recordID: completedPlan.recordID)
-                let uploadBytesPerSecond = await throughputTracker.markCompleted(recordID: completedPlan.recordID)
-                await MainActor.run {
-                    Self.applyProgressSnapshot(snapshot, to: job)
-                    job.setUploadRate(bytesPerSecond: uploadBytesPerSecond)
+                if let latestSnapshot, let latestUploadRate {
+                    await MainActor.run {
+                        Self.applyProgressSnapshot(latestSnapshot, to: job)
+                        job.setUploadRate(bytesPerSecond: latestUploadRate)
+                    }
                 }
             }
-        )
+            if let nonDeferableError = uploadBatchFailureSignal.nonDeferableError() {
+                throw nonDeferableError
+            }
+            throw error
+        }
     }
 
     private func validateUploadedFilesOnRemote(
@@ -953,6 +1228,41 @@ final class BackupEngine: @unchecked Sendable {
             }
             throw error
         }
+    }
+
+    private static func shouldDeferUploadFailure(_ error: Error) -> Bool {
+        if error is CancellationError {
+            return false
+        }
+
+        guard let glacierError = error as? GlacierClientError else {
+            return false
+        }
+
+        switch glacierError {
+        case .s3OperationFailed(_, let underlying):
+            if let statusCode = s3StatusCode(from: underlying),
+               statusCode == 403 || statusCode == 404 {
+                return false
+            }
+            return true
+        case .invalidCredentials:
+            return true
+        case .invalidRegion,
+                .invalidBucket,
+                .invalidObjectKey,
+                .fileNotFound,
+                .unreadableFile,
+                .unsupportedStorageClass,
+                .missingMultipartUploadID,
+                .missingMultipartETag,
+                .incompleteFileRead:
+            return false
+        }
+    }
+
+    private static func s3StatusCode(from error: Error) -> Int? {
+        (error as? any HTTPError)?.httpResponse.statusCode.rawValue
     }
 
     @MainActor

@@ -148,6 +148,31 @@ final class DatabaseService: @unchecked Sendable {
         }
     }
 
+    func pendingFiles(
+        for sourceRoot: String,
+        afterRelativePath: String?,
+        limit: Int
+    ) throws -> [FileRecord] {
+        let normalizedLimit = max(limit, 0)
+        guard normalizedLimit > 0 else {
+            return []
+        }
+
+        return try dbQueue.read { db in
+            var request = FileRecord
+                .filter(FileRecord.Columns.sourcePath == sourceRoot)
+                .filter(FileRecord.Columns.uploadedAt == nil)
+                .order(FileRecord.Columns.relativePath)
+                .limit(normalizedLimit)
+
+            if let afterRelativePath {
+                request = request.filter(FileRecord.Columns.relativePath > afterRelativePath)
+            }
+
+            return try request.fetchAll(db)
+        }
+    }
+
     func pendingFileCount(for sourceRoot: String) throws -> Int {
         try dbQueue.read { db in
             try Int.fetchOne(

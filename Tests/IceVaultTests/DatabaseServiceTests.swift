@@ -566,6 +566,13 @@ final class DatabaseServiceTests: XCTestCase {
         let firstBatch = try database.pendingFiles(for: sourceRoot, limit: 2)
         XCTAssertEqual(firstBatch.count, 2)
         XCTAssertEqual(firstBatch.map(\.relativePath), ["file-0.txt", "file-1.txt"])
+
+        let nextBatch = try database.pendingFiles(
+            for: sourceRoot,
+            afterRelativePath: "file-1.txt",
+            limit: 2
+        )
+        XCTAssertEqual(nextBatch.map(\.relativePath), ["file-2.txt"])
     }
 
     private func makeDatabaseService() throws -> DatabaseService {

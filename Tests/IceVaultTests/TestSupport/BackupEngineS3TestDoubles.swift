@@ -221,6 +221,229 @@ final class DeterministicFailureBackupEngineS3Client: GlacierS3Client {
     }
 }
 
+final class ForbiddenFailureBackupEngineS3Client: GlacierS3Client {
+    private let failingKey: String
+    private let failureTriggeredSignal = AsyncSignal()
+
+    init(failingKey: String) {
+        self.failingKey = failingKey
+    }
+
+    func waitUntilFailureTriggered() async {
+        await failureTriggeredSignal.wait()
+    }
+
+    func createMultipartUpload(input: CreateMultipartUploadInput) async throws -> CreateMultipartUploadOutput {
+        CreateMultipartUploadOutput(uploadId: "upload-id")
+    }
+
+    func uploadPart(input: UploadPartInput) async throws -> UploadPartOutput {
+        UploadPartOutput(eTag: "\"etag\"")
+    }
+
+    func completeMultipartUpload(input: CompleteMultipartUploadInput) async throws -> CompleteMultipartUploadOutput {
+        CompleteMultipartUploadOutput()
+    }
+
+    func abortMultipartUpload(input: AbortMultipartUploadInput) async throws -> AbortMultipartUploadOutput {
+        AbortMultipartUploadOutput()
+    }
+
+    func listParts(input: ListPartsInput) async throws -> ListPartsOutput {
+        ListPartsOutput(isTruncated: false, nextPartNumberMarker: nil, parts: [])
+    }
+
+    func putObject(input: PutObjectInput) async throws -> PutObjectOutput {
+        if input.key == failingKey {
+            await failureTriggeredSignal.signal()
+            throw MockHTTPStatusCodeError(statusCode: .forbidden)
+        }
+
+        return PutObjectOutput()
+    }
+
+    func headBucket(input: HeadBucketInput) async throws -> HeadBucketOutput {
+        HeadBucketOutput()
+    }
+}
+
+final class FailOnceBackupEngineS3Client: GlacierS3Client {
+    private actor FailedKeyTracker {
+        private var failedKeys: Set<String> = []
+
+        func shouldFail(for key: String) -> Bool {
+            if failedKeys.contains(key) {
+                return false
+            }
+            failedKeys.insert(key)
+            return true
+        }
+    }
+
+    private let transientFailureKey: String
+    private let putObjectCallCounter = InvocationCounter()
+    private let failedKeyTracker = FailedKeyTracker()
+
+    init(transientFailureKey: String) {
+        self.transientFailureKey = transientFailureKey
+    }
+
+    func putObjectCallCount() async -> Int {
+        await putObjectCallCounter.value()
+    }
+
+    func createMultipartUpload(input: CreateMultipartUploadInput) async throws -> CreateMultipartUploadOutput {
+        CreateMultipartUploadOutput(uploadId: "upload-id")
+    }
+
+    func uploadPart(input: UploadPartInput) async throws -> UploadPartOutput {
+        UploadPartOutput(eTag: "\"etag\"")
+    }
+
+    func completeMultipartUpload(input: CompleteMultipartUploadInput) async throws -> CompleteMultipartUploadOutput {
+        CompleteMultipartUploadOutput()
+    }
+
+    func abortMultipartUpload(input: AbortMultipartUploadInput) async throws -> AbortMultipartUploadOutput {
+        AbortMultipartUploadOutput()
+    }
+
+    func listParts(input: ListPartsInput) async throws -> ListPartsOutput {
+        ListPartsOutput(isTruncated: false, nextPartNumberMarker: nil, parts: [])
+    }
+
+    func putObject(input: PutObjectInput) async throws -> PutObjectOutput {
+        await putObjectCallCounter.increment()
+        let key = input.key ?? ""
+        if key == transientFailureKey {
+            let shouldFail = await failedKeyTracker.shouldFail(for: key)
+            if shouldFail {
+                throw DeterministicFailureS3Error.syntheticFailure
+            }
+        }
+        return PutObjectOutput()
+    }
+
+    func headBucket(input: HeadBucketInput) async throws -> HeadBucketOutput {
+        HeadBucketOutput()
+    }
+}
+
+final class DelayedSuccessAndDeterministicFailureBackupEngineS3Client: GlacierS3Client {
+    private let delayedKey: String
+    private let failingKey: String
+    private let delayNanoseconds: UInt64
+
+    init(
+        delayedKey: String,
+        failingKey: String,
+        delayNanoseconds: UInt64 = 500_000_000
+    ) {
+        self.delayedKey = delayedKey
+        self.failingKey = failingKey
+        self.delayNanoseconds = delayNanoseconds
+    }
+
+    func createMultipartUpload(input: CreateMultipartUploadInput) async throws -> CreateMultipartUploadOutput {
+        CreateMultipartUploadOutput(uploadId: "upload-id")
+    }
+
+    func uploadPart(input: UploadPartInput) async throws -> UploadPartOutput {
+        UploadPartOutput(eTag: "\"etag\"")
+    }
+
+    func completeMultipartUpload(input: CompleteMultipartUploadInput) async throws -> CompleteMultipartUploadOutput {
+        CompleteMultipartUploadOutput()
+    }
+
+    func abortMultipartUpload(input: AbortMultipartUploadInput) async throws -> AbortMultipartUploadOutput {
+        AbortMultipartUploadOutput()
+    }
+
+    func listParts(input: ListPartsInput) async throws -> ListPartsOutput {
+        ListPartsOutput(isTruncated: false, nextPartNumberMarker: nil, parts: [])
+    }
+
+    func putObject(input: PutObjectInput) async throws -> PutObjectOutput {
+        let key = input.key ?? ""
+        if key == delayedKey {
+            try await Task.sleep(nanoseconds: delayNanoseconds)
+            return PutObjectOutput()
+        }
+
+        if key == failingKey {
+            throw DeterministicFailureS3Error.syntheticFailure
+        }
+
+        return PutObjectOutput()
+    }
+
+    func headBucket(input: HeadBucketInput) async throws -> HeadBucketOutput {
+        HeadBucketOutput()
+    }
+}
+
+final class RecoverableAndMultipartFailureBackupEngineS3Client: GlacierS3Client {
+    private let recoverableFailureKey: String
+    private let multipartFailureKey: String
+    private let multipartPartStartedSignal = AsyncSignal()
+    private let releaseMultipartFailureSignal = AsyncSignal()
+    private let recoverableFailureTriggeredSignal = AsyncSignal()
+
+    init(recoverableFailureKey: String, multipartFailureKey: String) {
+        self.recoverableFailureKey = recoverableFailureKey
+        self.multipartFailureKey = multipartFailureKey
+    }
+
+    func waitUntilRecoverableFailureTriggered() async {
+        await recoverableFailureTriggeredSignal.wait()
+    }
+
+    func releaseMultipartFailure() async {
+        await releaseMultipartFailureSignal.signal()
+    }
+
+    func createMultipartUpload(input: CreateMultipartUploadInput) async throws -> CreateMultipartUploadOutput {
+        CreateMultipartUploadOutput(uploadId: "upload-id")
+    }
+
+    func uploadPart(input: UploadPartInput) async throws -> UploadPartOutput {
+        if input.key == multipartFailureKey {
+            await multipartPartStartedSignal.signal()
+            await releaseMultipartFailureSignal.wait()
+            // Return no ETag so GlacierClient surfaces .missingMultipartETag.
+            return UploadPartOutput()
+        }
+        return UploadPartOutput(eTag: "\"etag\"")
+    }
+
+    func completeMultipartUpload(input: CompleteMultipartUploadInput) async throws -> CompleteMultipartUploadOutput {
+        CompleteMultipartUploadOutput()
+    }
+
+    func abortMultipartUpload(input: AbortMultipartUploadInput) async throws -> AbortMultipartUploadOutput {
+        AbortMultipartUploadOutput()
+    }
+
+    func listParts(input: ListPartsInput) async throws -> ListPartsOutput {
+        ListPartsOutput(isTruncated: false, nextPartNumberMarker: nil, parts: [])
+    }
+
+    func putObject(input: PutObjectInput) async throws -> PutObjectOutput {
+        if input.key == recoverableFailureKey {
+            // Ensure multipart upload is already in flight so this recoverable failure is observed first.
+            await multipartPartStartedSignal.wait()
+            await recoverableFailureTriggeredSignal.signal()
+            throw DeterministicFailureS3Error.syntheticFailure
+        }
+        return PutObjectOutput()
+    }
+
+    func headBucket(input: HeadBucketInput) async throws -> HeadBucketOutput {
+        HeadBucketOutput()
+    }
+}
+
 enum DeterministicFailureS3Error: Error {
     case syntheticFailure
 }
