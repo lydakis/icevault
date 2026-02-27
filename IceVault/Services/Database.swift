@@ -116,6 +116,50 @@ final class DatabaseService: @unchecked Sendable {
         }
     }
 
+    func pendingFiles(for sourceRoot: String, limit: Int) throws -> [FileRecord] {
+        let normalizedLimit = max(limit, 0)
+        guard normalizedLimit > 0 else {
+            return []
+        }
+
+        return try dbQueue.read { db in
+            try FileRecord
+                .filter(FileRecord.Columns.sourcePath == sourceRoot)
+                .filter(FileRecord.Columns.uploadedAt == nil)
+                .order(FileRecord.Columns.relativePath)
+                .limit(normalizedLimit)
+                .fetchAll(db)
+        }
+    }
+
+    func pendingFileCount(for sourceRoot: String) throws -> Int {
+        try dbQueue.read { db in
+            try Int.fetchOne(
+                db,
+                sql: """
+                SELECT COUNT(*)
+                FROM \(FileRecord.databaseTableName)
+                WHERE sourcePath = ? AND uploadedAt IS NULL
+                """,
+                arguments: [sourceRoot]
+            ) ?? 0
+        }
+    }
+
+    func pendingTotalBytes(for sourceRoot: String) throws -> Int64 {
+        try dbQueue.read { db in
+            try Int64.fetchOne(
+                db,
+                sql: """
+                SELECT COALESCE(SUM(fileSize), 0)
+                FROM \(FileRecord.databaseTableName)
+                WHERE sourcePath = ? AND uploadedAt IS NULL
+                """,
+                arguments: [sourceRoot]
+            ) ?? 0
+        }
+    }
+
     func uploadedFiles(for sourceRoot: String) throws -> [FileRecord] {
         try dbQueue.read { db in
             try FileRecord
