@@ -491,7 +491,11 @@ class FileScanner: @unchecked Sendable {
         let chunkSize = 1024 * 1024
 
         while true {
-            let chunk = try handle.read(upToCount: chunkSize) ?? Data()
+            // `FileHandle` and Foundation can produce autoreleased NSData-backed chunks.
+            // Drain per-iteration to keep hashing very large files memory-bounded.
+            let chunk = try autoreleasepool {
+                try handle.read(upToCount: chunkSize) ?? Data()
+            }
             if chunk.isEmpty {
                 break
             }

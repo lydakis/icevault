@@ -223,10 +223,18 @@ final class DeterministicFailureBackupEngineS3Client: GlacierS3Client {
 
 final class ForbiddenFailureBackupEngineS3Client: GlacierS3Client {
     private let failingKey: String
+    private let statusCode: HTTPStatusCode
+    private let failureMessage: String?
     private let failureTriggeredSignal = AsyncSignal()
 
-    init(failingKey: String) {
+    init(
+        failingKey: String,
+        statusCode: HTTPStatusCode = .forbidden,
+        failureMessage: String? = nil
+    ) {
         self.failingKey = failingKey
+        self.statusCode = statusCode
+        self.failureMessage = failureMessage
     }
 
     func waitUntilFailureTriggered() async {
@@ -256,7 +264,7 @@ final class ForbiddenFailureBackupEngineS3Client: GlacierS3Client {
     func putObject(input: PutObjectInput) async throws -> PutObjectOutput {
         if input.key == failingKey {
             await failureTriggeredSignal.signal()
-            throw MockHTTPStatusCodeError(statusCode: .forbidden)
+            throw MockHTTPStatusCodeError(statusCode: statusCode, message: failureMessage)
         }
 
         return PutObjectOutput()
@@ -448,11 +456,17 @@ enum DeterministicFailureS3Error: Error {
     case syntheticFailure
 }
 
-struct MockHTTPStatusCodeError: Error, HTTPError {
+struct MockHTTPStatusCodeError: Error, HTTPError, LocalizedError {
     let httpResponse: HTTPResponse
+    private let message: String?
 
-    init(statusCode: HTTPStatusCode) {
+    init(statusCode: HTTPStatusCode, message: String? = nil) {
         self.httpResponse = HTTPResponse(statusCode: statusCode)
+        self.message = message
+    }
+
+    var errorDescription: String? {
+        message
     }
 }
 

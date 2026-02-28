@@ -1350,13 +1350,20 @@ final class BackupEngine: @unchecked Sendable {
 
         switch glacierError {
         case .s3OperationFailed(_, let underlying):
-            if let statusCode = s3StatusCode(from: underlying),
-               statusCode == 403 || statusCode == 404 {
-                return false
+            if let statusCode = s3StatusCode(from: underlying) {
+                // Auth and hard access failures should stop immediately.
+                if statusCode == 401 || statusCode == 403 || statusCode == 404 {
+                    return false
+                }
+
+                // Some auth expiry/service-side client errors can surface as HTTP 400.
+                if statusCode == 400, isLikelyAuthenticationFailure(underlying) {
+                    return false
+                }
             }
             return true
         case .invalidCredentials:
-            return true
+            return false
         case .invalidRegion,
                 .invalidBucket,
                 .invalidObjectKey,
@@ -1372,6 +1379,32 @@ final class BackupEngine: @unchecked Sendable {
 
     private static func s3StatusCode(from error: Error) -> Int? {
         (error as? any HTTPError)?.httpResponse.statusCode.rawValue
+    }
+
+    private static func isLikelyAuthenticationFailure(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        let combinedDescription = [
+            nsError.localizedDescription,
+            String(describing: error),
+            String(reflecting: error)
+        ]
+            .joined(separator: " ")
+            .lowercased()
+
+        let authMarkers = [
+            "expiredtoken",
+            "token has expired",
+            "expired token",
+            "invalidtoken",
+            "invalid security token",
+            "invalidclienttokenid",
+            "unrecognizedclientexception",
+            "signaturedoesnotmatch",
+            "requestexpired",
+            "invalidaccesskeyid"
+        ]
+
+        return authMarkers.contains { combinedDescription.contains($0) }
     }
 
     @MainActor
