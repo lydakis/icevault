@@ -336,12 +336,14 @@ final class BackupEngine: @unchecked Sendable {
         }
     }
 
-    private actor UploadThroughputTracker {
+    actor UploadThroughputTracker {
+        private static let minimumSamplingInterval: TimeInterval = 0.4
+        private static let smoothingFactor: Double = 0.2
+
         private var uploadedBytesByRecordID: [Int64: Int64] = [:]
         private var activeUploadRecordIDs: Set<Int64> = []
-        private var totalTransferredBytes: Int64 = 0
-        private var lastTimestamp: Date?
-        private var lastTransferredBytes: Int64 = 0
+        private var sampleWindowTransferredBytes: Int64 = 0
+        private var lastSampleTimestamp: Date?
         private var smoothedBytesPerSecond: Double = 0
 
         func observe(
@@ -352,10 +354,8 @@ final class BackupEngine: @unchecked Sendable {
             let normalizedUploadedBytes = max(uploadedBytesForRecord, 0)
             let previousUploadedBytes = uploadedBytesByRecordID[recordID]
             activeUploadRecordIDs.insert(recordID)
-
-            if lastTimestamp == nil {
-                lastTimestamp = timestamp
-                lastTransferredBytes = totalTransferredBytes
+            if lastSampleTimestamp == nil {
+                lastSampleTimestamp = timestamp
             }
 
             let transferredDelta: Int64
@@ -374,48 +374,61 @@ final class BackupEngine: @unchecked Sendable {
                 return smoothedBytesPerSecond
             }
 
-            totalTransferredBytes += transferredDelta
+            sampleWindowTransferredBytes += transferredDelta
 
-            guard let lastTimestamp else {
-                return smoothedBytesPerSecond
-            }
-            let elapsed = timestamp.timeIntervalSince(lastTimestamp)
-            guard elapsed > 0 else {
+            let elapsed = timestamp.timeIntervalSince(lastSampleTimestamp ?? timestamp)
+            guard elapsed >= Self.minimumSamplingInterval else {
                 return smoothedBytesPerSecond
             }
 
-            let transferredSinceLastSample = max(0, totalTransferredBytes - lastTransferredBytes)
-            let instantaneousBytesPerSecond = Double(transferredSinceLastSample) / elapsed
+            let instantaneousBytesPerSecond = Double(sampleWindowTransferredBytes) / elapsed
             if smoothedBytesPerSecond <= 0 {
                 smoothedBytesPerSecond = instantaneousBytesPerSecond
             } else {
-                smoothedBytesPerSecond = (smoothedBytesPerSecond * 0.8) + (instantaneousBytesPerSecond * 0.2)
+                smoothedBytesPerSecond = (smoothedBytesPerSecond * (1 - Self.smoothingFactor))
+                    + (instantaneousBytesPerSecond * Self.smoothingFactor)
             }
 
-            self.lastTimestamp = timestamp
-            lastTransferredBytes = totalTransferredBytes
+            self.lastSampleTimestamp = timestamp
+            sampleWindowTransferredBytes = 0
             return smoothedBytesPerSecond
         }
 
-        func markCompleted(recordID: Int64) -> Double {
-            finishActiveUpload(recordID: recordID)
+        func markCompleted(recordID: Int64, at timestamp: Date = Date()) -> Double {
+            finishActiveUpload(recordID: recordID, at: timestamp)
         }
 
-        func markFailed(recordID: Int64) -> Double {
-            finishActiveUpload(recordID: recordID)
+        func markFailed(recordID: Int64, at timestamp: Date = Date()) -> Double {
+            finishActiveUpload(recordID: recordID, at: timestamp)
         }
 
-        private func finishActiveUpload(recordID: Int64) -> Double {
+        private func finishActiveUpload(recordID: Int64, at timestamp: Date) -> Double {
             activeUploadRecordIDs.remove(recordID)
-            uploadedBytesByRecordID.removeValue(forKey: recordID)
+            let hadObservedProgress = uploadedBytesByRecordID.removeValue(forKey: recordID) != nil
 
-            guard activeUploadRecordIDs.isEmpty else {
-                return smoothedBytesPerSecond
+            // Flush any unsampled transfer bytes so single-callback uploads still
+            // contribute to the displayed throughput.
+            if hadObservedProgress,
+               activeUploadRecordIDs.isEmpty,
+               sampleWindowTransferredBytes > 0,
+               let lastSampleTimestamp
+            {
+                let elapsed = max(timestamp.timeIntervalSince(lastSampleTimestamp), Self.minimumSamplingInterval)
+                let instantaneousBytesPerSecond = Double(sampleWindowTransferredBytes) / elapsed
+                if smoothedBytesPerSecond <= 0 {
+                    smoothedBytesPerSecond = instantaneousBytesPerSecond
+                } else {
+                    smoothedBytesPerSecond = (smoothedBytesPerSecond * (1 - Self.smoothingFactor))
+                        + (instantaneousBytesPerSecond * Self.smoothingFactor)
+                }
+                sampleWindowTransferredBytes = 0
             }
 
-            smoothedBytesPerSecond = 0
-            lastTimestamp = nil
-            lastTransferredBytes = totalTransferredBytes
+            // Don't carry idle time into the next upload burst.
+            if activeUploadRecordIDs.isEmpty {
+                lastSampleTimestamp = nil
+            }
+
             return smoothedBytesPerSecond
         }
     }
@@ -668,15 +681,18 @@ final class BackupEngine: @unchecked Sendable {
             }
 
             await MainActor.run {
+                job.setUploadRate(bytesPerSecond: 0)
                 job.markCompleted()
             }
         } catch is CancellationError {
             await MainActor.run {
+                job.setUploadRate(bytesPerSecond: 0)
                 job.markFailed("Backup canceled")
             }
             throw CancellationError()
         } catch {
             await MainActor.run {
+                job.setUploadRate(bytesPerSecond: 0)
                 job.markFailed(error.localizedDescription)
             }
             throw error
@@ -738,6 +754,13 @@ final class BackupEngine: @unchecked Sendable {
                     progressTracker: progressTracker,
                     throughputTracker: throughputTracker
                 )
+                if await deferredFailureTracker.summary() != nil {
+                    await refreshDeferredPendingCount(
+                        sourceRoot: sourceRoot,
+                        database: database,
+                        job: job
+                    )
+                }
                 await backpressureGate.release(slots: plans.count)
             } catch {
                 await backpressureGate.release(slots: plans.count)

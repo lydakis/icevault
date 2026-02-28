@@ -91,35 +91,28 @@ struct MenuBarView: View {
     }
 
     private func runningBackupContent(job: BackupJob) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ProgressView(value: job.primaryProgressFraction)
+        VStack(alignment: .leading, spacing: 8) {
+            ProgressView(value: job.fileProgressFraction)
 
-            Text(scopeFileProgressText(for: job))
+            Text(uploadFileProgressText(for: job))
                 .font(.subheadline)
                 .monospacedDigit()
 
-            Text(scopeByteProgressText(for: job))
+            Text(uploadByteProgressText(for: job))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
 
-            Text("Upload queue: \(formattedCount(job.filesUploaded)) / \(formattedCount(job.filesTotal)) files")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .monospacedDigit()
+            compactMetricsGrid(job: job)
 
-            Text(discoveryRateText(for: job))
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .monospacedDigit()
-
-            Text(uploadRateText(for: job))
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .monospacedDigit()
+            if job.shouldShowDiscoveryRate || job.hasDiscoveryEstimate {
+                scanDetailsDisclosure(job: job)
+            }
 
             if job.hasDeferredUploadIssues {
                 deferredUploadTelemetryContent(job: job)
+            } else if job.deferredUploadFailureCount > 0 {
+                deferredUploadRecoveryDisclosure(job: job)
             }
         }
     }
@@ -294,46 +287,141 @@ struct MenuBarView: View {
         value.formatted(.number.precision(.fractionLength(1)))
     }
 
+    private func compactMetricsGrid(job: BackupJob) -> some View {
+        LazyVGrid(
+            columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)],
+            spacing: 8
+        ) {
+            metricTile(
+                title: "Upload Rate",
+                value: uploadRateValueText(for: job),
+                tint: .blue
+            )
+            metricTile(
+                title: "Upload Queue",
+                value: "\(formattedCount(job.filesUploaded)) / \(formattedCount(job.filesTotal))"
+            )
+        }
+    }
+
+    private func metricTile(
+        title: String,
+        value: String,
+        tint: Color = .secondary
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(tint)
+                .monospacedDigit()
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(8)
+        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    @ViewBuilder
+    private func scanDetailsDisclosure(job: BackupJob) -> some View {
+        DisclosureGroup("Scan Details") {
+            VStack(alignment: .leading, spacing: 4) {
+                if let scanFileProgressText = scanFileProgressText(for: job) {
+                    Text(scanFileProgressText)
+                        .monospacedDigit()
+                }
+
+                if let scanByteProgressText = scanByteProgressText(for: job) {
+                    Text(scanByteProgressText)
+                        .monospacedDigit()
+                }
+
+                Text(discoveryRateText(for: job))
+                    .monospacedDigit()
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .padding(.top, 2)
+        }
+        .font(.caption)
+    }
+
     @ViewBuilder
     private func deferredUploadTelemetryContent(job: BackupJob) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 6) {
             if job.isRetryingDeferredUploads {
                 Label(
                     "Retrying deferred uploads (pass \(formattedCount(job.deferredUploadRetryPassCount)))",
                     systemImage: "arrow.clockwise.circle.fill"
                 )
             } else {
-                Label("Deferred uploads detected", systemImage: "exclamationmark.triangle.fill")
+                Label(
+                    "Deferred uploads detected (\(formattedCount(job.deferredUploadPendingFiles)) pending)",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
             }
 
-            Text("Recoverable upload errors: \(formattedCount(job.deferredUploadFailureCount))")
-            Text("Pending uploads: \(formattedCount(job.deferredUploadPendingFiles))")
+            DisclosureGroup("Recovery Details") {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Recoverable upload errors: \(formattedCount(job.deferredUploadFailureCount))")
+                    Text("Pending uploads: \(formattedCount(job.deferredUploadPendingFiles))")
 
-            if let deferredUploadLastError = job.deferredUploadLastError, !deferredUploadLastError.isEmpty {
-                Text("Last error: \(deferredUploadLastError)")
-                    .lineLimit(2)
+                    if let deferredUploadLastError = job.deferredUploadLastError, !deferredUploadLastError.isEmpty {
+                        Text("Last error: \(deferredUploadLastError)")
+                            .lineLimit(2)
+                    }
+                }
+                .padding(.top, 2)
             }
         }
-        .font(.caption2)
+        .font(.caption)
         .foregroundStyle(.orange)
         .padding(8)
         .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
     }
 
-    private func scopeFileProgressText(for job: BackupJob) -> String {
-        if let estimatedFiles = job.discoveryEstimatedFiles {
-            let normalizedEstimate = max(estimatedFiles, job.discoveredFiles)
-            return "Scanned \(formattedCount(job.discoveredFiles)) / \(formattedCount(normalizedEstimate)) files"
+    @ViewBuilder
+    private func deferredUploadRecoveryDisclosure(job: BackupJob) -> some View {
+        DisclosureGroup("Recovered Upload Warnings") {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Recoverable upload errors: \(formattedCount(job.deferredUploadFailureCount))")
+                if let deferredUploadLastError = job.deferredUploadLastError, !deferredUploadLastError.isEmpty {
+                    Text("Last error: \(deferredUploadLastError)")
+                        .lineLimit(2)
+                }
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .padding(.top, 2)
         }
+        .font(.caption2)
+        .foregroundStyle(.secondary)
+    }
+
+    private func uploadFileProgressText(for job: BackupJob) -> String {
         return "Uploaded \(formattedCount(job.filesUploaded)) / \(formattedCount(job.filesTotal)) files"
     }
 
-    private func scopeByteProgressText(for job: BackupJob) -> String {
-        if let estimatedBytes = job.discoveryEstimatedBytes {
-            let normalizedEstimate = max(estimatedBytes, job.discoveredBytes)
-            return "Scanned \(formattedBytes(job.discoveredBytes)) / \(formattedBytes(normalizedEstimate))"
-        }
+    private func uploadByteProgressText(for job: BackupJob) -> String {
         return "Uploaded \(formattedBytes(job.bytesUploaded)) / \(formattedBytes(job.bytesTotal))"
+    }
+
+    private func scanFileProgressText(for job: BackupJob) -> String? {
+        guard let estimatedFiles = job.discoveryEstimatedFiles else {
+            return nil
+        }
+        let normalizedEstimate = max(estimatedFiles, job.discoveredFiles)
+        return "Scanned \(formattedCount(job.discoveredFiles)) / \(formattedCount(normalizedEstimate)) files"
+    }
+
+    private func scanByteProgressText(for job: BackupJob) -> String? {
+        guard let estimatedBytes = job.discoveryEstimatedBytes else {
+            return nil
+        }
+        let normalizedEstimate = max(estimatedBytes, job.discoveredBytes)
+        return "Scanned \(formattedBytes(job.discoveredBytes)) / \(formattedBytes(normalizedEstimate))"
     }
 
     private func discoveryRateText(for job: BackupJob) -> String {
@@ -342,8 +430,8 @@ struct MenuBarView: View {
         return "Discovery rate: \(formattedRate(filesPerSecond)) files/s (\(formattedBytes(Int64(max(bytesPerSecond, 0))))/s)"
     }
 
-    private func uploadRateText(for job: BackupJob) -> String {
+    private func uploadRateValueText(for job: BackupJob) -> String {
         let bytesPerSecond = job.isRunning ? job.uploadBytesPerSecond : 0
-        return "Upload rate: \(formattedBytes(Int64(max(bytesPerSecond, 0))))/s"
+        return "\(formattedBytes(Int64(max(bytesPerSecond, 0))))/s"
     }
 }

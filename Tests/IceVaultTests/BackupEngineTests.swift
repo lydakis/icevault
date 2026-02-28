@@ -314,6 +314,130 @@ final class BackupEngineTests: XCTestCase {
         XCTAssertEqual(stats.putObjectCallCount, 1)
     }
 
+    func testUploadThroughputTrackerDoesNotFlushWindowForUnobservedCompletion() async {
+        let tracker = BackupEngine.UploadThroughputTracker()
+        let baseTimestamp = Date(timeIntervalSinceReferenceDate: 10_000)
+
+        _ = await tracker.observe(
+            recordID: 1,
+            uploadedBytesForRecord: 0,
+            at: baseTimestamp
+        )
+        _ = await tracker.observe(
+            recordID: 1,
+            uploadedBytesForRecord: 600,
+            at: baseTimestamp.addingTimeInterval(0.5)
+        )
+        _ = await tracker.observe(
+            recordID: 1,
+            uploadedBytesForRecord: 800,
+            at: baseTimestamp.addingTimeInterval(0.7)
+        )
+
+        _ = await tracker.markCompleted(
+            recordID: 2,
+            at: baseTimestamp.addingTimeInterval(0.71)
+        )
+
+        let sampledRate = await tracker.observe(
+            recordID: 1,
+            uploadedBytesForRecord: 1_000,
+            at: baseTimestamp.addingTimeInterval(0.9)
+        )
+        XCTAssertGreaterThan(sampledRate, 1_100)
+    }
+
+    func testUploadThroughputTrackerResetsSamplingAnchorAfterIdleGap() async {
+        let tracker = BackupEngine.UploadThroughputTracker()
+        let baseTimestamp = Date(timeIntervalSinceReferenceDate: 20_000)
+
+        _ = await tracker.observe(
+            recordID: 1,
+            uploadedBytesForRecord: 0,
+            at: baseTimestamp
+        )
+        _ = await tracker.observe(
+            recordID: 1,
+            uploadedBytesForRecord: 50,
+            at: baseTimestamp.addingTimeInterval(0.5)
+        )
+        _ = await tracker.markCompleted(
+            recordID: 1,
+            at: baseTimestamp.addingTimeInterval(0.5)
+        )
+
+        _ = await tracker.observe(
+            recordID: 2,
+            uploadedBytesForRecord: 0,
+            at: baseTimestamp.addingTimeInterval(10)
+        )
+        let resumedRate = await tracker.observe(
+            recordID: 2,
+            uploadedBytesForRecord: 500,
+            at: baseTimestamp.addingTimeInterval(10.5)
+        )
+        XCTAssertGreaterThan(resumedRate, 200)
+    }
+
+    func testRunKeepsUploadRateVisibleAcrossSequentialUploads() async throws {
+        let sourceRoot = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        for index in 0..<3 {
+            let fileURL = sourceRoot.appendingPathComponent("file-\(index).txt")
+            let payload = Data(repeating: UInt8(index), count: 512 * 1_024)
+            try payload.write(to: fileURL)
+        }
+
+        let database = try makeDatabaseService()
+        let s3Client = ConcurrencyTrackingBackupEngineS3Client(putObjectDelayNanoseconds: 600_000_000)
+        let backupEngine = BackupEngine(
+            scanner: FileScanner(),
+            fileManager: .default,
+            database: database,
+            glacierClientFactory: { _, _, _, _, db in
+                GlacierClient(s3Client: s3Client, database: db)
+            }
+        )
+
+        let settings = AppState.Settings(
+            awsAccessKey: "access",
+            awsSecretKey: "secret",
+            awsRegion: "us-east-1",
+            bucket: "bucket",
+            sourcePath: sourceRoot.path,
+            maxConcurrentFileUploads: 1,
+            maxConcurrentMultipartPartUploads: 1
+        )
+        let job = await MainActor.run {
+            BackupJob(sourceRoot: sourceRoot.path, bucket: "bucket")
+        }
+
+        let runTask = Task {
+            try await backupEngine.run(job: job, settings: settings)
+        }
+
+        var observedNonZeroRate = false
+        for _ in 0..<100 {
+            let currentRate = await MainActor.run {
+                job.uploadBytesPerSecond
+            }
+            if currentRate > 0 {
+                observedNonZeroRate = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 40_000_000)
+        }
+
+        try await runTask.value
+
+        XCTAssertTrue(observedNonZeroRate)
+        await MainActor.run {
+            XCTAssertEqual(job.status, .completed)
+            XCTAssertEqual(job.uploadBytesPerSecond, 0)
+        }
+    }
+
     func testRunSkipsReuploadWhenRemoteObjectAlreadyMatches() async throws {
         let sourceRoot = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: sourceRoot) }
@@ -1819,6 +1943,7 @@ final class BackupEngineTests: XCTestCase {
             XCTAssertEqual(job.deferredUploadRetryPassCount, 1)
             XCTAssertNotNil(job.deferredUploadLastError)
             XCTAssertFalse(job.isRetryingDeferredUploads)
+            XCTAssertFalse(job.hasDeferredUploadIssues)
         }
     }
 

@@ -137,7 +137,7 @@ final class BackupJob: ObservableObject, Identifiable {
     }
 
     var hasDeferredUploadIssues: Bool {
-        deferredUploadFailureCount > 0 || deferredUploadPendingFiles > 0 || isRetryingDeferredUploads
+        deferredUploadPendingFiles > 0 || isRetryingDeferredUploads
     }
 
     func setScanTotals(fileCount: Int, byteCount: Int64) {

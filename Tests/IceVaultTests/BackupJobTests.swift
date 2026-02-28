@@ -172,9 +172,11 @@ final class BackupJobTests: XCTestCase {
 
         job.markDeferredRetryPassCompleted()
         XCTAssertFalse(job.isRetryingDeferredUploads)
+        XCTAssertTrue(job.hasDeferredUploadIssues)
 
         job.setDeferredUploadPendingFiles(0)
         XCTAssertEqual(job.deferredUploadPendingFiles, 0)
+        XCTAssertFalse(job.hasDeferredUploadIssues)
 
         job.resetDeferredUploadTelemetry()
         XCTAssertEqual(job.deferredUploadFailureCount, 0)
