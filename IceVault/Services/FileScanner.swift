@@ -34,6 +34,18 @@ class FileScanner: @unchecked Sendable {
         sourceRoot: String,
         onRecord: (FileRecord) throws -> Void
     ) throws {
+        try scan(
+            sourceRoot: sourceRoot,
+            includeHiddenFiles: true,
+            onRecord: onRecord
+        )
+    }
+
+    func scan(
+        sourceRoot: String,
+        includeHiddenFiles: Bool,
+        onRecord: (FileRecord) throws -> Void
+    ) throws {
         let rootURL = URL(fileURLWithPath: sourceRoot, isDirectory: true).standardizedFileURL
 
         try scanDirectory(
@@ -41,12 +53,25 @@ class FileScanner: @unchecked Sendable {
             rootURL: rootURL,
             sourceRoot: sourceRoot,
             keys: Self.resourceKeys,
+            includeHiddenFiles: includeHiddenFiles,
             onRecord: onRecord
         )
     }
 
     func scan(
         sourceRoot: String,
+        onRecord: @escaping (FileRecord) async throws -> Void
+    ) async throws {
+        try await scan(
+            sourceRoot: sourceRoot,
+            includeHiddenFiles: true,
+            onRecord: onRecord
+        )
+    }
+
+    func scan(
+        sourceRoot: String,
+        includeHiddenFiles: Bool,
         onRecord: @escaping (FileRecord) async throws -> Void
     ) async throws {
         let rootURL = URL(fileURLWithPath: sourceRoot, isDirectory: true).standardizedFileURL
@@ -56,13 +81,18 @@ class FileScanner: @unchecked Sendable {
             rootURL: rootURL,
             sourceRoot: sourceRoot,
             keys: Self.resourceKeys,
+            includeHiddenFiles: includeHiddenFiles,
             onRecord: onRecord
         )
     }
 
     func scan(sourceRoot: String) throws -> [FileRecord] {
+        try scan(sourceRoot: sourceRoot, includeHiddenFiles: true)
+    }
+
+    func scan(sourceRoot: String, includeHiddenFiles: Bool) throws -> [FileRecord] {
         var records: [FileRecord] = []
-        try scan(sourceRoot: sourceRoot) { record in
+        try scan(sourceRoot: sourceRoot, includeHiddenFiles: includeHiddenFiles) { record in
             records.append(record)
         }
 
@@ -75,6 +105,18 @@ class FileScanner: @unchecked Sendable {
         sourceRoot: String,
         onRecord: @escaping (FileRecord) async throws -> Void
     ) async throws {
+        try await scanMetadata(
+            sourceRoot: sourceRoot,
+            includeHiddenFiles: true,
+            onRecord: onRecord
+        )
+    }
+
+    func scanMetadata(
+        sourceRoot: String,
+        includeHiddenFiles: Bool,
+        onRecord: @escaping (FileRecord) async throws -> Void
+    ) async throws {
         let rootURL = URL(fileURLWithPath: sourceRoot, isDirectory: true).standardizedFileURL
 
         try await scanDirectoryMetadata(
@@ -82,6 +124,7 @@ class FileScanner: @unchecked Sendable {
             rootURL: rootURL,
             sourceRoot: sourceRoot,
             keys: Self.resourceKeys,
+            includeHiddenFiles: includeHiddenFiles,
             onRecord: onRecord
         )
     }
@@ -94,21 +137,43 @@ class FileScanner: @unchecked Sendable {
         sourceRoot: String,
         abortCheck: (() throws -> Void)? = nil
     ) throws -> InventoryStats {
-        let rootURL = URL(fileURLWithPath: sourceRoot, isDirectory: true).standardizedFileURL
-        return try inventoryStats(
-            at: rootURL,
-            keys: Self.resourceKeys,
+        try inventoryStats(
+            sourceRoot: sourceRoot,
+            includeHiddenFiles: true,
             abortCheck: abortCheck
         )
     }
 
-    private func shouldSkip(fileURL: URL) -> Bool {
-        fileURL.lastPathComponent == ".DS_Store"
+    func inventoryStats(
+        sourceRoot: String,
+        includeHiddenFiles: Bool,
+        abortCheck: (() throws -> Void)? = nil
+    ) throws -> InventoryStats {
+        let rootURL = URL(fileURLWithPath: sourceRoot, isDirectory: true).standardizedFileURL
+        return try inventoryStats(
+            at: rootURL,
+            keys: Self.resourceKeys,
+            includeHiddenFiles: includeHiddenFiles,
+            abortCheck: abortCheck
+        )
+    }
+
+    private func shouldSkip(fileURL: URL, includeHiddenFiles: Bool) -> Bool {
+        if fileURL.lastPathComponent == ".DS_Store" {
+            return true
+        }
+
+        if includeHiddenFiles {
+            return false
+        }
+
+        return fileURL.lastPathComponent.hasPrefix(".")
     }
 
     private func inventoryStats(
         at directoryURL: URL,
         keys: Set<URLResourceKey>,
+        includeHiddenFiles: Bool,
         abortCheck: (() throws -> Void)?
     ) throws -> InventoryStats {
         try abortCheck?()
@@ -130,7 +195,7 @@ class FileScanner: @unchecked Sendable {
         for entryURL in entries {
             try abortCheck?()
 
-            if shouldSkip(fileURL: entryURL) {
+            if shouldSkip(fileURL: entryURL, includeHiddenFiles: includeHiddenFiles) {
                 continue
             }
 
@@ -148,6 +213,7 @@ class FileScanner: @unchecked Sendable {
                 let nestedStats = try inventoryStats(
                     at: entryURL,
                     keys: keys,
+                    includeHiddenFiles: includeHiddenFiles,
                     abortCheck: abortCheck
                 )
                 stats = stats.adding(nestedStats)
@@ -175,6 +241,7 @@ class FileScanner: @unchecked Sendable {
         rootURL: URL,
         sourceRoot: String,
         keys: Set<URLResourceKey>,
+        includeHiddenFiles: Bool,
         onRecord: (FileRecord) throws -> Void
     ) throws {
         let entries: [URL]
@@ -194,7 +261,7 @@ class FileScanner: @unchecked Sendable {
         }
 
         for entryURL in sortedEntries {
-            if shouldSkip(fileURL: entryURL) {
+            if shouldSkip(fileURL: entryURL, includeHiddenFiles: includeHiddenFiles) {
                 continue
             }
 
@@ -214,6 +281,7 @@ class FileScanner: @unchecked Sendable {
                     rootURL: rootURL,
                     sourceRoot: sourceRoot,
                     keys: keys,
+                    includeHiddenFiles: includeHiddenFiles,
                     onRecord: onRecord
                 )
                 continue
@@ -250,6 +318,7 @@ class FileScanner: @unchecked Sendable {
         rootURL: URL,
         sourceRoot: String,
         keys: Set<URLResourceKey>,
+        includeHiddenFiles: Bool,
         onRecord: @escaping (FileRecord) async throws -> Void
     ) async throws {
         let entries: [URL]
@@ -269,7 +338,7 @@ class FileScanner: @unchecked Sendable {
         }
 
         for entryURL in sortedEntries {
-            if shouldSkip(fileURL: entryURL) {
+            if shouldSkip(fileURL: entryURL, includeHiddenFiles: includeHiddenFiles) {
                 continue
             }
 
@@ -289,6 +358,7 @@ class FileScanner: @unchecked Sendable {
                     rootURL: rootURL,
                     sourceRoot: sourceRoot,
                     keys: keys,
+                    includeHiddenFiles: includeHiddenFiles,
                     onRecord: onRecord
                 )
                 continue
@@ -322,6 +392,7 @@ class FileScanner: @unchecked Sendable {
         rootURL: URL,
         sourceRoot: String,
         keys: Set<URLResourceKey>,
+        includeHiddenFiles: Bool,
         onRecord: @escaping (FileRecord) async throws -> Void
     ) async throws {
         let entries: [URL]
@@ -341,7 +412,7 @@ class FileScanner: @unchecked Sendable {
         }
 
         for entryURL in sortedEntries {
-            if shouldSkip(fileURL: entryURL) {
+            if shouldSkip(fileURL: entryURL, includeHiddenFiles: includeHiddenFiles) {
                 continue
             }
 
@@ -361,6 +432,7 @@ class FileScanner: @unchecked Sendable {
                     rootURL: rootURL,
                     sourceRoot: sourceRoot,
                     keys: keys,
+                    includeHiddenFiles: includeHiddenFiles,
                     onRecord: onRecord
                 )
                 continue

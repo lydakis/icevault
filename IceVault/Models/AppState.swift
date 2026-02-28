@@ -64,6 +64,7 @@ final class AppState: ObservableObject {
         var scheduledBackupsEnabled: Bool = false
         var scheduleInterval: ScheduleInterval = .daily
         var customIntervalHours: Int = 24
+        var includeHiddenFiles: Bool = false
         var maxConcurrentFileUploads: Int = Settings.defaultMaxConcurrentFileUploads
         var maxConcurrentMultipartPartUploads: Int = Settings.defaultMaxConcurrentMultipartPartUploads
         var maxBufferedPendingPlans: Int? = Settings.defaultMaxBufferedPendingPlans
@@ -77,6 +78,7 @@ final class AppState: ObservableObject {
             case scheduledBackupsEnabled
             case scheduleInterval
             case customIntervalHours
+            case includeHiddenFiles
             case maxConcurrentFileUploads
             case maxConcurrentMultipartPartUploads
             case maxBufferedPendingPlans
@@ -94,6 +96,7 @@ final class AppState: ObservableObject {
             scheduledBackupsEnabled: Bool = false,
             scheduleInterval: ScheduleInterval = .daily,
             customIntervalHours: Int = 24,
+            includeHiddenFiles: Bool = false,
             maxConcurrentFileUploads: Int = Settings.defaultMaxConcurrentFileUploads,
             maxConcurrentMultipartPartUploads: Int = Settings.defaultMaxConcurrentMultipartPartUploads,
             maxBufferedPendingPlans: Int? = Settings.defaultMaxBufferedPendingPlans
@@ -109,6 +112,7 @@ final class AppState: ObservableObject {
             self.scheduledBackupsEnabled = scheduledBackupsEnabled
             self.scheduleInterval = scheduleInterval
             self.customIntervalHours = max(1, customIntervalHours)
+            self.includeHiddenFiles = includeHiddenFiles
             self.maxConcurrentFileUploads = Self.clampFileUploadConcurrency(maxConcurrentFileUploads)
             self.maxConcurrentMultipartPartUploads = Self.clampMultipartPartConcurrency(maxConcurrentMultipartPartUploads)
             self.maxBufferedPendingPlans = Self.clampBufferedPendingPlans(maxBufferedPendingPlans)
@@ -127,6 +131,7 @@ final class AppState: ObservableObject {
             scheduledBackupsEnabled = try container.decodeIfPresent(Bool.self, forKey: .scheduledBackupsEnabled) ?? false
             scheduleInterval = try container.decodeIfPresent(ScheduleInterval.self, forKey: .scheduleInterval) ?? .daily
             customIntervalHours = max(1, try container.decodeIfPresent(Int.self, forKey: .customIntervalHours) ?? 24)
+            includeHiddenFiles = try container.decodeIfPresent(Bool.self, forKey: .includeHiddenFiles) ?? false
             maxConcurrentFileUploads = Self.clampFileUploadConcurrency(
                 try container.decodeIfPresent(Int.self, forKey: .maxConcurrentFileUploads) ?? Self.defaultMaxConcurrentFileUploads
             )
@@ -149,6 +154,7 @@ final class AppState: ObservableObject {
             try container.encode(scheduledBackupsEnabled, forKey: .scheduledBackupsEnabled)
             try container.encode(scheduleInterval, forKey: .scheduleInterval)
             try container.encode(customIntervalHours, forKey: .customIntervalHours)
+            try container.encode(includeHiddenFiles, forKey: .includeHiddenFiles)
             try container.encode(maxConcurrentFileUploads, forKey: .maxConcurrentFileUploads)
             try container.encode(maxConcurrentMultipartPartUploads, forKey: .maxConcurrentMultipartPartUploads)
             try container.encodeIfPresent(maxBufferedPendingPlans, forKey: .maxBufferedPendingPlans)

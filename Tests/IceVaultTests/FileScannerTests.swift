@@ -4,7 +4,7 @@ import XCTest
 @testable import IceVault
 
 final class FileScannerTests: XCTestCase {
-    func testScanIncludesHiddenAndPackageFilesAndComputesSHA256() throws {
+    func testScanIncludesHiddenAndPackageFilesAndComputesSHA256WhenEnabled() throws {
         let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
@@ -26,7 +26,7 @@ final class FileScannerTests: XCTestCase {
         try Data("ignore".utf8).write(to: dsStoreFile)
 
         var records: [FileRecord] = []
-        try FileScanner().scan(sourceRoot: tempDirectory.path) { record in
+        try FileScanner().scan(sourceRoot: tempDirectory.path, includeHiddenFiles: true) { record in
             records.append(record)
         }
         let relativePaths = Set(records.map(\.relativePath))
@@ -40,6 +40,34 @@ final class FileScannerTests: XCTestCase {
         let visibleRecord = try XCTUnwrap(records.first(where: { $0.relativePath == "visible.txt" }))
         XCTAssertEqual(visibleRecord.sha256, sha256Hex(of: Data("hello".utf8)))
         XCTAssertEqual(visibleRecord.sha256.count, 64)
+    }
+
+    func testScanSkipsHiddenFilesWhenDisabled() throws {
+        let tempDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let visibleFile = tempDirectory.appendingPathComponent("visible.txt")
+        let hiddenFile = tempDirectory.appendingPathComponent(".hidden")
+        let hiddenDirectory = tempDirectory.appendingPathComponent(".config", isDirectory: true)
+        let hiddenNestedFile = hiddenDirectory.appendingPathComponent("settings.json")
+        let packageDirectory = tempDirectory.appendingPathComponent("Sample.app", isDirectory: true)
+        let packageNestedFile = packageDirectory.appendingPathComponent("Contents.txt")
+
+        try FileManager.default.createDirectory(at: hiddenDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: packageDirectory, withIntermediateDirectories: true)
+
+        try Data("hello".utf8).write(to: visibleFile)
+        try Data("secret".utf8).write(to: hiddenFile)
+        try Data("{}".utf8).write(to: hiddenNestedFile)
+        try Data("package-data".utf8).write(to: packageNestedFile)
+
+        let records = try FileScanner().scan(sourceRoot: tempDirectory.path, includeHiddenFiles: false)
+        let relativePaths = Set(records.map(\.relativePath))
+
+        XCTAssertTrue(relativePaths.contains("visible.txt"))
+        XCTAssertTrue(relativePaths.contains("Sample.app/Contents.txt"))
+        XCTAssertFalse(relativePaths.contains(".hidden"))
+        XCTAssertFalse(relativePaths.contains(".config/settings.json"))
     }
 
     func testStreamingScanPropagatesHandlerError() throws {
@@ -144,7 +172,7 @@ final class FileScannerTests: XCTestCase {
         XCTAssertEqual(arrayScan.map(\.sha256), sortedStreaming.map(\.sha256))
     }
 
-    func testInventoryStatsCountsFilesAndBytesWithoutHashes() throws {
+    func testInventoryStatsCountsFilesAndBytesWithoutHashesWhenEnabled() throws {
         let tempDirectory = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
@@ -165,12 +193,40 @@ final class FileScannerTests: XCTestCase {
         try Data("package-data".utf8).write(to: packageNestedFile)
         try Data("ignore".utf8).write(to: dsStoreFile)
 
-        let stats = try FileScanner().inventoryStats(sourceRoot: tempDirectory.path)
+        let stats = try FileScanner().inventoryStats(sourceRoot: tempDirectory.path, includeHiddenFiles: true)
 
         XCTAssertEqual(stats.fileCount, 4)
         XCTAssertEqual(
             stats.totalBytes,
             Int64("hello".utf8.count + "secret".utf8.count + "{}".utf8.count + "package-data".utf8.count)
+        )
+    }
+
+    func testInventoryStatsSkipsHiddenFilesWhenDisabled() throws {
+        let tempDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let visibleFile = tempDirectory.appendingPathComponent("visible.txt")
+        let hiddenFile = tempDirectory.appendingPathComponent(".hidden")
+        let hiddenDirectory = tempDirectory.appendingPathComponent(".config", isDirectory: true)
+        let hiddenNestedFile = hiddenDirectory.appendingPathComponent("settings.json")
+        let packageDirectory = tempDirectory.appendingPathComponent("Sample.app", isDirectory: true)
+        let packageNestedFile = packageDirectory.appendingPathComponent("Contents.txt")
+
+        try FileManager.default.createDirectory(at: hiddenDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: packageDirectory, withIntermediateDirectories: true)
+
+        try Data("hello".utf8).write(to: visibleFile)
+        try Data("secret".utf8).write(to: hiddenFile)
+        try Data("{}".utf8).write(to: hiddenNestedFile)
+        try Data("package-data".utf8).write(to: packageNestedFile)
+
+        let stats = try FileScanner().inventoryStats(sourceRoot: tempDirectory.path, includeHiddenFiles: false)
+
+        XCTAssertEqual(stats.fileCount, 2)
+        XCTAssertEqual(
+            stats.totalBytes,
+            Int64("hello".utf8.count + "package-data".utf8.count)
         )
     }
 

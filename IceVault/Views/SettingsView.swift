@@ -38,211 +38,228 @@ struct SettingsView: View {
         "sa-east-1"
     ]
 
+    private static let cardCornerRadius: CGFloat = 16
+
     var body: some View {
-        Form {
-            Section("AWS Authentication") {
-                Picker("Authentication Method", selection: $draft.authenticationMethod) {
-                    ForEach(AppState.Settings.AuthenticationMethod.allCases) { method in
-                        Text(method.displayName).tag(method)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                settingsHeaderCard
+
+                settingsCard(title: "AWS Authentication", systemImage: "lock.shield") {
+                    Picker("Authentication Method", selection: $draft.authenticationMethod) {
+                        ForEach(AppState.Settings.AuthenticationMethod.allCases) { method in
+                            Text(method.displayName).tag(method)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    if draft.authenticationMethod == .ssoProfile {
+                        TextField("SSO Profile Name", text: $draft.ssoProfileName)
+
+                        HStack(spacing: 10) {
+                            Button("Login") {
+                                loginToSSOProfile()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(isRunningSSOLogin || trimmed(draft.ssoProfileName).isEmpty)
+
+                            if isRunningSSOLogin {
+                                ProgressView()
+                                    .controlSize(.small)
+                            }
+
+                            Spacer()
+                        }
+
+                        Text(ssoStatusDescription)
+                            .font(.caption)
+                            .foregroundStyle(ssoStatusColor)
+
+                        if let ssoLoginMessage {
+                            Text(ssoLoginMessage)
+                                .font(.caption)
+                                .foregroundStyle(ssoLoginSucceeded ? .green : .red)
+                        }
+
+                        Text("Run `aws configure sso --profile <name>` once before first login.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        TextField("Access Key ID", text: $accessKey)
+                            .textContentType(.username)
+
+                        SecureField("Secret Access Key", text: $secretKey)
+                            .textContentType(.password)
+
+                        Text("Saved credentials are stored in macOS Keychain.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if let detectedCredentialSource {
+                        Text(detectedCredentialSource.settingsDescription)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("No credentials detected.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if let detectedCredentialExpiry {
+                        Text("Detected credentials expire at \(detectedCredentialExpiry.formatted(date: .abbreviated, time: .shortened)).")
+                            .font(.caption)
+                            .foregroundStyle(detectedCredentialExpiry > Date() ? Color.secondary : Color.red)
                     }
                 }
-                .pickerStyle(.segmented)
 
-                if draft.authenticationMethod == .ssoProfile {
-                    TextField("SSO Profile Name", text: $draft.ssoProfileName)
+                settingsCard(title: "Storage Target", systemImage: "shippingbox") {
+                    TextField("Bucket Name", text: $draft.bucket)
 
-                    HStack(spacing: 10) {
-                        Button("Login") {
-                            loginToSSOProfile()
+                    Picker("Region", selection: $draft.awsRegion) {
+                        ForEach(regionOptions, id: \.self) { region in
+                            Text(region).tag(region)
                         }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(isRunningSSOLogin || trimmed(draft.ssoProfileName).isEmpty)
+                    }
+                    .pickerStyle(.menu)
+                }
 
-                        if isRunningSSOLogin {
+                settingsCard(title: "Source & Filters", systemImage: "folder.badge.gearshape") {
+                    HStack(alignment: .top, spacing: 10) {
+                        Text(draft.sourcePath.isEmpty ? "No folder selected" : draft.sourcePath)
+                            .font(.subheadline)
+                            .foregroundStyle(draft.sourcePath.isEmpty ? .secondary : .primary)
+                            .lineLimit(2)
+                            .textSelection(.enabled)
+
+                        Spacer()
+
+                        Button("Choose Folder…") {
+                            chooseSourceFolder()
+                        }
+                    }
+
+                    Toggle("Include hidden files and folders (dotfiles)", isOn: $draft.includeHiddenFiles)
+                    Text(draft.includeHiddenFiles
+                        ? "Hidden dotfiles are included in backup scans."
+                        : "Hidden dotfiles are ignored by default to avoid backing up local app metadata.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                settingsCard(title: "Transfer Performance", systemImage: "speedometer") {
+                    Stepper(
+                        value: $draft.maxConcurrentFileUploads,
+                        in: AppState.Settings.minimumUploadConcurrency...AppState.Settings.maximumConcurrentFileUploads
+                    ) {
+                        Text("Concurrent File Uploads: \(draft.maxConcurrentFileUploads)")
+                    }
+
+                    Stepper(
+                        value: $draft.maxConcurrentMultipartPartUploads,
+                        in: AppState.Settings.minimumUploadConcurrency...AppState.Settings.maximumConcurrentMultipartPartUploads
+                    ) {
+                        Text("Multipart Parts Per File: \(draft.maxConcurrentMultipartPartUploads)")
+                    }
+
+                    Toggle("Auto-Tune Scan Buffer", isOn: autoTuneScanBufferBinding)
+                        .help("Automatically sizes the scan-to-upload pending file buffer based on upload concurrency.")
+
+                    if draft.maxBufferedPendingPlans != nil {
+                        Stepper(
+                            value: maxBufferedPendingPlansBinding,
+                            in: AppState.Settings.minimumBufferedPendingPlans...AppState.Settings.maximumBufferedPendingPlans,
+                            step: AppState.Settings.minimumBufferedPendingPlans
+                        ) {
+                            Text("Max Buffered Pending Files: \(draft.maxBufferedPendingPlans ?? AppState.Settings.defaultManualMaxBufferedPendingPlans)")
+                        }
+                        .help("Caps how many pending files can be queued between scanning and uploading to bound memory use.")
+                    }
+
+                    Text("Higher values can increase throughput but may saturate network bandwidth or trigger S3 throttling.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                settingsCard(title: "Scheduling", systemImage: "clock.arrow.circlepath") {
+                    Toggle("Scheduled Backups", isOn: $draft.scheduledBackupsEnabled)
+
+                    if draft.scheduledBackupsEnabled {
+                        Picker("Interval", selection: $draft.scheduleInterval) {
+                            ForEach(AppState.Settings.ScheduleInterval.allCases) { interval in
+                                Text(interval.displayName).tag(interval)
+                            }
+                        }
+                        .pickerStyle(.menu)
+
+                        if draft.scheduleInterval == .customHours {
+                            Stepper(value: $draft.customIntervalHours, in: 1...168) {
+                                Text("Every \(draft.customIntervalHours) hour\(draft.customIntervalHours == 1 ? "" : "s")")
+                            }
+                        }
+
+                        Text("LaunchAgent: ~/Library/LaunchAgents/com.icevault.backup.plist")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Text(scheduleInstalled ? "LaunchAgent is installed." : "LaunchAgent is not installed.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                settingsCard(title: "Actions", systemImage: "checkmark.seal") {
+                    HStack(spacing: 10) {
+                        Button("Test Connection") {
+                            testConnection()
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(isTestingConnection)
+
+                        if isTestingConnection {
                             ProgressView()
                                 .controlSize(.small)
                         }
 
                         Spacer()
+
+                        Button("Save") {
+                            saveSettings()
+                        }
+                        .buttonStyle(.borderedProminent)
                     }
 
-                    Text(ssoStatusDescription)
-                        .font(.caption)
-                        .foregroundStyle(ssoStatusColor)
-
-                    if let ssoLoginMessage {
-                        Text(ssoLoginMessage)
+                    if let connectionMessage {
+                        Text(connectionMessage)
                             .font(.caption)
-                            .foregroundStyle(ssoLoginSucceeded ? .green : .red)
+                            .foregroundStyle(connectionSucceeded ? .green : .red)
                     }
 
-                    Text("Run `aws configure sso --profile <name>` once before first login.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    TextField("Access Key ID", text: $accessKey)
-                        .textContentType(.username)
-
-                    SecureField("Secret Access Key", text: $secretKey)
-                        .textContentType(.password)
-
-                    Text("Saved credentials are stored in macOS Keychain.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                if let detectedCredentialSource {
-                    Text(detectedCredentialSource.settingsDescription)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("No credentials detected.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                if let detectedCredentialExpiry {
-                    Text("Detected credentials expire at \(detectedCredentialExpiry.formatted(date: .abbreviated, time: .shortened)).")
-                        .font(.caption)
-                        .foregroundStyle(detectedCredentialExpiry > Date() ? Color.secondary : Color.red)
-                }
-            }
-
-            Section("Storage") {
-                TextField("Bucket Name", text: $draft.bucket)
-
-                Picker("Region", selection: $draft.awsRegion) {
-                    ForEach(regionOptions, id: \.self) { region in
-                        Text(region).tag(region)
+                    if let saveMessage {
+                        Text(saveMessage)
+                            .font(.caption)
+                            .foregroundStyle(saveSucceeded ? .green : .red)
                     }
-                }
-                .pickerStyle(.menu)
-            }
 
-            Section("Source") {
-                HStack(alignment: .top, spacing: 10) {
-                    Text(draft.sourcePath.isEmpty ? "No folder selected" : draft.sourcePath)
-                        .font(.subheadline)
-                        .foregroundStyle(draft.sourcePath.isEmpty ? .secondary : .primary)
-                        .lineLimit(2)
-                        .textSelection(.enabled)
-
-                    Spacer()
-
-                    Button("Choose Folder…") {
-                        chooseSourceFolder()
+                    if let savedAt {
+                        Text("Last saved \(savedAt.formatted(date: .abbreviated, time: .shortened))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
-
-            Section("Performance") {
-                Stepper(
-                    value: $draft.maxConcurrentFileUploads,
-                    in: AppState.Settings.minimumUploadConcurrency...AppState.Settings.maximumConcurrentFileUploads
-                ) {
-                    Text("Concurrent File Uploads: \(draft.maxConcurrentFileUploads)")
-                }
-
-                Stepper(
-                    value: $draft.maxConcurrentMultipartPartUploads,
-                    in: AppState.Settings.minimumUploadConcurrency...AppState.Settings.maximumConcurrentMultipartPartUploads
-                ) {
-                    Text("Multipart Parts Per File: \(draft.maxConcurrentMultipartPartUploads)")
-                }
-
-                Toggle("Auto-Tune Scan Buffer", isOn: autoTuneScanBufferBinding)
-                    .help("Automatically sizes the scan-to-upload pending file buffer based on upload concurrency.")
-
-                if draft.maxBufferedPendingPlans != nil {
-                    Stepper(
-                        value: maxBufferedPendingPlansBinding,
-                        in: AppState.Settings.minimumBufferedPendingPlans...AppState.Settings.maximumBufferedPendingPlans,
-                        step: AppState.Settings.minimumBufferedPendingPlans
-                    ) {
-                        Text("Max Buffered Pending Files: \(draft.maxBufferedPendingPlans ?? AppState.Settings.defaultManualMaxBufferedPendingPlans)")
-                    }
-                    .help("Caps how many pending files can be queued between scanning and uploading to bound memory use.")
-                }
-
-                Text("Higher values can increase throughput but may saturate network bandwidth or trigger S3 throttling.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                Text("Scan buffer tuning: lower cap = lower memory, higher cap = more scan-ahead.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section("Scheduling") {
-                Toggle("Scheduled Backups", isOn: $draft.scheduledBackupsEnabled)
-
-                if draft.scheduledBackupsEnabled {
-                    Picker("Interval", selection: $draft.scheduleInterval) {
-                        ForEach(AppState.Settings.ScheduleInterval.allCases) { interval in
-                            Text(interval.displayName).tag(interval)
-                        }
-                    }
-                    .pickerStyle(.menu)
-
-                    if draft.scheduleInterval == .customHours {
-                        Stepper(value: $draft.customIntervalHours, in: 1...168) {
-                            Text("Every \(draft.customIntervalHours) hour\(draft.customIntervalHours == 1 ? "" : "s")")
-                        }
-                    }
-
-                    Text("LaunchAgent: ~/Library/LaunchAgents/com.icevault.backup.plist")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                Text(scheduleInstalled ? "LaunchAgent is installed." : "LaunchAgent is not installed.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section {
-                HStack(spacing: 10) {
-                    Button("Test Connection") {
-                        testConnection()
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(isTestingConnection)
-
-                    if isTestingConnection {
-                        ProgressView()
-                            .controlSize(.small)
-                    }
-
-                    Spacer()
-
-                    Button("Save") {
-                        saveSettings()
-                    }
-                    .buttonStyle(.borderedProminent)
-                }
-
-                if let connectionMessage {
-                    Text(connectionMessage)
-                        .font(.caption)
-                        .foregroundStyle(connectionSucceeded ? .green : .red)
-                }
-
-                if let saveMessage {
-                    Text(saveMessage)
-                        .font(.caption)
-                        .foregroundStyle(saveSucceeded ? .green : .red)
-                }
-
-                if let savedAt {
-                    Text("Last saved \(savedAt.formatted(date: .abbreviated, time: .shortened))")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
+            .padding(20)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .formStyle(.grouped)
-        .padding()
-        .frame(minWidth: 560)
+        .background(
+            LinearGradient(
+                colors: [Color(nsColor: .windowBackgroundColor), Color.accentColor.opacity(0.08)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+        .frame(minWidth: 640, minHeight: 680)
+        .animation(.easeInOut(duration: 0.18), value: draft.authenticationMethod)
         .onAppear {
             loadDraft()
         }
@@ -257,6 +274,87 @@ struct SettingsView: View {
         .onChange(of: draft.awsRegion) { _, _ in
             applyDetectedCredentials(prefillFields: false)
         }
+    }
+
+    private var settingsHeaderCard: some View {
+        HStack(alignment: .top) {
+            HStack(spacing: 12) {
+                Image(systemName: "slider.horizontal.3")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .frame(width: 36, height: 36)
+                    .background(Color.accentColor.opacity(0.14), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("IceVault Settings")
+                        .font(.title2.weight(.semibold))
+                    Text("Configure backup behavior, credentials, and schedule.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Spacer()
+
+            VStack(alignment: .trailing, spacing: 4) {
+                metadataPill(
+                    text: scheduleInstalled ? "Scheduler Installed" : "Scheduler Not Installed",
+                    color: scheduleInstalled ? .green : .secondary
+                )
+                if let savedAt {
+                    metadataPill(
+                        text: "Saved \(savedAt.formatted(date: .omitted, time: .shortened))",
+                        color: .secondary
+                    )
+                }
+            }
+        }
+        .padding(18)
+        .background(cardSurface, in: RoundedRectangle(cornerRadius: Self.cardCornerRadius, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: Self.cardCornerRadius, style: .continuous)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.28), lineWidth: 0.8)
+        }
+    }
+
+    @ViewBuilder
+    private func settingsCard<Content: View>(
+        title: String,
+        systemImage: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 10) {
+                Image(systemName: systemImage)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .frame(width: 24)
+                Text(title)
+                    .font(.headline)
+            }
+            content()
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(cardSurface, in: RoundedRectangle(cornerRadius: Self.cardCornerRadius, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: Self.cardCornerRadius, style: .continuous)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.24), lineWidth: 0.8)
+        }
+    }
+
+    private var cardSurface: Color {
+        Color(nsColor: .controlBackgroundColor).opacity(0.96)
+    }
+
+    @ViewBuilder
+    private func metadataPill(text: String, color: Color) -> some View {
+        Text(text)
+            .font(.caption.weight(.medium))
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .foregroundStyle(color)
+            .background(color.opacity(0.12), in: Capsule())
     }
 
     private var regionOptions: [String] {
@@ -356,6 +454,7 @@ struct SettingsView: View {
             normalizedSettings.ssoProfileName = trimmed(draft.ssoProfileName)
             normalizedSettings.sourcePath = trimmed(draft.sourcePath)
             normalizedSettings.customIntervalHours = min(max(draft.customIntervalHours, 1), 168)
+            normalizedSettings.includeHiddenFiles = draft.includeHiddenFiles
             normalizedSettings.maxConcurrentFileUploads = AppState.Settings.clampFileUploadConcurrency(draft.maxConcurrentFileUploads)
             normalizedSettings.maxConcurrentMultipartPartUploads = AppState.Settings.clampMultipartPartConcurrency(draft.maxConcurrentMultipartPartUploads)
             normalizedSettings.maxBufferedPendingPlans = AppState.Settings.clampBufferedPendingPlans(draft.maxBufferedPendingPlans)

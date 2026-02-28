@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct HistoryView: View {
@@ -21,68 +22,155 @@ struct HistoryView: View {
     }()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("Backup History")
-                    .font(.title3.weight(.semibold))
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Backup History")
+                            .font(.title2.weight(.semibold))
+                        Text("Recent jobs, outcomes, and transfer stats.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
+
+                    Button("Clear History") {
+                        appState.clearHistory()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(appState.history.isEmpty)
+                }
+
+                historySummaryCards
+
+                if appState.history.isEmpty {
+                    ContentUnavailableView(
+                        "No Backups Yet",
+                        systemImage: "clock.arrow.trianglehead.counterclockwise.rotate.90",
+                        description: Text("Run Backup Now to record your first backup job.")
+                    )
+                    .frame(maxWidth: .infinity, minHeight: 220)
+                    .background(
+                        Color(nsColor: .controlBackgroundColor),
+                        in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    )
+                } else {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        ForEach(Array(appState.history.prefix(100))) { entry in
+                            historyEntryCard(entry)
+                        }
+                    }
+                }
+            }
+            .padding(18)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .background(
+            LinearGradient(
+                colors: [Color(nsColor: .windowBackgroundColor), Color.accentColor.opacity(0.05)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+    }
+
+    private var historySummaryCards: some View {
+        let recentEntries = Array(appState.history.prefix(100))
+        let completedCount = recentEntries.filter { $0.status == .completed }.count
+        let failedCount = recentEntries.filter { $0.status == .failed }.count
+        let totalBytesUploaded = recentEntries.reduce(0) { partial, entry in
+            partial + max(entry.bytesUploaded, 0)
+        }
+
+        return HStack(spacing: 10) {
+            summaryCard(
+                title: "Completed",
+                value: formattedCount(completedCount),
+                systemImage: "checkmark.circle.fill",
+                color: .green
+            )
+            summaryCard(
+                title: "Failed",
+                value: formattedCount(failedCount),
+                systemImage: "xmark.circle.fill",
+                color: .red
+            )
+            summaryCard(
+                title: "Data Uploaded",
+                value: formattedBytes(totalBytesUploaded),
+                systemImage: "tray.full.fill",
+                color: .blue
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func summaryCard(
+        title: String,
+        value: String,
+        systemImage: String,
+        color: Color
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label(title, systemImage: systemImage)
+                .font(.caption)
+                .foregroundStyle(color)
+            Text(value)
+                .font(.title3.weight(.semibold))
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    @ViewBuilder
+    private func historyEntryCard(_ entry: BackupHistoryEntry) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(entry.displayDate.formatted(date: .abbreviated, time: .shortened))
+                        .font(.headline)
+                    Text(entry.sourceRoot)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
 
                 Spacer()
 
-                Button("Clear History") {
-                    appState.clearHistory()
-                }
-                .buttonStyle(.bordered)
-                .disabled(appState.history.isEmpty)
+                statusBadge(for: entry.status)
             }
 
-            if appState.history.isEmpty {
-                ContentUnavailableView(
-                    "No Backups Yet",
-                    systemImage: "clock.arrow.trianglehead.counterclockwise.rotate.90",
-                    description: Text("Run Backup Now to record your first backup job.")
+            HStack(spacing: 14) {
+                Label("\(formattedCount(entry.filesUploaded)) files", systemImage: "doc")
+                Label(formattedBytes(entry.bytesUploaded), systemImage: "externaldrive")
+                Label(formattedDuration(entry.duration), systemImage: "timer")
+            }
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+
+            if entry.deferredUploadPendingFiles > 0 {
+                Label(
+                    "Deferred pending uploads: \(formattedCount(entry.deferredUploadPendingFiles))",
+                    systemImage: "arrow.triangle.2.circlepath.circle.fill"
                 )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                List(Array(appState.history.prefix(100))) { entry in
-                    HStack(alignment: .top, spacing: 12) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(entry.displayDate.formatted(date: .abbreviated, time: .shortened))
-                                .font(.headline)
+                .font(.subheadline)
+                .foregroundStyle(.orange)
+            }
 
-                            Text("Duration: \(formattedDuration(entry.duration))")
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-
-                            Text("\(formattedCount(entry.filesUploaded)) files uploaded")
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-
-                            Text("\(formattedBytes(entry.bytesUploaded)) uploaded")
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-
-                            if entry.deferredUploadPendingFiles > 0 {
-                                Text("Deferred pending uploads: \(formattedCount(entry.deferredUploadPendingFiles))")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.orange)
-                            }
-
-                            if entry.deferredUploadFailureCount > 0 {
-                                Text("Recoverable upload errors: \(formattedCount(entry.deferredUploadFailureCount))")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.orange)
-                            }
-                        }
-
-                        Spacer()
-
-                        statusBadge(for: entry.status)
-                    }
-                    .padding(.vertical, 4)
-                }
-                .listStyle(.inset)
+            if entry.deferredUploadFailureCount > 0 {
+                Label(
+                    "Recoverable upload errors: \(formattedCount(entry.deferredUploadFailureCount))",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.subheadline)
+                .foregroundStyle(.orange)
             }
         }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
     private func formattedCount(_ value: Int) -> String {

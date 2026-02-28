@@ -492,6 +492,7 @@ final class BackupEngine: @unchecked Sendable {
             do {
                 discoveryEstimate = try scanner.inventoryStats(
                     sourceRoot: sourceRoot,
+                    includeHiddenFiles: settings.includeHiddenFiles,
                     abortCheck: { try Task.checkCancellation() }
                 )
             } catch is CancellationError {
@@ -553,7 +554,10 @@ final class BackupEngine: @unchecked Sendable {
                         var discoveredByteCount: Int64 = 0
                         let initialFlushBatchSize = max(1, min(Self.scanSyncBatchSize, settings.maxConcurrentFileUploads))
 
-                        try await scanner.scanMetadata(sourceRoot: sourceRoot) { record in
+                        try await scanner.scanMetadata(
+                            sourceRoot: sourceRoot,
+                            includeHiddenFiles: settings.includeHiddenFiles
+                        ) { record in
                             try Task.checkCancellation()
                             try uploadLoopFailureSignal.throwIfFailed()
                             discoveredFileCount += 1

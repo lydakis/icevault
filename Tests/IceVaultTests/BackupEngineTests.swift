@@ -184,6 +184,88 @@ final class BackupEngineTests: XCTestCase {
         XCTAssertNotNil(stored.first?.uploadedAt)
     }
 
+    func testRunSkipsHiddenFilesByDefault() async throws {
+        let sourceRoot = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        try Data("visible".utf8).write(to: sourceRoot.appendingPathComponent("visible.txt"))
+        try Data("hidden".utf8).write(to: sourceRoot.appendingPathComponent(".hidden"))
+        try FileManager.default.createDirectory(
+            at: sourceRoot.appendingPathComponent(".config"),
+            withIntermediateDirectories: true
+        )
+        try Data("nested-hidden".utf8).write(to: sourceRoot.appendingPathComponent(".config/settings.json"))
+
+        let database = try makeDatabaseService()
+        let mockS3 = MockBackupEngineS3Client()
+        let backupEngine = BackupEngine(
+            scanner: FileScanner(),
+            fileManager: .default,
+            database: database,
+            glacierClientFactory: { _, _, _, _, db in
+                GlacierClient(s3Client: mockS3, database: db)
+            }
+        )
+
+        let settings = AppState.Settings(
+            awsAccessKey: "access",
+            awsSecretKey: "secret",
+            awsRegion: "us-east-1",
+            bucket: "bucket",
+            sourcePath: sourceRoot.path
+        )
+        let job = await MainActor.run {
+            BackupJob(sourceRoot: sourceRoot.path, bucket: "bucket")
+        }
+
+        try await backupEngine.run(job: job, settings: settings)
+
+        XCTAssertEqual(mockS3.putObjectInputs.compactMap(\.key), ["visible.txt"])
+    }
+
+    func testRunIncludesHiddenFilesWhenEnabled() async throws {
+        let sourceRoot = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        try Data("visible".utf8).write(to: sourceRoot.appendingPathComponent("visible.txt"))
+        try Data("hidden".utf8).write(to: sourceRoot.appendingPathComponent(".hidden"))
+        try FileManager.default.createDirectory(
+            at: sourceRoot.appendingPathComponent(".config"),
+            withIntermediateDirectories: true
+        )
+        try Data("nested-hidden".utf8).write(to: sourceRoot.appendingPathComponent(".config/settings.json"))
+
+        let database = try makeDatabaseService()
+        let mockS3 = MockBackupEngineS3Client()
+        let backupEngine = BackupEngine(
+            scanner: FileScanner(),
+            fileManager: .default,
+            database: database,
+            glacierClientFactory: { _, _, _, _, db in
+                GlacierClient(s3Client: mockS3, database: db)
+            }
+        )
+
+        let settings = AppState.Settings(
+            awsAccessKey: "access",
+            awsSecretKey: "secret",
+            awsRegion: "us-east-1",
+            bucket: "bucket",
+            sourcePath: sourceRoot.path,
+            includeHiddenFiles: true
+        )
+        let job = await MainActor.run {
+            BackupJob(sourceRoot: sourceRoot.path, bucket: "bucket")
+        }
+
+        try await backupEngine.run(job: job, settings: settings)
+
+        XCTAssertEqual(
+            Set(mockS3.putObjectInputs.compactMap(\.key)),
+            Set(["visible.txt", ".hidden", ".config/settings.json"])
+        )
+    }
+
     func testRunClearsUploadRateAfterAllTransfersFinish() async throws {
         let sourceRoot = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: sourceRoot) }
@@ -2478,6 +2560,7 @@ private final class StreamingOnlyFileScanner: FileScanner, @unchecked Sendable {
 
     override func scanMetadata(
         sourceRoot: String,
+        includeHiddenFiles _: Bool,
         onRecord: @escaping (FileRecord) async throws -> Void
     ) async throws {
         metadataScanCallCount += 1
@@ -2563,6 +2646,7 @@ private final class GatedAfterFirstRecordScanner: FileScanner, @unchecked Sendab
 
     override func scanMetadata(
         sourceRoot: String,
+        includeHiddenFiles _: Bool,
         onRecord: @escaping (FileRecord) async throws -> Void
     ) async throws {
         guard !records.isEmpty else {
@@ -2635,6 +2719,7 @@ private final class CompletionSignalingStreamingScanner: FileScanner, @unchecked
 
     override func scanMetadata(
         sourceRoot: String,
+        includeHiddenFiles _: Bool,
         onRecord: @escaping (FileRecord) async throws -> Void
     ) async throws {
         defer { scanCompletionSemaphore.signal() }

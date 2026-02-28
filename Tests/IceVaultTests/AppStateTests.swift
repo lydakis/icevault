@@ -188,6 +188,7 @@ final class AppStateTests: XCTestCase {
             scheduledBackupsEnabled: true,
             scheduleInterval: .customHours,
             customIntervalHours: 0,
+            includeHiddenFiles: true,
             maxConcurrentFileUploads: 0,
             maxConcurrentMultipartPartUploads: 999,
             maxBufferedPendingPlans: 1
@@ -204,6 +205,7 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(decoded.bucket, "bucket")
         XCTAssertEqual(decoded.sourcePath, "/tmp/source")
         XCTAssertEqual(decoded.customIntervalHours, 1)
+        XCTAssertTrue(decoded.includeHiddenFiles)
         XCTAssertEqual(decoded.maxConcurrentFileUploads, AppState.Settings.minimumUploadConcurrency)
         XCTAssertEqual(
             decoded.maxConcurrentMultipartPartUploads,
