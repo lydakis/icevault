@@ -105,6 +105,21 @@ final class BackupJob: ObservableObject, Identifiable {
         return min(1, Double(bytesUploaded) / Double(bytesTotal))
     }
 
+    /// Primary progress for the menu bar: prefer full-scope inventory progress when available.
+    var primaryProgressFraction: Double {
+        if let discoveryEstimatedBytes, discoveryEstimatedBytes > 0 {
+            let boundedDiscoveredBytes = min(max(discoveredBytes, 0), discoveryEstimatedBytes)
+            return min(1, Double(boundedDiscoveredBytes) / Double(discoveryEstimatedBytes))
+        }
+
+        if let discoveryEstimatedFiles, discoveryEstimatedFiles > 0 {
+            let boundedDiscoveredFiles = min(max(discoveredFiles, 0), discoveryEstimatedFiles)
+            return min(1, Double(boundedDiscoveredFiles) / Double(discoveryEstimatedFiles))
+        }
+
+        return fileProgressFraction
+    }
+
     var discoveryFilesPerSecond: Double {
         Double(discoveredFiles) / runtimeDuration
     }

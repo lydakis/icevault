@@ -353,28 +353,39 @@ final class BackupEngine: @unchecked Sendable {
             let previousUploadedBytes = uploadedBytesByRecordID[recordID]
             activeUploadRecordIDs.insert(recordID)
 
+            if lastTimestamp == nil {
+                lastTimestamp = timestamp
+                lastTransferredBytes = totalTransferredBytes
+            }
+
+            let transferredDelta: Int64
             if let previousUploadedBytes {
-                let transferredDelta = max(0, normalizedUploadedBytes - previousUploadedBytes)
-                totalTransferredBytes += transferredDelta
+                transferredDelta = max(0, normalizedUploadedBytes - previousUploadedBytes)
                 uploadedBytesByRecordID[recordID] = max(previousUploadedBytes, normalizedUploadedBytes)
             } else {
                 // The first progress callback can include resumed bytes from a prior run.
                 uploadedBytesByRecordID[recordID] = normalizedUploadedBytes
+                transferredDelta = 0
             }
+
+            // Ignore zero-byte callbacks for throughput math; they represent state changes,
+            // not network transfer, and would otherwise skew elapsed-time sampling.
+            guard transferredDelta > 0 else {
+                return smoothedBytesPerSecond
+            }
+
+            totalTransferredBytes += transferredDelta
 
             guard let lastTimestamp else {
-                self.lastTimestamp = timestamp
-                lastTransferredBytes = totalTransferredBytes
-                return 0
+                return smoothedBytesPerSecond
             }
-
             let elapsed = timestamp.timeIntervalSince(lastTimestamp)
             guard elapsed > 0 else {
                 return smoothedBytesPerSecond
             }
 
-            let transferredDelta = max(0, totalTransferredBytes - lastTransferredBytes)
-            let instantaneousBytesPerSecond = Double(transferredDelta) / elapsed
+            let transferredSinceLastSample = max(0, totalTransferredBytes - lastTransferredBytes)
+            let instantaneousBytesPerSecond = Double(transferredSinceLastSample) / elapsed
             if smoothedBytesPerSecond <= 0 {
                 smoothedBytesPerSecond = instantaneousBytesPerSecond
             } else {

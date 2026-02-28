@@ -17,6 +17,35 @@ final class BackupJobTests: XCTestCase {
         XCTAssertEqual(job.byteProgressFraction, 1)
     }
 
+    func testPrimaryProgressFractionPrefersDiscoveryEstimateTotals() {
+        let job = BackupJob(
+            sourceRoot: "/tmp/source",
+            bucket: "bucket",
+            filesTotal: 2,
+            filesUploaded: 1,
+            bytesTotal: 200,
+            bytesUploaded: 100
+        )
+
+        job.setDiscoveryEstimate(fileCount: 1_000, byteCount: 4_000)
+        job.markDiscovered(fileCount: 250, byteCount: 1_000)
+
+        XCTAssertEqual(job.fileProgressFraction, 0.5)
+        XCTAssertEqual(job.primaryProgressFraction, 0.25)
+    }
+
+    func testPrimaryProgressFractionFallsBackToUploadProgressWithoutEstimate() {
+        let job = BackupJob(
+            sourceRoot: "/tmp/source",
+            bucket: "bucket",
+            filesTotal: 10,
+            filesUploaded: 4
+        )
+
+        XCTAssertEqual(job.primaryProgressFraction, job.fileProgressFraction)
+        XCTAssertEqual(job.primaryProgressFraction, 0.4)
+    }
+
     func testSetScanTotalsClampsNegativeValuesAndResetsProgress() {
         let job = BackupJob(
             sourceRoot: "/tmp/source",

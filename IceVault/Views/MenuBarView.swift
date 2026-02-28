@@ -92,30 +92,31 @@ struct MenuBarView: View {
 
     private func runningBackupContent(job: BackupJob) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            ProgressView(value: job.fileProgressFraction)
+            ProgressView(value: job.primaryProgressFraction)
 
-            Text("\(formattedCount(job.filesUploaded)) / \(formattedCount(job.filesTotal)) files")
+            Text(scopeFileProgressText(for: job))
                 .font(.subheadline)
+                .monospacedDigit()
 
-            Text("\(formattedBytes(job.bytesUploaded)) / \(formattedBytes(job.bytesTotal))")
+            Text(scopeByteProgressText(for: job))
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .monospacedDigit()
 
-            Text(discoverySummaryText(for: job))
+            Text("Upload queue: \(formattedCount(job.filesUploaded)) / \(formattedCount(job.filesTotal)) files")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .monospacedDigit()
 
-            if job.shouldShowDiscoveryRate {
-                Text("Discovering at \(formattedRate(job.discoveryFilesPerSecond)) files/s (\(formattedBytes(Int64(job.discoveryBytesPerSecond)))/s)")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
+            Text(discoveryRateText(for: job))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
 
-            if job.uploadBytesPerSecond > 0 {
-                Text("Uploading at \(formattedBytes(Int64(job.uploadBytesPerSecond)))/s")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
+            Text(uploadRateText(for: job))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
 
             if job.hasDeferredUploadIssues {
                 deferredUploadTelemetryContent(job: job)
@@ -319,14 +320,30 @@ struct MenuBarView: View {
         .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
     }
 
-    private func discoverySummaryText(for job: BackupJob) -> String {
-        if
-            let estimatedFiles = job.discoveryEstimatedFiles,
-            let estimatedBytes = job.discoveryEstimatedBytes
-        {
-            return "Discovered: \(formattedCount(job.discoveredFiles)) / \(formattedCount(estimatedFiles)) files (\(formattedBytes(job.discoveredBytes)) / \(formattedBytes(estimatedBytes)))"
+    private func scopeFileProgressText(for job: BackupJob) -> String {
+        if let estimatedFiles = job.discoveryEstimatedFiles {
+            let normalizedEstimate = max(estimatedFiles, job.discoveredFiles)
+            return "Scanned \(formattedCount(job.discoveredFiles)) / \(formattedCount(normalizedEstimate)) files"
         }
+        return "Uploaded \(formattedCount(job.filesUploaded)) / \(formattedCount(job.filesTotal)) files"
+    }
 
-        return "Discovered: \(formattedCount(job.discoveredFiles)) files (\(formattedBytes(job.discoveredBytes)))"
+    private func scopeByteProgressText(for job: BackupJob) -> String {
+        if let estimatedBytes = job.discoveryEstimatedBytes {
+            let normalizedEstimate = max(estimatedBytes, job.discoveredBytes)
+            return "Scanned \(formattedBytes(job.discoveredBytes)) / \(formattedBytes(normalizedEstimate))"
+        }
+        return "Uploaded \(formattedBytes(job.bytesUploaded)) / \(formattedBytes(job.bytesTotal))"
+    }
+
+    private func discoveryRateText(for job: BackupJob) -> String {
+        let filesPerSecond = job.isScanInProgress ? job.discoveryFilesPerSecond : 0
+        let bytesPerSecond = job.isScanInProgress ? job.discoveryBytesPerSecond : 0
+        return "Discovery rate: \(formattedRate(filesPerSecond)) files/s (\(formattedBytes(Int64(max(bytesPerSecond, 0))))/s)"
+    }
+
+    private func uploadRateText(for job: BackupJob) -> String {
+        let bytesPerSecond = job.isRunning ? job.uploadBytesPerSecond : 0
+        return "Upload rate: \(formattedBytes(Int64(max(bytesPerSecond, 0))))/s"
     }
 }
