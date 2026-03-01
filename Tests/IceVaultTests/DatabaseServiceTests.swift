@@ -575,6 +575,42 @@ final class DatabaseServiceTests: XCTestCase {
         XCTAssertEqual(nextBatch.map(\.relativePath), ["file-2.txt"])
     }
 
+    func testSourceByteSummariesIncludeUploadedAndTotalBytes() throws {
+        let database = try makeDatabaseService()
+        let sourceRoot = "/tmp/source"
+        let fixedDate = Date(timeIntervalSince1970: 1_700_000_800)
+
+        var uploadedRecord = FileRecord(
+            sourcePath: sourceRoot,
+            relativePath: "uploaded.txt",
+            fileSize: 8,
+            modifiedAt: fixedDate,
+            sha256: "uploaded",
+            glacierKey: "uploaded.txt",
+            uploadedAt: Date(timeIntervalSince1970: 1_700_000_801),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&uploadedRecord)
+
+        var pendingRecord = FileRecord(
+            sourcePath: sourceRoot,
+            relativePath: "pending.txt",
+            fileSize: 4,
+            modifiedAt: fixedDate,
+            sha256: "pending",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&pendingRecord)
+
+        XCTAssertEqual(try database.uploadedCount(for: sourceRoot), 1)
+        XCTAssertEqual(try database.pendingFileCount(for: sourceRoot), 1)
+        XCTAssertEqual(try database.uploadedTotalBytes(for: sourceRoot), 8)
+        XCTAssertEqual(try database.pendingTotalBytes(for: sourceRoot), 4)
+        XCTAssertEqual(try database.totalBytes(for: sourceRoot), 12)
+    }
+
     private func makeDatabaseService() throws -> DatabaseService {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("IceVaultTests-DB-\(UUID().uuidString)", isDirectory: true)

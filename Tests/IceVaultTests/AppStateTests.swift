@@ -443,6 +443,419 @@ final class AppStateTests: XCTestCase {
         )
     }
 
+    func testRunningInventoryUploadProgressUsesTotalInventoryScope() throws {
+        let (userDefaults, suiteName) = makeUserDefaults()
+        defer { clearUserDefaults(userDefaults, suiteName: suiteName) }
+
+        let sourceRoot = try makeTemporaryDirectory(prefix: "IceVaultTests-AppState-RunningInventory")
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let databaseDirectory = try makeTemporaryDirectory(prefix: "IceVaultTests-AppState-RunningInventoryDB")
+        defer { try? FileManager.default.removeItem(at: databaseDirectory) }
+        let database = try DatabaseService(databaseURL: databaseDirectory.appendingPathComponent("icevault.sqlite"))
+
+        var uploadedA = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "uploaded-a.txt",
+            fileSize: 2_000,
+            modifiedAt: Date(timeIntervalSince1970: 1_700_175_000),
+            sha256: "uploaded-a",
+            glacierKey: "uploaded-a.txt",
+            uploadedAt: Date(timeIntervalSince1970: 1_700_175_100),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&uploadedA)
+
+        var uploadedB = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "uploaded-b.txt",
+            fileSize: 1_000,
+            modifiedAt: Date(timeIntervalSince1970: 1_700_175_001),
+            sha256: "uploaded-b",
+            glacierKey: "uploaded-b.txt",
+            uploadedAt: Date(timeIntervalSince1970: 1_700_175_101),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&uploadedB)
+
+        var pendingA = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "pending-a.txt",
+            fileSize: 3_000,
+            modifiedAt: Date(timeIntervalSince1970: 1_700_175_002),
+            sha256: "pending-a",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&pendingA)
+
+        let appState = makeAppState(
+            userDefaults: userDefaults,
+            databaseService: database
+        )
+
+        appState.updateSettings(
+            AppState.Settings(
+                awsRegion: "us-east-1",
+                bucket: "bucket",
+                sourcePath: sourceRoot.path
+            )
+        )
+
+        appState.currentJob = BackupJob(
+            sourceRoot: sourceRoot.path,
+            bucket: "bucket",
+            status: .uploading,
+            filesTotal: 1,
+            filesUploaded: 1,
+            bytesTotal: 3_000,
+            bytesUploaded: 3_000
+        )
+
+        XCTAssertEqual(
+            appState.runningInventoryUploadProgress,
+            AppState.InventoryUploadProgress(
+                uploadedFiles: 3,
+                totalFiles: 3,
+                uploadedBytes: 6_000,
+                totalBytes: 6_000
+            )
+        )
+    }
+
+    func testRunningInventoryUploadProgressExpandsTotalsWhenRunDiscoversNewFiles() throws {
+        let (userDefaults, suiteName) = makeUserDefaults()
+        defer { clearUserDefaults(userDefaults, suiteName: suiteName) }
+
+        let sourceRoot = try makeTemporaryDirectory(prefix: "IceVaultTests-AppState-RunningInventoryExpanded")
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let databaseDirectory = try makeTemporaryDirectory(prefix: "IceVaultTests-AppState-RunningInventoryExpandedDB")
+        defer { try? FileManager.default.removeItem(at: databaseDirectory) }
+        let database = try DatabaseService(databaseURL: databaseDirectory.appendingPathComponent("icevault.sqlite"))
+
+        var uploadedA = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "uploaded-a.txt",
+            fileSize: 2_000,
+            modifiedAt: Date(timeIntervalSince1970: 1_700_180_000),
+            sha256: "uploaded-a",
+            glacierKey: "uploaded-a.txt",
+            uploadedAt: Date(timeIntervalSince1970: 1_700_180_100),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&uploadedA)
+
+        var uploadedB = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "uploaded-b.txt",
+            fileSize: 1_000,
+            modifiedAt: Date(timeIntervalSince1970: 1_700_180_001),
+            sha256: "uploaded-b",
+            glacierKey: "uploaded-b.txt",
+            uploadedAt: Date(timeIntervalSince1970: 1_700_180_101),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&uploadedB)
+
+        var pendingA = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "pending-a.txt",
+            fileSize: 3_000,
+            modifiedAt: Date(timeIntervalSince1970: 1_700_180_002),
+            sha256: "pending-a",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&pendingA)
+
+        let appState = makeAppState(
+            userDefaults: userDefaults,
+            databaseService: database
+        )
+
+        appState.updateSettings(
+            AppState.Settings(
+                awsRegion: "us-east-1",
+                bucket: "bucket",
+                sourcePath: sourceRoot.path
+            )
+        )
+
+        appState.currentJob = BackupJob(
+            sourceRoot: sourceRoot.path,
+            bucket: "bucket",
+            status: .uploading,
+            filesTotal: 2,
+            filesUploaded: 1,
+            bytesTotal: 5_000,
+            bytesUploaded: 3_000,
+            discoveredFiles: 4,
+            discoveredBytes: 8_000
+        )
+
+        XCTAssertEqual(
+            appState.runningInventoryUploadProgress,
+            AppState.InventoryUploadProgress(
+                uploadedFiles: 3,
+                totalFiles: 4,
+                uploadedBytes: 6_000,
+                totalBytes: 8_000
+            )
+        )
+    }
+
+    func testRunningInventoryUploadProgressDropsBaselinePendingFloorAfterScanCompletes() throws {
+        let (userDefaults, suiteName) = makeUserDefaults()
+        defer { clearUserDefaults(userDefaults, suiteName: suiteName) }
+
+        let sourceRoot = try makeTemporaryDirectory(prefix: "IceVaultTests-AppState-RunningInventoryCompletedScan")
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let databaseDirectory = try makeTemporaryDirectory(prefix: "IceVaultTests-AppState-RunningInventoryCompletedScanDB")
+        defer { try? FileManager.default.removeItem(at: databaseDirectory) }
+        let database = try DatabaseService(databaseURL: databaseDirectory.appendingPathComponent("icevault.sqlite"))
+
+        var uploadedA = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "uploaded-a.txt",
+            fileSize: 2_000,
+            modifiedAt: Date(timeIntervalSince1970: 1_700_185_000),
+            sha256: "uploaded-a",
+            glacierKey: "uploaded-a.txt",
+            uploadedAt: Date(timeIntervalSince1970: 1_700_185_100),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&uploadedA)
+
+        var uploadedB = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "uploaded-b.txt",
+            fileSize: 1_000,
+            modifiedAt: Date(timeIntervalSince1970: 1_700_185_001),
+            sha256: "uploaded-b",
+            glacierKey: "uploaded-b.txt",
+            uploadedAt: Date(timeIntervalSince1970: 1_700_185_101),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&uploadedB)
+
+        var pendingA = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "pending-a.txt",
+            fileSize: 3_000,
+            modifiedAt: Date(timeIntervalSince1970: 1_700_185_002),
+            sha256: "pending-a",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&pendingA)
+
+        var pendingB = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "pending-b.txt",
+            fileSize: 4_000,
+            modifiedAt: Date(timeIntervalSince1970: 1_700_185_003),
+            sha256: "pending-b",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&pendingB)
+
+        let appState = makeAppState(
+            userDefaults: userDefaults,
+            databaseService: database
+        )
+
+        appState.updateSettings(
+            AppState.Settings(
+                awsRegion: "us-east-1",
+                bucket: "bucket",
+                sourcePath: sourceRoot.path
+            )
+        )
+
+        appState.currentJob = BackupJob(
+            sourceRoot: sourceRoot.path,
+            bucket: "bucket",
+            status: .uploading,
+            filesTotal: 1,
+            filesUploaded: 1,
+            bytesTotal: 3_000,
+            bytesUploaded: 3_000,
+            discoveredFiles: 4,
+            discoveredBytes: 10_000
+        )
+
+        XCTAssertEqual(
+            appState.runningInventoryUploadProgress,
+            AppState.InventoryUploadProgress(
+                uploadedFiles: 4,
+                totalFiles: 4,
+                uploadedBytes: 10_000,
+                totalBytes: 10_000
+            )
+        )
+    }
+
+    func testRunningInventoryUploadProgressDropsStaleBaselineTotalsAfterScanCompletes() throws {
+        let (userDefaults, suiteName) = makeUserDefaults()
+        defer { clearUserDefaults(userDefaults, suiteName: suiteName) }
+
+        let sourceRoot = try makeTemporaryDirectory(prefix: "IceVaultTests-AppState-RunningInventoryStaleTotals")
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let databaseDirectory = try makeTemporaryDirectory(prefix: "IceVaultTests-AppState-RunningInventoryStaleTotalsDB")
+        defer { try? FileManager.default.removeItem(at: databaseDirectory) }
+        let database = try DatabaseService(databaseURL: databaseDirectory.appendingPathComponent("icevault.sqlite"))
+
+        var uploadedA = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "uploaded-a.txt",
+            fileSize: 2_000,
+            modifiedAt: Date(timeIntervalSince1970: 1_700_187_000),
+            sha256: "uploaded-a",
+            glacierKey: "uploaded-a.txt",
+            uploadedAt: Date(timeIntervalSince1970: 1_700_187_100),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&uploadedA)
+
+        var uploadedB = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "uploaded-b.txt",
+            fileSize: 1_000,
+            modifiedAt: Date(timeIntervalSince1970: 1_700_187_001),
+            sha256: "uploaded-b",
+            glacierKey: "uploaded-b.txt",
+            uploadedAt: Date(timeIntervalSince1970: 1_700_187_101),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&uploadedB)
+
+        var pendingA = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "pending-a.txt",
+            fileSize: 3_000,
+            modifiedAt: Date(timeIntervalSince1970: 1_700_187_002),
+            sha256: "pending-a",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&pendingA)
+
+        var pendingB = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "pending-b.txt",
+            fileSize: 4_000,
+            modifiedAt: Date(timeIntervalSince1970: 1_700_187_003),
+            sha256: "pending-b",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&pendingB)
+
+        let appState = makeAppState(
+            userDefaults: userDefaults,
+            databaseService: database
+        )
+
+        appState.updateSettings(
+            AppState.Settings(
+                awsRegion: "us-east-1",
+                bucket: "bucket",
+                sourcePath: sourceRoot.path
+            )
+        )
+
+        appState.currentJob = BackupJob(
+            sourceRoot: sourceRoot.path,
+            bucket: "bucket",
+            status: .uploading,
+            filesTotal: 1,
+            filesUploaded: 0,
+            bytesTotal: 3_000,
+            bytesUploaded: 0,
+            discoveredFiles: 3,
+            discoveredBytes: 6_000
+        )
+
+        XCTAssertEqual(
+            appState.runningInventoryUploadProgress,
+            AppState.InventoryUploadProgress(
+                uploadedFiles: 2,
+                totalFiles: 3,
+                uploadedBytes: 3_000,
+                totalBytes: 6_000
+            )
+        )
+    }
+
+    func testRunningInventoryUploadProgressDoesNotDoubleCountReuploadedInventoryRecords() throws {
+        let (userDefaults, suiteName) = makeUserDefaults()
+        defer { clearUserDefaults(userDefaults, suiteName: suiteName) }
+
+        let sourceRoot = try makeTemporaryDirectory(prefix: "IceVaultTests-AppState-RunningInventoryReupload")
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let databaseDirectory = try makeTemporaryDirectory(prefix: "IceVaultTests-AppState-RunningInventoryReuploadDB")
+        defer { try? FileManager.default.removeItem(at: databaseDirectory) }
+        let database = try DatabaseService(databaseURL: databaseDirectory.appendingPathComponent("icevault.sqlite"))
+
+        var uploadedA = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "uploaded-a.txt",
+            fileSize: 2_000,
+            modifiedAt: Date(timeIntervalSince1970: 1_700_190_000),
+            sha256: "uploaded-a",
+            glacierKey: "uploaded-a.txt",
+            uploadedAt: Date(timeIntervalSince1970: 1_700_190_100),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&uploadedA)
+
+        let appState = makeAppState(
+            userDefaults: userDefaults,
+            databaseService: database
+        )
+
+        appState.updateSettings(
+            AppState.Settings(
+                awsRegion: "us-east-1",
+                bucket: "bucket",
+                sourcePath: sourceRoot.path
+            )
+        )
+
+        appState.currentJob = BackupJob(
+            sourceRoot: sourceRoot.path,
+            bucket: "bucket",
+            status: .uploading,
+            filesTotal: 1,
+            filesUploaded: 1,
+            bytesTotal: 2_000,
+            bytesUploaded: 2_000,
+            discoveredFiles: 1,
+            discoveredBytes: 2_000
+        )
+
+        XCTAssertEqual(
+            appState.runningInventoryUploadProgress,
+            AppState.InventoryUploadProgress(
+                uploadedFiles: 1,
+                totalFiles: 1,
+                uploadedBytes: 2_000,
+                totalBytes: 2_000
+            )
+        )
+    }
+
     func testStatusStaysSetupWhenInventoryExistsButTargetConfigurationIsIncomplete() throws {
         let (userDefaults, suiteName) = makeUserDefaults()
         defer { clearUserDefaults(userDefaults, suiteName: suiteName) }

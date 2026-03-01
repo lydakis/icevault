@@ -8,7 +8,16 @@ final class AppState: ObservableObject {
         let totalFiles: Int
         let uploadedFiles: Int
         let pendingFiles: Int
+        let totalBytes: Int64
+        let uploadedBytes: Int64
         let pendingBytes: Int64
+    }
+
+    struct InventoryUploadProgress: Equatable {
+        let uploadedFiles: Int
+        let totalFiles: Int
+        let uploadedBytes: Int64
+        let totalBytes: Int64
     }
 
     struct Settings: Codable, Equatable {
@@ -218,6 +227,7 @@ final class AppState: ObservableObject {
     private var currentJobObserver: AnyCancellable?
     private var ssoTokenMonitorObserver: AnyCancellable?
     private var backupTask: Task<Void, Never>?
+    private var activeJobInventoryBaseline: SourceInventorySummary?
 
     private static let settingsKey = "IceVault.settings"
     private static let historyKey = "IceVault.history"
@@ -383,6 +393,70 @@ final class AppState: ObservableObject {
             return false
         }
         return sourceInventorySummary.totalFiles > 0
+    }
+
+    var runningInventoryUploadProgress: InventoryUploadProgress? {
+        guard let currentJob else {
+            return nil
+        }
+
+        let summaryForActiveJob: SourceInventorySummary? = {
+            if let activeJobInventoryBaseline, activeJobInventoryBaseline.sourcePath == currentJob.sourceRoot {
+                return activeJobInventoryBaseline
+            }
+            if let sourceInventorySummary, sourceInventorySummary.sourcePath == currentJob.sourceRoot {
+                return sourceInventorySummary
+            }
+            return nil
+        }()
+
+        guard let summaryForActiveJob else {
+            return nil
+        }
+
+        let baselinePendingFiles = max(summaryForActiveJob.pendingFiles, 0)
+        let baselineTotalFiles = max(summaryForActiveJob.totalFiles, baselinePendingFiles)
+        let runTotalFiles = max(currentJob.filesTotal, 0)
+        let runUploadedFiles = max(currentJob.filesUploaded, 0)
+        let discoveredTotalFiles = max(currentJob.discoveredFiles, 0)
+        let shouldPreferDiscoveredTotals: Bool = {
+            if currentJob.isScanInProgress {
+                return false
+            }
+            if discoveredTotalFiles > 0 {
+                return true
+            }
+            return runTotalFiles == 0 && runUploadedFiles == 0
+        }()
+        let totalFiles = shouldPreferDiscoveredTotals
+            ? discoveredTotalFiles
+            : max(baselineTotalFiles, discoveredTotalFiles)
+        let pendingFilesDuringRun: Int = {
+            let pendingScope = currentJob.isScanInProgress ? max(runTotalFiles, baselinePendingFiles) : runTotalFiles
+            return max(pendingScope - runUploadedFiles, 0)
+        }()
+        let uploadedFiles = min(totalFiles, max(totalFiles - pendingFilesDuringRun, 0))
+
+        let baselinePendingBytes = max(summaryForActiveJob.pendingBytes, 0)
+        let baselineTotalBytes = max(summaryForActiveJob.totalBytes, baselinePendingBytes)
+        let discoveredTotalBytes = max(currentJob.discoveredBytes, 0)
+        let runTotalBytes = max(currentJob.bytesTotal, 0)
+        let runUploadedBytes = max(currentJob.bytesUploaded, 0)
+        let totalBytes = shouldPreferDiscoveredTotals
+            ? discoveredTotalBytes
+            : max(baselineTotalBytes, discoveredTotalBytes)
+        let pendingBytesDuringRun: Int64 = {
+            let pendingScope = currentJob.isScanInProgress ? max(runTotalBytes, baselinePendingBytes) : runTotalBytes
+            return max(pendingScope - runUploadedBytes, 0)
+        }()
+        let uploadedBytes = min(totalBytes, max(totalBytes - pendingBytesDuringRun, 0))
+
+        return InventoryUploadProgress(
+            uploadedFiles: uploadedFiles,
+            totalFiles: totalFiles,
+            uploadedBytes: uploadedBytes,
+            totalBytes: totalBytes
+        )
     }
 
     var sourceInventoryStatusText: String? {
@@ -601,6 +675,13 @@ final class AppState: ObservableObject {
         let sourceRoot = Self.trimmed(settings.sourcePath)
         let bucket = Self.trimmed(settings.bucket)
 
+        refreshSourceInventorySummary()
+        if let sourceInventorySummary, sourceInventorySummary.sourcePath == sourceRoot {
+            activeJobInventoryBaseline = sourceInventorySummary
+        } else {
+            activeJobInventoryBaseline = nil
+        }
+
         let job = BackupJob(sourceRoot: sourceRoot, bucket: bucket, status: .scanning)
         currentJob = job
 
@@ -676,6 +757,7 @@ final class AppState: ObservableObject {
         updatedHistory.insert(job.historyEntry(), at: 0)
         history = Array(updatedHistory.prefix(100))
         refreshSourceInventorySummary()
+        activeJobInventoryBaseline = nil
 
         if currentJob?.id == job.id {
             currentJob = nil
@@ -744,6 +826,8 @@ final class AppState: ObservableObject {
         do {
             let pendingFiles = max(try databaseService.pendingFileCount(for: sourceRoot), 0)
             let uploadedFiles = max(try databaseService.uploadedCount(for: sourceRoot), 0)
+            let totalBytes = max(try databaseService.totalBytes(for: sourceRoot), 0)
+            let uploadedBytes = max(try databaseService.uploadedTotalBytes(for: sourceRoot), 0)
             let pendingBytes = max(try databaseService.pendingTotalBytes(for: sourceRoot), 0)
             let totalFiles = max(pendingFiles + uploadedFiles, 0)
 
@@ -757,6 +841,8 @@ final class AppState: ObservableObject {
                 totalFiles: totalFiles,
                 uploadedFiles: uploadedFiles,
                 pendingFiles: pendingFiles,
+                totalBytes: totalBytes,
+                uploadedBytes: uploadedBytes,
                 pendingBytes: pendingBytes
             )
         } catch {

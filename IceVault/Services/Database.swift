@@ -201,6 +201,34 @@ final class DatabaseService: @unchecked Sendable {
         }
     }
 
+    func totalBytes(for sourceRoot: String) throws -> Int64 {
+        try dbQueue.read { db in
+            try Int64.fetchOne(
+                db,
+                sql: """
+                SELECT COALESCE(SUM(fileSize), 0)
+                FROM \(FileRecord.databaseTableName)
+                WHERE sourcePath = ?
+                """,
+                arguments: [sourceRoot]
+            ) ?? 0
+        }
+    }
+
+    func uploadedTotalBytes(for sourceRoot: String) throws -> Int64 {
+        try dbQueue.read { db in
+            try Int64.fetchOne(
+                db,
+                sql: """
+                SELECT COALESCE(SUM(fileSize), 0)
+                FROM \(FileRecord.databaseTableName)
+                WHERE sourcePath = ? AND uploadedAt IS NOT NULL
+                """,
+                arguments: [sourceRoot]
+            ) ?? 0
+        }
+    }
+
     func uploadedFiles(for sourceRoot: String) throws -> [FileRecord] {
         try dbQueue.read { db in
             try FileRecord
