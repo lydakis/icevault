@@ -333,6 +333,159 @@ final class AppStateTests: XCTestCase {
         }
     }
 
+    func testStatusReflectsKnownInventoryWhenCredentialsAreUnavailable() throws {
+        let (userDefaults, suiteName) = makeUserDefaults()
+        defer { clearUserDefaults(userDefaults, suiteName: suiteName) }
+
+        let sourceRoot = try makeTemporaryDirectory(prefix: "IceVaultTests-AppState-Inventory")
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let databaseDirectory = try makeTemporaryDirectory(prefix: "IceVaultTests-AppState-InventoryDB")
+        let database = try DatabaseService(databaseURL: databaseDirectory.appendingPathComponent("icevault.sqlite"))
+
+        var pendingRecord = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "pending.txt",
+            fileSize: 512,
+            modifiedAt: Date(timeIntervalSince1970: 1_700_100_000),
+            sha256: "pending-sha",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&pendingRecord)
+
+        var uploadedRecord = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "uploaded.txt",
+            fileSize: 1_024,
+            modifiedAt: Date(timeIntervalSince1970: 1_700_100_001),
+            sha256: "uploaded-sha",
+            glacierKey: "uploaded.txt",
+            uploadedAt: Date(timeIntervalSince1970: 1_700_100_100),
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&uploadedRecord)
+
+        let appState = makeAppState(
+            userDefaults: userDefaults,
+            databaseService: database
+        )
+
+        appState.updateSettings(
+            AppState.Settings(
+                awsRegion: "us-east-1",
+                bucket: "bucket",
+                sourcePath: sourceRoot.path
+            )
+        )
+
+        XCTAssertFalse(appState.isConfigured)
+        XCTAssertTrue(appState.hasKnownSourceInventory)
+        XCTAssertEqual(appState.statusText, "Idle")
+        XCTAssertEqual(appState.statusBadgeText, "PAUSED")
+        XCTAssertEqual(appState.idleStatusText, "Authentication required (inventory available)")
+        XCTAssertEqual(
+            appState.sourceInventoryStatusText,
+            "Known inventory: 1 / 2 uploaded, 1 pending"
+        )
+    }
+
+    func testInventoryUsesInjectedBackupEngineDatabaseWhenDatabaseServiceIsOmitted() throws {
+        let (userDefaults, suiteName) = makeUserDefaults()
+        defer { clearUserDefaults(userDefaults, suiteName: suiteName) }
+
+        let sourceRoot = try makeTemporaryDirectory(prefix: "IceVaultTests-AppState-EngineInventory")
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let databaseDirectory = try makeTemporaryDirectory(prefix: "IceVaultTests-AppState-EngineInventoryDB")
+        defer { try? FileManager.default.removeItem(at: databaseDirectory) }
+        let database = try DatabaseService(databaseURL: databaseDirectory.appendingPathComponent("icevault.sqlite"))
+
+        var pendingRecord = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "pending.txt",
+            fileSize: 256,
+            modifiedAt: Date(timeIntervalSince1970: 1_700_150_000),
+            sha256: "pending-sha",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&pendingRecord)
+
+        let backupEngine = BackupEngine(
+            scanner: FileScanner(),
+            fileManager: .default,
+            database: database
+        )
+
+        let appState = AppState(
+            userDefaults: userDefaults,
+            backupEngine: backupEngine,
+            keychainService: KeychainService(keychain: InMemoryKeychainStore()),
+            launchAgent: LaunchAgent(launchctlRunner: { _, _ in 0 }),
+            ssoTokenMonitor: SSOTokenMonitor(userDefaults: userDefaults, autoStart: false)
+        )
+
+        appState.updateSettings(
+            AppState.Settings(
+                awsRegion: "us-east-1",
+                bucket: "bucket",
+                sourcePath: sourceRoot.path
+            )
+        )
+
+        XCTAssertTrue(appState.hasKnownSourceInventory)
+        XCTAssertEqual(
+            appState.sourceInventoryStatusText,
+            "Known inventory: 0 / 1 uploaded, 1 pending"
+        )
+    }
+
+    func testStatusStaysSetupWhenInventoryExistsButTargetConfigurationIsIncomplete() throws {
+        let (userDefaults, suiteName) = makeUserDefaults()
+        defer { clearUserDefaults(userDefaults, suiteName: suiteName) }
+
+        let sourceRoot = try makeTemporaryDirectory(prefix: "IceVaultTests-AppState-PartialTarget")
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let databaseDirectory = try makeTemporaryDirectory(prefix: "IceVaultTests-AppState-PartialTargetDB")
+        let database = try DatabaseService(databaseURL: databaseDirectory.appendingPathComponent("icevault.sqlite"))
+
+        var pendingRecord = FileRecord(
+            sourcePath: sourceRoot.path,
+            relativePath: "pending.txt",
+            fileSize: 512,
+            modifiedAt: Date(timeIntervalSince1970: 1_700_200_000),
+            sha256: "pending-sha",
+            glacierKey: "",
+            uploadedAt: nil,
+            storageClass: FileRecord.deepArchiveStorageClass
+        )
+        try database.insertFile(&pendingRecord)
+
+        let appState = makeAppState(
+            userDefaults: userDefaults,
+            databaseService: database
+        )
+
+        appState.updateSettings(
+            AppState.Settings(
+                awsRegion: "us-east-1",
+                bucket: "",
+                sourcePath: sourceRoot.path
+            )
+        )
+
+        XCTAssertTrue(appState.hasKnownSourceInventory)
+        XCTAssertFalse(appState.hasBackupTargetConfiguration)
+        XCTAssertFalse(appState.isConfigured)
+        XCTAssertEqual(appState.statusText, "Not Configured")
+        XCTAssertEqual(appState.statusBadgeText, "SETUP")
+        XCTAssertEqual(appState.idleStatusText, "Not configured")
+    }
+
     func testSaveAndDeleteCredentialsUpdatesCredentialState() throws {
         let (userDefaults, suiteName) = makeUserDefaults()
         defer { clearUserDefaults(userDefaults, suiteName: suiteName) }
@@ -536,17 +689,24 @@ final class AppStateTests: XCTestCase {
     private func makeAppState(
         userDefaults: UserDefaults,
         launchAgent: LaunchAgent = LaunchAgent(launchctlRunner: { _, _ in 0 }),
-        ssoTokenMonitor: SSOTokenMonitor? = nil
+        ssoTokenMonitor: SSOTokenMonitor? = nil,
+        databaseService: DatabaseService? = nil
     ) -> AppState {
+        let resolvedDatabaseService = databaseService
+            ?? (try? DatabaseService(
+                databaseURL: FileManager.default.temporaryDirectory
+                    .appendingPathComponent("icevault-\(UUID().uuidString).sqlite")
+            ))
         let backupEngine = BackupEngine(
             scanner: FileScanner(),
             fileManager: .default,
-            database: try? DatabaseService(databaseURL: FileManager.default.temporaryDirectory.appendingPathComponent("icevault-\(UUID().uuidString).sqlite"))
+            database: resolvedDatabaseService
         )
         let keychain = KeychainService(keychain: InMemoryKeychainStore())
         return AppState(
             userDefaults: userDefaults,
             backupEngine: backupEngine,
+            databaseService: resolvedDatabaseService,
             keychainService: keychain,
             launchAgent: launchAgent,
             ssoTokenMonitor: ssoTokenMonitor

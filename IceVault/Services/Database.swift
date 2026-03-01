@@ -427,6 +427,20 @@ final class DatabaseService: @unchecked Sendable {
         }
     }
 
+    func uploadedCount(for sourceRoot: String) throws -> Int {
+        try dbQueue.read { db in
+            try Int.fetchOne(
+                db,
+                sql: """
+                SELECT COUNT(*)
+                FROM \(FileRecord.databaseTableName)
+                WHERE sourcePath = ? AND uploadedAt IS NOT NULL
+                """,
+                arguments: [sourceRoot]
+            ) ?? 0
+        }
+    }
+
     private static func defaultDatabaseURL() throws -> URL {
         let fileManager = FileManager.default
         let appSupportURL = try fileManager.url(

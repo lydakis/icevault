@@ -215,8 +215,8 @@ honest take:
 
 the pragmatic recommendation for icevault as a mac menu bar app:
 
-* **support sso** as the default/safer option (great for interactive apps)
-* **also support static keys** for people who need “set and forget” automation
+* **default to static keys** for unattended scheduled backups (“set and forget”)
+* **also support sso** for interactive/admin usage where periodic re-auth is acceptable
 
 ---
 
@@ -415,4 +415,3 @@ aws s3api put-object \
 [9]: https://docs.aws.amazon.com/singlesignon/latest/userguide/user-interactive-sessions.html "https://docs.aws.amazon.com/singlesignon/latest/userguide/user-interactive-sessions.html"
 [10]: https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso-concepts.html "https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso-concepts.html"
 [11]: https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazons3.html "https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazons3.html"
-

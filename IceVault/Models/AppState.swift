@@ -3,6 +3,14 @@ import Foundation
 
 @MainActor
 final class AppState: ObservableObject {
+    struct SourceInventorySummary: Equatable {
+        let sourcePath: String
+        let totalFiles: Int
+        let uploadedFiles: Int
+        let pendingFiles: Int
+        let pendingBytes: Int64
+    }
+
     struct Settings: Codable, Equatable {
         static let defaultMaxConcurrentFileUploads = 3
         static let defaultMaxConcurrentMultipartPartUploads = 2
@@ -199,9 +207,11 @@ final class AppState: ObservableObject {
     @Published var authenticationPromptMessage: String?
     @Published private(set) var ssoSessionStatus: SSOTokenStatus?
     @Published private(set) var ssoSessionExpiresAt: Date?
+    @Published private(set) var sourceInventorySummary: SourceInventorySummary?
 
     private let userDefaults: UserDefaults
     private let backupEngine: BackupEngine
+    private let databaseService: DatabaseService?
     private let keychainService: KeychainService
     private let launchAgent: LaunchAgent
     let ssoTokenMonitor: SSOTokenMonitor
@@ -216,6 +226,7 @@ final class AppState: ObservableObject {
     init(
         userDefaults: UserDefaults = .standard,
         backupEngine: BackupEngine = BackupEngine(),
+        databaseService: DatabaseService? = nil,
         keychainService: KeychainService = KeychainService(),
         launchAgent: LaunchAgent = LaunchAgent(),
         ssoTokenMonitor: SSOTokenMonitor? = nil,
@@ -223,6 +234,7 @@ final class AppState: ObservableObject {
     ) {
         self.userDefaults = userDefaults
         self.backupEngine = backupEngine
+        self.databaseService = databaseService ?? backupEngine.resolvedDatabaseService
         self.keychainService = keychainService
         self.launchAgent = launchAgent
         self.ssoTokenMonitor = ssoTokenMonitor
@@ -237,10 +249,12 @@ final class AppState: ObservableObject {
         self.authenticationPromptMessage = nil
         self.ssoSessionStatus = nil
         self.ssoSessionExpiresAt = nil
+        self.sourceInventorySummary = nil
 
         bindSSOTokenMonitor()
         configureSSOTokenMonitor()
         refreshCredentialState()
+        refreshSourceInventorySummary()
         saveSettings()
     }
 
@@ -249,7 +263,7 @@ final class AppState: ObservableObject {
             return currentJob.status.displayName
         }
 
-        if !isConfigured {
+        if !hasBackupTargetConfiguration {
             return "Not Configured"
         }
 
@@ -284,8 +298,15 @@ final class AppState: ObservableObject {
     }
 
     var idleStatusText: String {
-        guard isConfigured else {
+        guard hasBackupTargetConfiguration else {
             return "Not configured"
+        }
+
+        guard isConfigured else {
+            if hasKnownSourceInventory {
+                return "Authentication required (inventory available)"
+            }
+            return "Authentication required"
         }
 
         switch latestBackupStatus {
@@ -306,8 +327,12 @@ final class AppState: ObservableObject {
             return currentJob.status.displayName.uppercased()
         }
 
-        guard isConfigured else {
+        guard hasBackupTargetConfiguration else {
             return "SETUP"
+        }
+
+        guard isConfigured else {
+            return hasKnownSourceInventory ? "PAUSED" : "AUTH"
         }
 
         switch latestBackupStatus {
@@ -342,11 +367,38 @@ final class AppState: ObservableObject {
         history.first(where: { $0.status == .completed })?.displayDate
     }
 
-    var isConfigured: Bool {
-        hasAvailableCredentials
-            && !Self.trimmed(settings.awsRegion).isEmpty
+    var hasBackupTargetConfiguration: Bool {
+        !Self.trimmed(settings.awsRegion).isEmpty
             && !Self.trimmed(settings.bucket).isEmpty
             && !Self.trimmed(settings.sourcePath).isEmpty
+    }
+
+    var isConfigured: Bool {
+        hasAvailableCredentials
+            && hasBackupTargetConfiguration
+    }
+
+    var hasKnownSourceInventory: Bool {
+        guard let sourceInventorySummary else {
+            return false
+        }
+        return sourceInventorySummary.totalFiles > 0
+    }
+
+    var sourceInventoryStatusText: String? {
+        guard let sourceInventorySummary, sourceInventorySummary.totalFiles > 0 else {
+            return nil
+        }
+
+        let uploadedCountText = sourceInventorySummary.uploadedFiles.formatted(.number.grouping(.automatic))
+        let totalCountText = sourceInventorySummary.totalFiles.formatted(.number.grouping(.automatic))
+        let pendingCountText = sourceInventorySummary.pendingFiles.formatted(.number.grouping(.automatic))
+
+        if sourceInventorySummary.pendingFiles > 0 {
+            return "Known inventory: \(uploadedCountText) / \(totalCountText) uploaded, \(pendingCountText) pending"
+        }
+
+        return "Known inventory: \(uploadedCountText) / \(totalCountText) uploaded"
     }
 
     var usesSSOAuthentication: Bool {
@@ -423,6 +475,7 @@ final class AppState: ObservableObject {
         settings = sanitized
         configureSSOTokenMonitor()
         refreshCredentialState()
+        refreshSourceInventorySummary()
     }
 
     func loadStoredCredentials() throws -> AWSCredentials? {
@@ -441,6 +494,7 @@ final class AppState: ObservableObject {
 
     func clearHistory() {
         history = []
+        refreshSourceInventorySummary()
     }
 
     func resolveCredentials(preferredRegion: String? = nil) -> ResolvedCredentials? {
@@ -621,6 +675,7 @@ final class AppState: ObservableObject {
         var updatedHistory = history
         updatedHistory.insert(job.historyEntry(), at: 0)
         history = Array(updatedHistory.prefix(100))
+        refreshSourceInventorySummary()
 
         if currentJob?.id == job.id {
             currentJob = nil
@@ -672,6 +727,41 @@ final class AppState: ObservableObject {
         let resolvedCredentials = resolveCredentials(preferredRegion: settings.awsRegion)
         hasAvailableCredentials = resolvedCredentials != nil
         credentialSource = resolvedCredentials?.credentialSource
+    }
+
+    private func refreshSourceInventorySummary() {
+        guard let databaseService else {
+            sourceInventorySummary = nil
+            return
+        }
+
+        let sourceRoot = Self.trimmed(settings.sourcePath)
+        guard !sourceRoot.isEmpty else {
+            sourceInventorySummary = nil
+            return
+        }
+
+        do {
+            let pendingFiles = max(try databaseService.pendingFileCount(for: sourceRoot), 0)
+            let uploadedFiles = max(try databaseService.uploadedCount(for: sourceRoot), 0)
+            let pendingBytes = max(try databaseService.pendingTotalBytes(for: sourceRoot), 0)
+            let totalFiles = max(pendingFiles + uploadedFiles, 0)
+
+            if totalFiles == 0 {
+                sourceInventorySummary = nil
+                return
+            }
+
+            sourceInventorySummary = SourceInventorySummary(
+                sourcePath: sourceRoot,
+                totalFiles: totalFiles,
+                uploadedFiles: uploadedFiles,
+                pendingFiles: pendingFiles,
+                pendingBytes: pendingBytes
+            )
+        } catch {
+            sourceInventorySummary = nil
+        }
     }
 
     private func configureSSOTokenMonitor() {

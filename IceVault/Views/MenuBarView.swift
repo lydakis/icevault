@@ -131,6 +131,13 @@ struct MenuBarView: View {
                 .font(.subheadline.weight(.medium))
                 .foregroundStyle(idleStatusColor)
 
+            if let sourceInventoryStatusText = appState.sourceInventoryStatusText {
+                Text(sourceInventoryStatusText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+
             if let latestDeferredUploadStatusText = appState.latestDeferredUploadStatusText {
                 Label(latestDeferredUploadStatusText, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)

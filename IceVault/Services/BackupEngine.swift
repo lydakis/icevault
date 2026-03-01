@@ -469,6 +469,13 @@ final class BackupEngine: @unchecked Sendable {
         self.glacierClientFactory = glacierClientFactory
     }
 
+    var resolvedDatabaseService: DatabaseService? {
+        guard case .available(let database) = databaseState else {
+            return nil
+        }
+        return database
+    }
+
     func run(job: BackupJob, settings: AppState.Settings) async throws {
         let sourceRoot = await MainActor.run { job.sourceRoot }
         let bucket = await MainActor.run { job.bucket }

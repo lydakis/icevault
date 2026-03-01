@@ -131,6 +131,12 @@ Region resolution uses:
 2. `~/.aws/config` (`[default]` profile region)
 3. `AWS_REGION` / `AWS_DEFAULT_REGION`
 
+Recommended default for unattended backups:
+
+- Use a dedicated IAM user (programmatic access only) with least-privilege bucket policy.
+- Store access key + secret in IceVault (Keychain-backed).
+- Use SSO profiles for interactive/admin workflows, not long-running unattended jobs.
+
 ### Option A: `aws configure`
 
 ```bash
