@@ -1,5 +1,82 @@
 import SwiftUI
 
+@MainActor
+enum MenuBarViewProgressModel {
+    private static let etaFormatter: DateComponentsFormatter = {
+        let formatter = DateComponentsFormatter()
+        formatter.allowedUnits = [.hour, .minute, .second]
+        formatter.unitsStyle = .abbreviated
+        formatter.maximumUnitCount = 2
+        formatter.zeroFormattingBehavior = [.dropLeading]
+        return formatter
+    }()
+
+    static func primaryUploadProgressFraction(
+        for job: BackupJob,
+        runningInventoryUploadProgress: AppState.InventoryUploadProgress?
+    ) -> Double {
+        if let runningInventoryUploadProgress {
+            if runningInventoryUploadProgress.totalBytes > 0 {
+                return min(
+                    1,
+                    Double(runningInventoryUploadProgress.uploadedBytes) / Double(runningInventoryUploadProgress.totalBytes)
+                )
+            }
+
+            if runningInventoryUploadProgress.totalFiles > 0 {
+                return min(
+                    1,
+                    Double(runningInventoryUploadProgress.uploadedFiles) / Double(runningInventoryUploadProgress.totalFiles)
+                )
+            }
+        }
+
+        if job.bytesTotal > 0 {
+            return job.byteProgressFraction
+        }
+        return job.fileProgressFraction
+    }
+
+    static func etaText(
+        for job: BackupJob,
+        runningInventoryUploadProgress: AppState.InventoryUploadProgress?
+    ) -> String {
+        let remaining = remainingBytes(
+            for: job,
+            runningInventoryUploadProgress: runningInventoryUploadProgress
+        )
+        guard remaining > 0 else {
+            return job.isRunning ? "Calculating..." : "Done"
+        }
+
+        let bytesPerSecond = job.isRunning ? max(job.uploadBytesPerSecond, 0) : 0
+        guard bytesPerSecond > 0 else {
+            return "Calculating..."
+        }
+
+        let estimatedSeconds = Double(remaining) / bytesPerSecond
+        guard estimatedSeconds.isFinite, estimatedSeconds > 0 else {
+            return "Calculating..."
+        }
+
+        if estimatedSeconds < 1 {
+            return "<1s"
+        }
+
+        return etaFormatter.string(from: estimatedSeconds) ?? "Calculating..."
+    }
+
+    private static func remainingBytes(
+        for job: BackupJob,
+        runningInventoryUploadProgress: AppState.InventoryUploadProgress?
+    ) -> Int64 {
+        if let runningInventoryUploadProgress {
+            return max(runningInventoryUploadProgress.totalBytes - runningInventoryUploadProgress.uploadedBytes, 0)
+        }
+        return max(job.bytesTotal - job.bytesUploaded, 0)
+    }
+}
+
 struct MenuBarView: View {
     @Environment(\.openSettings) private var openSettings
     @Environment(\.openWindow) private var openWindow
@@ -92,18 +169,25 @@ struct MenuBarView: View {
 
     private func runningBackupContent(job: BackupJob) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            ProgressView(value: primaryUploadProgressFraction(for: job))
+            ProgressView(value: primaryUploadByteProgressFraction(for: job))
 
-            Text(primaryUploadFileProgressText(for: job))
+            Text(primaryUploadByteProgressText(for: job))
                 .font(.subheadline)
                 .monospacedDigit()
 
-            Text(primaryUploadByteProgressText(for: job))
+            Text(primaryUploadFileProgressText(for: job))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
 
-            uploadRateMetric(job: job)
+            HStack(spacing: 8) {
+                uploadRateMetric(job: job)
+                etaMetric(job: job)
+            }
+
+            if shouldShowDetailsDisclosure(for: job) {
+                detailsDisclosure(job: job)
+            }
 
             if job.hasDeferredUploadIssues {
                 deferredUploadTelemetryContent(job: job)
@@ -294,6 +378,14 @@ struct MenuBarView: View {
         )
     }
 
+    private func etaMetric(job: BackupJob) -> some View {
+        metricTile(
+            title: "ETA",
+            value: etaText(for: job),
+            tint: .secondary
+        )
+    }
+
     private func metricTile(
         title: String,
         value: String,
@@ -312,6 +404,55 @@ struct MenuBarView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(8)
         .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func shouldShowDetailsDisclosure(for job: BackupJob) -> Bool {
+        job.filesTotal > 0
+            || appState.runningInventoryUploadProgress != nil
+            || job.shouldShowDiscoveryRate
+            || job.hasDiscoveryEstimate
+    }
+
+    @ViewBuilder
+    private func detailsDisclosure(job: BackupJob) -> some View {
+        DisclosureGroup("Details") {
+            VStack(alignment: .leading, spacing: 4) {
+                if let runningInventoryUploadProgress = appState.runningInventoryUploadProgress {
+                    Text(
+                        "Inventory files: \(formattedCount(runningInventoryUploadProgress.uploadedFiles)) / \(formattedCount(runningInventoryUploadProgress.totalFiles))"
+                    )
+                    .monospacedDigit()
+                    Text(
+                        "Inventory data: \(formattedBytes(runningInventoryUploadProgress.uploadedBytes)) / \(formattedBytes(runningInventoryUploadProgress.totalBytes))"
+                    )
+                    .monospacedDigit()
+                }
+
+                Text("Upload queue: \(formattedCount(job.filesUploaded)) / \(formattedCount(job.filesTotal)) files")
+                    .monospacedDigit()
+                Text(uploadByteProgressText(for: job))
+                    .monospacedDigit()
+
+                if let scanFileProgressText = scanFileProgressText(for: job) {
+                    Text(scanFileProgressText)
+                        .monospacedDigit()
+                }
+
+                if let scanByteProgressText = scanByteProgressText(for: job) {
+                    Text(scanByteProgressText)
+                        .monospacedDigit()
+                }
+
+                if job.shouldShowDiscoveryRate {
+                    Text(discoveryRateText(for: job))
+                        .monospacedDigit()
+                }
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .padding(.top, 2)
+        }
+        .font(.caption)
     }
 
     @ViewBuilder
@@ -384,15 +525,11 @@ struct MenuBarView: View {
         return uploadFileProgressText(for: job)
     }
 
-    private func primaryUploadProgressFraction(for job: BackupJob) -> Double {
-        if let runningInventoryUploadProgress = appState.runningInventoryUploadProgress,
-           runningInventoryUploadProgress.totalFiles > 0 {
-            return min(
-                1,
-                Double(runningInventoryUploadProgress.uploadedFiles) / Double(runningInventoryUploadProgress.totalFiles)
-            )
-        }
-        return job.fileProgressFraction
+    private func primaryUploadByteProgressFraction(for job: BackupJob) -> Double {
+        MenuBarViewProgressModel.primaryUploadProgressFraction(
+            for: job,
+            runningInventoryUploadProgress: appState.runningInventoryUploadProgress
+        )
     }
 
     private func primaryUploadByteProgressText(for job: BackupJob) -> String {
@@ -401,6 +538,39 @@ struct MenuBarView: View {
             return "Uploaded \(formattedBytes(runningInventoryUploadProgress.uploadedBytes)) / \(formattedBytes(runningInventoryUploadProgress.totalBytes))"
         }
         return uploadByteProgressText(for: job)
+    }
+
+    private func scanFileProgressText(for job: BackupJob) -> String? {
+        guard let estimatedFiles = job.discoveryEstimatedFiles else {
+            return nil
+        }
+        let normalizedEstimate = max(estimatedFiles, job.discoveredFiles)
+        return "Scanned \(formattedCount(job.discoveredFiles)) / \(formattedCount(normalizedEstimate)) files"
+    }
+
+    private func scanByteProgressText(for job: BackupJob) -> String? {
+        guard let estimatedBytes = job.discoveryEstimatedBytes else {
+            return nil
+        }
+        let normalizedEstimate = max(estimatedBytes, job.discoveredBytes)
+        return "Scanned \(formattedBytes(job.discoveredBytes)) / \(formattedBytes(normalizedEstimate))"
+    }
+
+    private func discoveryRateText(for job: BackupJob) -> String {
+        let filesPerSecond = job.isScanInProgress ? job.discoveryFilesPerSecond : 0
+        let bytesPerSecond = job.isScanInProgress ? job.discoveryBytesPerSecond : 0
+        return "Discovery rate: \(formattedRate(filesPerSecond)) files/s (\(formattedBytes(Int64(max(bytesPerSecond, 0))))/s)"
+    }
+
+    private func etaText(for job: BackupJob) -> String {
+        MenuBarViewProgressModel.etaText(
+            for: job,
+            runningInventoryUploadProgress: appState.runningInventoryUploadProgress
+        )
+    }
+
+    private func formattedRate(_ value: Double) -> String {
+        value.formatted(.number.precision(.fractionLength(1)))
     }
 
     private func uploadRateValueText(for job: BackupJob) -> String {
