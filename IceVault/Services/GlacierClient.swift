@@ -127,6 +127,71 @@ extension GlacierS3Client {
 
 extension S3Client: GlacierS3Client {}
 
+private actor MultipartMemoryLimiter {
+    private let totalBytes: Int64
+    private var availableBytes: Int64
+    private var nextWaiterID: UInt64 = 0
+    private var waiters: [UInt64: CheckedContinuation<Void, Never>] = [:]
+
+    init(totalBytes: Int64) {
+        let normalizedTotalBytes = max(totalBytes, 1)
+        self.totalBytes = normalizedTotalBytes
+        availableBytes = normalizedTotalBytes
+    }
+
+    func reserve(bytes: Int64) async throws {
+        let normalizedBytes = min(max(bytes, 1), totalBytes)
+        while true {
+            try Task.checkCancellation()
+            if availableBytes >= normalizedBytes {
+                availableBytes -= normalizedBytes
+                return
+            }
+
+            let waiterID = nextWaiterID
+            nextWaiterID += 1
+
+            await withTaskCancellationHandler(
+                operation: {
+                    await withCheckedContinuation { continuation in
+                        waiters[waiterID] = continuation
+                    }
+                },
+                onCancel: {
+                    Task {
+                        await self.cancelWaiter(id: waiterID)
+                    }
+                }
+            )
+        }
+    }
+
+    func release(bytes: Int64) {
+        let normalizedBytes = min(max(bytes, 1), totalBytes)
+        availableBytes = min(totalBytes, availableBytes + normalizedBytes)
+        resumeAllWaiters()
+    }
+
+    private func cancelWaiter(id: UInt64) {
+        guard let continuation = waiters.removeValue(forKey: id) else {
+            return
+        }
+        continuation.resume()
+    }
+
+    private func resumeAllWaiters() {
+        guard !waiters.isEmpty else {
+            return
+        }
+
+        let continuations = waiters.values
+        waiters.removeAll(keepingCapacity: true)
+        for continuation in continuations {
+            continuation.resume()
+        }
+    }
+}
+
 /// Thread-safety invariant: stored dependencies are immutable after initialization and
 /// per-upload mutable state is scoped to local values inside async functions.
 final class GlacierClient: @unchecked Sendable {
@@ -134,7 +199,10 @@ final class GlacierClient: @unchecked Sendable {
     static let sha256MetadataKey = "icevault-sha256"
     private static let defaultPartSizeBytes: Int = 8 * 1024 * 1024
     private static let minimumPartSizeBytes: Int = 5 * 1024 * 1024
-    private static let maxBufferedMultipartBytes: Int64 = 64 * 1024 * 1024
+    private static let minimumBufferedMultipartBytes: Int64 = 64 * 1024 * 1024
+    private static let maximumBufferedMultipartBytes: Int64 = 512 * 1024 * 1024
+    private static let bufferedMultipartBudgetDivisor: UInt64 = 32
+    private static let bufferedMultipartBudgetOverrideEnvironmentKey = "ICEVAULT_MULTIPART_MEMORY_BUDGET_MB"
     private static let maxS3Retries = 3
     private static let retryBackoffSeconds: [UInt64] = [2, 8, 32]
 
@@ -142,6 +210,8 @@ final class GlacierClient: @unchecked Sendable {
     private let fileManager: FileManager
     private let database: DatabaseService?
     private let multipartThreshold: Int64
+    private let multipartBufferedBytesBudget: Int64
+    private let multipartMemoryLimiter: MultipartMemoryLimiter
 
     init(
         accessKey: String,
@@ -150,7 +220,8 @@ final class GlacierClient: @unchecked Sendable {
         region: String,
         fileManager: FileManager = .default,
         database: DatabaseService? = nil,
-        multipartThreshold: Int64 = GlacierClient.multipartThresholdBytes
+        multipartThreshold: Int64 = GlacierClient.multipartThresholdBytes,
+        multipartBufferedBytesBudget: Int64? = nil
     ) throws {
         let trimmedAccessKey = accessKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedSecretKey = secretKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -173,22 +244,33 @@ final class GlacierClient: @unchecked Sendable {
             region: trimmedRegion
         )
 
+        let resolvedMultipartBufferedBytesBudget = Self.normalizedMultipartBufferedBytesBudget(
+            multipartBufferedBytesBudget ?? Self.resolvedBufferedMultipartBytes()
+        )
         self.s3Client = S3Client(config: config)
         self.fileManager = fileManager
         self.database = database
         self.multipartThreshold = multipartThreshold
+        self.multipartBufferedBytesBudget = resolvedMultipartBufferedBytesBudget
+        multipartMemoryLimiter = MultipartMemoryLimiter(totalBytes: resolvedMultipartBufferedBytesBudget)
     }
 
     init(
         s3Client: any GlacierS3Client,
         fileManager: FileManager = .default,
         database: DatabaseService? = nil,
-        multipartThreshold: Int64 = GlacierClient.multipartThresholdBytes
+        multipartThreshold: Int64 = GlacierClient.multipartThresholdBytes,
+        multipartBufferedBytesBudget: Int64? = nil
     ) {
+        let resolvedMultipartBufferedBytesBudget = Self.normalizedMultipartBufferedBytesBudget(
+            multipartBufferedBytesBudget ?? Self.resolvedBufferedMultipartBytes()
+        )
         self.s3Client = s3Client
         self.fileManager = fileManager
         self.database = database
         self.multipartThreshold = multipartThreshold
+        self.multipartBufferedBytesBudget = resolvedMultipartBufferedBytesBudget
+        multipartMemoryLimiter = MultipartMemoryLimiter(totalBytes: resolvedMultipartBufferedBytesBudget)
     }
 
     static func resolveCredentials(
@@ -580,7 +662,7 @@ final class GlacierClient: @unchecked Sendable {
 
         let pendingPartNumbers = (1...totalParts).filter { uploadState.completedPartsByNumber[$0] == nil }
         if !pendingPartNumbers.isEmpty {
-            let cappedByMemory = Self.effectiveMultipartPartConcurrency(
+            let cappedByMemory = effectiveMultipartPartConcurrency(
                 requestedConcurrency: multipartPartConcurrency,
                 partSize: partSize
             )
@@ -591,36 +673,45 @@ final class GlacierClient: @unchecked Sendable {
                 inputs: pendingPartNumbers,
                 maxConcurrentTasks: partConcurrency,
                 operation: { [self] partNumber in
-                    let partData = try Self.readPartData(
-                        fileURL: fileURL,
+                    let expectedPartBytes = Self.expectedPartSize(
                         partNumber: partNumber,
                         totalParts: totalParts,
                         fileSize: fileSize,
                         partSize: partSize
                     )
 
-                    let partOutput = try await self.performS3Operation("uploadPart #\(partNumber)") {
-                        try await self.s3Client.uploadPart(
-                            input: UploadPartInput(
-                                body: .data(partData),
-                                bucket: bucket,
-                                contentLength: partData.count,
-                                key: key,
-                                partNumber: partNumber,
-                                uploadId: uploadID
+                    return try await self.withMultipartMemoryReservation(bytes: expectedPartBytes) {
+                        let partData = try Self.readPartData(
+                            fileURL: fileURL,
+                            partNumber: partNumber,
+                            totalParts: totalParts,
+                            fileSize: fileSize,
+                            partSize: partSize
+                        )
+
+                        let partOutput = try await self.performS3Operation("uploadPart #\(partNumber)") {
+                            try await self.s3Client.uploadPart(
+                                input: UploadPartInput(
+                                    body: .data(partData),
+                                    bucket: bucket,
+                                    contentLength: partData.count,
+                                    key: key,
+                                    partNumber: partNumber,
+                                    uploadId: uploadID
+                                )
                             )
+                        }
+
+                        guard let eTag = partOutput.eTag else {
+                            throw GlacierClientError.missingMultipartETag(partNumber: partNumber)
+                        }
+
+                        return UploadedPart(
+                            partNumber: partNumber,
+                            eTag: eTag,
+                            byteCount: Int64(partData.count)
                         )
                     }
-
-                    guard let eTag = partOutput.eTag else {
-                        throw GlacierClientError.missingMultipartETag(partNumber: partNumber)
-                    }
-
-                    return UploadedPart(
-                        partNumber: partNumber,
-                        eTag: eTag,
-                        byteCount: Int64(partData.count)
-                    )
                 },
                 onSuccess: { [self] uploadedPart in
                     uploadState.completedPartsByNumber[uploadedPart.partNumber] = S3ClientTypes.CompletedPart(
@@ -1002,14 +1093,72 @@ final class GlacierClient: @unchecked Sendable {
         return max(fileSize - priorPartsBytes, 0)
     }
 
-    private static func effectiveMultipartPartConcurrency(
+    private func effectiveMultipartPartConcurrency(
         requestedConcurrency: Int,
         partSize: Int
     ) -> Int {
         let normalizedRequested = max(1, requestedConcurrency)
         let normalizedPartSize = max(Int64(partSize), 1)
-        let maxByMemoryBudget = max(1, Int(maxBufferedMultipartBytes / normalizedPartSize))
+        let maxByMemoryBudget = max(1, Int(multipartBufferedBytesBudget / normalizedPartSize))
         return max(1, min(normalizedRequested, maxByMemoryBudget))
+    }
+
+    private static func resolvedBufferedMultipartBytes(
+        processInfo: ProcessInfo = .processInfo
+    ) -> Int64 {
+        let minimumBudget = max(minimumBufferedMultipartBytes, 1)
+        let maximumBudget = max(maximumBufferedMultipartBytes, minimumBudget)
+
+        if let overriddenBudget = overriddenBufferedMultipartBytes(environment: processInfo.environment) {
+            return min(max(overriddenBudget, minimumBudget), maximumBudget)
+        }
+
+        let derivedBudget = processInfo.physicalMemory / bufferedMultipartBudgetDivisor
+        let normalizedMinimum = UInt64(minimumBudget)
+        let normalizedMaximum = UInt64(maximumBudget)
+        let clampedBudget = min(max(derivedBudget, normalizedMinimum), normalizedMaximum)
+        return Int64(clampedBudget)
+    }
+
+    private static func normalizedMultipartBufferedBytesBudget(_ value: Int64) -> Int64 {
+        let minimumBudget = max(minimumBufferedMultipartBytes, 1)
+        let maximumBudget = max(maximumBufferedMultipartBytes, minimumBudget)
+        return min(max(value, minimumBudget), maximumBudget)
+    }
+
+    private static func overriddenBufferedMultipartBytes(
+        environment: [String: String]
+    ) -> Int64? {
+        guard
+            let rawValue = environment[bufferedMultipartBudgetOverrideEnvironmentKey]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            let parsedMegabytes = Int64(rawValue),
+            parsedMegabytes > 0
+        else {
+            return nil
+        }
+
+        let megabyte: Int64 = 1024 * 1024
+        let minimumMegabytes = max(minimumBufferedMultipartBytes / megabyte, 1)
+        let maximumMegabytes = max(maximumBufferedMultipartBytes / megabyte, minimumMegabytes)
+        let clampedMegabytes = min(max(parsedMegabytes, minimumMegabytes), maximumMegabytes)
+        return clampedMegabytes * megabyte
+    }
+
+    private func withMultipartMemoryReservation<T>(
+        bytes: Int64,
+        operation: () async throws -> T
+    ) async throws -> T {
+        let reservationBytes = min(max(bytes, 1), multipartBufferedBytesBudget)
+        try await multipartMemoryLimiter.reserve(bytes: reservationBytes)
+        do {
+            let result = try await operation()
+            await multipartMemoryLimiter.release(bytes: reservationBytes)
+            return result
+        } catch {
+            await multipartMemoryLimiter.release(bytes: reservationBytes)
+            throw error
+        }
     }
 
     private static func totalUploadedBytes(

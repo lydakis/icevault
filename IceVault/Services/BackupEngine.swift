@@ -42,6 +42,7 @@ final class BackupEngine: @unchecked Sendable {
     private static let scanSyncBatchSize = 128
     private static let discoveryProgressUpdateBatchSize = 128
     private static let remoteAuditBatchSize = 256
+    private static let maximumAggregateMultipartWorkers = 64
     private static let pendingPlanBufferOverrideEnvironmentKey = "ICEVAULT_MAX_BUFFERED_PENDING_PLANS"
 
     private enum DatabaseState {
@@ -1036,6 +1037,18 @@ final class BackupEngine: @unchecked Sendable {
         return max(scanSyncBatchSize, parsedOverrideValue)
     }
 
+    static func effectiveMultipartPartConcurrency(
+        requestedPartConcurrency: Int,
+        fileConcurrency: Int
+    ) -> Int {
+        let normalizedFileConcurrency = max(1, fileConcurrency)
+        let normalizedRequestedPartConcurrency = max(1, requestedPartConcurrency)
+        // Keep aggregate multipart workers bounded so high file and part concurrency
+        // does not exhaust launchd's common per-process file descriptor limits.
+        let maxPerFileByAggregateLimit = max(1, maximumAggregateMultipartWorkers / normalizedFileConcurrency)
+        return min(normalizedRequestedPartConcurrency, maxPerFileByAggregateLimit)
+    }
+
     private func makePendingPlanStreamChannel() -> PendingPlanStreamChannel {
         var continuation: AsyncThrowingStream<[PendingUploadPlan], Error>.Continuation?
         let stream = AsyncThrowingStream<[PendingUploadPlan], Error> { streamContinuation in
@@ -1140,7 +1153,10 @@ final class BackupEngine: @unchecked Sendable {
         }
 
         let fileConcurrency = max(1, min(settings.maxConcurrentFileUploads, plans.count))
-        let multipartPartConcurrency = max(1, settings.maxConcurrentMultipartPartUploads)
+        let multipartPartConcurrency = Self.effectiveMultipartPartConcurrency(
+            requestedPartConcurrency: settings.maxConcurrentMultipartPartUploads,
+            fileConcurrency: fileConcurrency
+        )
         let completedPlanTracker = CompletedPlanTracker()
         let uploadBatchFailureSignal = UploadBatchFailureSignal()
 

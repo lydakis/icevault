@@ -1104,6 +1104,37 @@ final class BackupEngineTests: XCTestCase {
         XCTAssertEqual(stats.maxInFlightPutObjectCalls, 2)
     }
 
+    func testEffectiveMultipartPartConcurrencyCapsAggregateWorkers() {
+        XCTAssertEqual(
+            BackupEngine.effectiveMultipartPartConcurrency(
+                requestedPartConcurrency: 16,
+                fileConcurrency: 16
+            ),
+            4
+        )
+        XCTAssertEqual(
+            BackupEngine.effectiveMultipartPartConcurrency(
+                requestedPartConcurrency: 16,
+                fileConcurrency: 1
+            ),
+            16
+        )
+        XCTAssertEqual(
+            BackupEngine.effectiveMultipartPartConcurrency(
+                requestedPartConcurrency: 8,
+                fileConcurrency: 9
+            ),
+            7
+        )
+        XCTAssertEqual(
+            BackupEngine.effectiveMultipartPartConcurrency(
+                requestedPartConcurrency: 2,
+                fileConcurrency: 16
+            ),
+            2
+        )
+    }
+
     func testRunRecordsCompletedConcurrentUploadWhenSiblingFails() async throws {
         let sourceRoot = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: sourceRoot) }

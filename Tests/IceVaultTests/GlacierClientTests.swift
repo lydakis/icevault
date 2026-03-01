@@ -216,6 +216,51 @@ final class GlacierClientTests: XCTestCase {
         XCTAssertLessThanOrEqual(stats.maxInFlightUploadPartCalls, 3)
     }
 
+    func testUploadFileMultipartSharesMemoryBudgetAcrossConcurrentFiles() async throws {
+        let workingDirectory = try makeTemporaryDirectory(prefix: "IceVaultTests-GlacierMultipartGlobalMemoryBudget")
+        defer { try? FileManager.default.removeItem(at: workingDirectory) }
+
+        let fileCount = 12
+        let payloadSize = 16 * 1024 * 1024
+        var fileURLs: [URL] = []
+        fileURLs.reserveCapacity(fileCount)
+        for index in 0..<fileCount {
+            let fileURL = workingDirectory.appendingPathComponent("large-\(index).bin")
+            try Data(repeating: UInt8(index % 255), count: payloadSize).write(to: fileURL)
+            fileURLs.append(fileURL)
+        }
+
+        let s3 = MultipartConcurrencyTrackingS3Client(uploadPartDelayNanoseconds: 120_000_000)
+        let client = GlacierClient(
+            s3Client: s3,
+            fileManager: .default,
+            database: nil,
+            multipartThreshold: 1,
+            multipartBufferedBytesBudget: 64 * 1024 * 1024
+        )
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for (index, fileURL) in fileURLs.enumerated() {
+                group.addTask {
+                    _ = try await client.uploadFile(
+                        localPath: fileURL.path,
+                        bucket: "test-bucket",
+                        key: "archives/large-\(index).bin",
+                        fileRecordId: nil,
+                        multipartPartConcurrency: 16
+                    )
+                }
+            }
+            try await group.waitForAll()
+        }
+
+        let stats = await s3.uploadPartStats()
+        XCTAssertGreaterThan(stats.uploadPartCallCount, fileCount)
+        XCTAssertGreaterThan(stats.maxInFlightUploadPartCalls, 1)
+        // 64 MB total budget / 8 MB default part size = 8 max in-flight parts overall.
+        XCTAssertLessThanOrEqual(stats.maxInFlightUploadPartCalls, 8)
+    }
+
     func testUploadFileMultipartCapsConcurrencyWhenPartsAreLarge() async throws {
         let workingDirectory = try makeTemporaryDirectory(prefix: "IceVaultTests-GlacierMultipartMemoryCap")
         defer { try? FileManager.default.removeItem(at: workingDirectory) }
@@ -241,14 +286,14 @@ final class GlacierClientTests: XCTestCase {
                 bucket: "test-bucket",
                 key: "archives/sparse-large.bin",
                 fileRecordId: nil,
-                multipartPartConcurrency: 8
+                multipartPartConcurrency: 128
             )
             XCTFail("Expected multipart upload to fail")
         } catch {}
 
         let stats = await s3.uploadPartStats()
         XCTAssertGreaterThanOrEqual(stats.maxInFlightUploadPartCalls, 2)
-        XCTAssertLessThan(stats.maxInFlightUploadPartCalls, 8)
+        XCTAssertLessThan(stats.maxInFlightUploadPartCalls, 128)
     }
 
     func testUploadFileMultipartPersistsCompletedPartsWhenSiblingPartFails() async throws {

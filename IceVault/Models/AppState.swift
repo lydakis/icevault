@@ -7,8 +7,8 @@ final class AppState: ObservableObject {
         static let defaultMaxConcurrentFileUploads = 3
         static let defaultMaxConcurrentMultipartPartUploads = 2
         static let minimumUploadConcurrency = 1
-        static let maximumConcurrentFileUploads = 8
-        static let maximumConcurrentMultipartPartUploads = 8
+        static let maximumConcurrentFileUploads = 16
+        static let maximumConcurrentMultipartPartUploads = 16
         static let defaultMaxBufferedPendingPlans: Int? = nil
         static let defaultManualMaxBufferedPendingPlans = 1024
         static let minimumBufferedPendingPlans = 128
