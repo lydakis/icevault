@@ -1,4 +1,5 @@
 import Foundation
+import protocol AWSClientRuntime.AWSServiceError
 import protocol ClientRuntime.HTTPError
 
 enum BackupEngineError: LocalizedError {
@@ -1350,6 +1351,10 @@ final class BackupEngine: @unchecked Sendable {
 
         switch glacierError {
         case .s3OperationFailed(_, let underlying):
+            if isNonDeferableGlacierError(underlying) {
+                return false
+            }
+
             if let statusCode = s3StatusCode(from: underlying) {
                 // Auth and hard access failures should stop immediately.
                 if statusCode == 401 || statusCode == 403 || statusCode == 404 {
@@ -1377,11 +1382,38 @@ final class BackupEngine: @unchecked Sendable {
         }
     }
 
+    private static func isNonDeferableGlacierError(_ error: Error) -> Bool {
+        guard let glacierError = error as? GlacierClientError else {
+            return false
+        }
+
+        switch glacierError {
+        case .s3OperationFailed(_, let nestedUnderlying):
+            return isNonDeferableGlacierError(nestedUnderlying)
+        case .invalidCredentials,
+                .invalidRegion,
+                .invalidBucket,
+                .invalidObjectKey,
+                .fileNotFound,
+                .unreadableFile,
+                .unsupportedStorageClass,
+                .missingMultipartUploadID,
+                .missingMultipartETag,
+                .incompleteFileRead:
+            return true
+        }
+    }
+
     private static func s3StatusCode(from error: Error) -> Int? {
         (error as? any HTTPError)?.httpResponse.statusCode.rawValue
     }
 
     private static func isLikelyAuthenticationFailure(_ error: Error) -> Bool {
+        if let awsServiceErrorCode = normalizedAWSServiceErrorCode(from: error),
+           isAuthenticationErrorCode(awsServiceErrorCode) {
+            return true
+        }
+
         let nsError = error as NSError
         let combinedDescription = [
             nsError.localizedDescription,
@@ -1405,6 +1437,44 @@ final class BackupEngine: @unchecked Sendable {
         ]
 
         return authMarkers.contains { combinedDescription.contains($0) }
+    }
+
+    private static func normalizedAWSServiceErrorCode(from error: Error) -> String? {
+        guard let serviceError = error as? any AWSServiceError else {
+            return nil
+        }
+
+        guard let rawCode = serviceError.errorCode?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawCode.isEmpty
+        else {
+            return nil
+        }
+
+        let preColonCode = rawCode.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? rawCode
+        let namespacedCode = preColonCode.split(separator: "#").last.map(String.init) ?? preColonCode
+        return normalizedToken(namespacedCode)
+    }
+
+    private static func isAuthenticationErrorCode(_ normalizedCode: String) -> Bool {
+        let authCodes: Set<String> = [
+            "expiredtoken",
+            "invalidtoken",
+            "invalidsecuritytoken",
+            "invalidclienttokenid",
+            "unrecognizedclientexception",
+            "signaturedoesnotmatch",
+            "requestexpired",
+            "invalidaccesskeyid",
+            "authorizationheadermalformed"
+        ]
+
+        return authCodes.contains(normalizedCode)
+    }
+
+    private static func normalizedToken(_ rawValue: String) -> String {
+        rawValue
+            .lowercased()
+            .filter { $0.isLetter || $0.isNumber }
     }
 
     @MainActor

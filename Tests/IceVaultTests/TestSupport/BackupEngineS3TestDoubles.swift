@@ -1,5 +1,6 @@
 import Foundation
 import AWSS3
+import protocol AWSClientRuntime.AWSServiceError
 import protocol ClientRuntime.HTTPError
 import class SmithyHTTPAPI.HTTPResponse
 import enum SmithyHTTPAPI.HTTPStatusCode
@@ -225,16 +226,22 @@ final class ForbiddenFailureBackupEngineS3Client: GlacierS3Client {
     private let failingKey: String
     private let statusCode: HTTPStatusCode
     private let failureMessage: String?
+    private let failureErrorCode: String?
+    private let failureError: Error?
     private let failureTriggeredSignal = AsyncSignal()
 
     init(
         failingKey: String,
         statusCode: HTTPStatusCode = .forbidden,
-        failureMessage: String? = nil
+        failureMessage: String? = nil,
+        failureErrorCode: String? = nil,
+        failureError: Error? = nil
     ) {
         self.failingKey = failingKey
         self.statusCode = statusCode
         self.failureMessage = failureMessage
+        self.failureErrorCode = failureErrorCode
+        self.failureError = failureError
     }
 
     func waitUntilFailureTriggered() async {
@@ -264,7 +271,14 @@ final class ForbiddenFailureBackupEngineS3Client: GlacierS3Client {
     func putObject(input: PutObjectInput) async throws -> PutObjectOutput {
         if input.key == failingKey {
             await failureTriggeredSignal.signal()
-            throw MockHTTPStatusCodeError(statusCode: statusCode, message: failureMessage)
+            if let failureError {
+                throw failureError
+            }
+            throw MockHTTPStatusCodeError(
+                statusCode: statusCode,
+                message: failureMessage,
+                awsErrorCode: failureErrorCode
+            )
         }
 
         return PutObjectOutput()
@@ -456,17 +470,31 @@ enum DeterministicFailureS3Error: Error {
     case syntheticFailure
 }
 
-struct MockHTTPStatusCodeError: Error, HTTPError, LocalizedError {
+struct MockHTTPStatusCodeError: Error, HTTPError, LocalizedError, AWSServiceError, CustomStringConvertible, CustomDebugStringConvertible {
     let httpResponse: HTTPResponse
-    private let message: String?
+    private let detailMessage: String?
+    private let awsErrorCode: String?
 
-    init(statusCode: HTTPStatusCode, message: String? = nil) {
+    var typeName: String? { awsErrorCode }
+    var message: String? { detailMessage }
+    var requestID: String? { nil }
+
+    init(statusCode: HTTPStatusCode, message: String? = nil, awsErrorCode: String? = nil) {
         self.httpResponse = HTTPResponse(statusCode: statusCode)
-        self.message = message
+        detailMessage = message
+        self.awsErrorCode = awsErrorCode
     }
 
     var errorDescription: String? {
-        message
+        detailMessage
+    }
+
+    var description: String {
+        "MockHTTPStatusCodeError(statusCode: \(httpResponse.statusCode.rawValue))"
+    }
+
+    var debugDescription: String {
+        description
     }
 }
 

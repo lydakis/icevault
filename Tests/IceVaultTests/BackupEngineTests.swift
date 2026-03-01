@@ -1894,6 +1894,80 @@ final class BackupEngineTests: XCTestCase {
         }
     }
 
+    func testRunFailsFastForUnauthorizedS3OperationFailure() async throws {
+        try await assertRunFailsFastForS3UploadFailure(
+            failingRelativePath: "000-unauthorized.txt",
+            makeS3Client: { failingRelativePath in
+                ForbiddenFailureBackupEngineS3Client(
+                    failingKey: failingRelativePath,
+                    statusCode: .unauthorized
+                )
+            }
+        ) { error in
+            guard case .s3OperationFailed(_, let underlying) = (error as? GlacierClientError) else {
+                return XCTFail("Expected s3OperationFailed error, got \(error)")
+            }
+            let statusCode = (underlying as? MockHTTPStatusCodeError)?.httpResponse.statusCode.rawValue
+            XCTAssertEqual(statusCode, 401)
+        }
+    }
+
+    func testRunFailsFastForNotFoundS3OperationFailure() async throws {
+        try await assertRunFailsFastForS3UploadFailure(
+            failingRelativePath: "000-not-found.txt",
+            makeS3Client: { failingRelativePath in
+                ForbiddenFailureBackupEngineS3Client(
+                    failingKey: failingRelativePath,
+                    statusCode: .notFound
+                )
+            }
+        ) { error in
+            guard case .s3OperationFailed(_, let underlying) = (error as? GlacierClientError) else {
+                return XCTFail("Expected s3OperationFailed error, got \(error)")
+            }
+            let statusCode = (underlying as? MockHTTPStatusCodeError)?.httpResponse.statusCode.rawValue
+            XCTAssertEqual(statusCode, 404)
+        }
+    }
+
+    func testRunFailsFastForBadRequestExpiredTokenErrorCodeFailure() async throws {
+        try await assertRunFailsFastForS3UploadFailure(
+            failingRelativePath: "000-expired-token-code.txt",
+            makeS3Client: { failingRelativePath in
+                ForbiddenFailureBackupEngineS3Client(
+                    failingKey: failingRelativePath,
+                    statusCode: .badRequest,
+                    failureErrorCode: "ExpiredToken"
+                )
+            }
+        ) { error in
+            guard case .s3OperationFailed(_, let underlying) = (error as? GlacierClientError) else {
+                return XCTFail("Expected s3OperationFailed error, got \(error)")
+            }
+            let statusCode = (underlying as? MockHTTPStatusCodeError)?.httpResponse.statusCode.rawValue
+            XCTAssertEqual(statusCode, 400)
+        }
+    }
+
+    func testRunFailsFastForInvalidCredentialsUploadFailure() async throws {
+        try await assertRunFailsFastForS3UploadFailure(
+            failingRelativePath: "000-invalid-credentials.txt",
+            makeS3Client: { failingRelativePath in
+                ForbiddenFailureBackupEngineS3Client(
+                    failingKey: failingRelativePath,
+                    failureError: GlacierClientError.invalidCredentials
+                )
+            }
+        ) { error in
+            guard case .s3OperationFailed(_, let underlying) = (error as? GlacierClientError) else {
+                return XCTFail("Expected s3OperationFailed error, got \(error)")
+            }
+            guard case .invalidCredentials = (underlying as? GlacierClientError) else {
+                return XCTFail("Expected underlying invalidCredentials error, got \(underlying)")
+            }
+        }
+    }
+
     func testRunDefersGenericBadRequestS3OperationFailure() async throws {
         let sourceRoot = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: sourceRoot) }
@@ -2712,6 +2786,93 @@ final class BackupEngineTests: XCTestCase {
             .appendingPathComponent("IceVaultTests-Engine-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory
+    }
+
+    private func assertRunFailsFastForS3UploadFailure(
+        failingRelativePath: String,
+        totalFileCount: Int = 400,
+        makeS3Client: (_ failingRelativePath: String) -> ForbiddenFailureBackupEngineS3Client,
+        assertError: (_ error: Error) -> Void
+    ) async throws {
+        let sourceRoot = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        var records: [FileRecord] = []
+        records.reserveCapacity(totalFileCount)
+
+        for index in 0..<totalFileCount {
+            let relativePath = index == 0 ? failingRelativePath : String(format: "zzz-%03d.txt", index)
+            let payload = Data("payload-\(index)".utf8)
+            try payload.write(to: sourceRoot.appendingPathComponent(relativePath))
+            records.append(
+                FileRecord(
+                    sourcePath: sourceRoot.path,
+                    relativePath: relativePath,
+                    fileSize: Int64(payload.count),
+                    modifiedAt: Date(timeIntervalSince1970: 1_700_010_000 + TimeInterval(index)),
+                    sha256: sha256Hex(of: payload),
+                    glacierKey: "",
+                    uploadedAt: nil,
+                    storageClass: FileRecord.deepArchiveStorageClass
+                )
+            )
+        }
+
+        let scanner = CompletionSignalingStreamingScanner(records: records)
+        let database = try makeDatabaseService()
+        let s3Client = makeS3Client(failingRelativePath)
+        let backupEngine = BackupEngine(
+            scanner: scanner,
+            fileManager: .default,
+            database: database,
+            glacierClientFactory: { _, _, _, _, db in
+                GlacierClient(s3Client: s3Client, database: db)
+            }
+        )
+
+        let settings = AppState.Settings(
+            awsAccessKey: "access",
+            awsSecretKey: "secret",
+            awsRegion: "us-east-1",
+            bucket: "bucket",
+            sourcePath: sourceRoot.path,
+            maxConcurrentFileUploads: 1,
+            maxConcurrentMultipartPartUploads: 1
+        )
+        let job = await MainActor.run {
+            BackupJob(sourceRoot: sourceRoot.path, bucket: "bucket")
+        }
+
+        let runTask = Task {
+            try await backupEngine.run(job: job, settings: settings)
+        }
+
+        await s3Client.waitUntilFailureTriggered()
+        let runOutcome = await waitForRunTaskOutcome(
+            runTask,
+            timeoutNanoseconds: 10_000_000_000
+        )
+
+        switch runOutcome {
+        case .failed(let error):
+            assertError(error)
+        case .succeeded:
+            XCTFail("Expected backup to fail fast for non-recoverable S3 upload failure.")
+        case .timedOut:
+            runTask.cancel()
+            _ = try? await runTask.value
+            XCTFail("Timed out waiting for non-recoverable S3 upload failure.")
+        }
+
+        XCTAssertLessThan(
+            scanner.processedRecordCount(),
+            totalFileCount,
+            "Scan should stop promptly on non-recoverable upload failures."
+        )
+
+        await MainActor.run {
+            XCTAssertEqual(job.status, .failed)
+        }
     }
 
     private func sha256Hex(of data: Data) -> String {
