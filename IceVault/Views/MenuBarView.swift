@@ -92,9 +92,9 @@ struct MenuBarView: View {
 
     private func runningBackupContent(job: BackupJob) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            ProgressView(value: job.fileProgressFraction)
+            ProgressView(value: uploadedOfDiscoveredProgressFraction(for: job))
 
-            Text(uploadFileProgressText(for: job))
+            Text(uploadedOfDiscoveredFileProgressText(for: job))
                 .font(.subheadline)
                 .monospacedDigit()
 
@@ -103,10 +103,10 @@ struct MenuBarView: View {
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
 
-            compactMetricsGrid(job: job)
+            uploadRateMetric(job: job)
 
-            if job.shouldShowDiscoveryRate || job.hasDiscoveryEstimate {
-                scanDetailsDisclosure(job: job)
+            if shouldShowDetailsDisclosure(for: job) {
+                detailsDisclosure(job: job)
             }
 
             if job.hasDeferredUploadIssues {
@@ -287,21 +287,12 @@ struct MenuBarView: View {
         value.formatted(.number.precision(.fractionLength(1)))
     }
 
-    private func compactMetricsGrid(job: BackupJob) -> some View {
-        LazyVGrid(
-            columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)],
-            spacing: 8
-        ) {
-            metricTile(
-                title: "Upload Rate",
-                value: uploadRateValueText(for: job),
-                tint: .blue
-            )
-            metricTile(
-                title: "Upload Queue",
-                value: "\(formattedCount(job.filesUploaded)) / \(formattedCount(job.filesTotal))"
-            )
-        }
+    private func uploadRateMetric(job: BackupJob) -> some View {
+        metricTile(
+            title: "Upload Rate",
+            value: uploadRateValueText(for: job),
+            tint: .blue
+        )
     }
 
     private func metricTile(
@@ -324,10 +315,17 @@ struct MenuBarView: View {
         .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
     }
 
+    private func shouldShowDetailsDisclosure(for job: BackupJob) -> Bool {
+        job.filesTotal > 0 || job.shouldShowDiscoveryRate || job.hasDiscoveryEstimate
+    }
+
     @ViewBuilder
-    private func scanDetailsDisclosure(job: BackupJob) -> some View {
-        DisclosureGroup("Scan Details") {
+    private func detailsDisclosure(job: BackupJob) -> some View {
+        DisclosureGroup("Details") {
             VStack(alignment: .leading, spacing: 4) {
+                Text("Upload queue: \(formattedCount(job.filesUploaded)) / \(formattedCount(job.filesTotal)) files")
+                    .monospacedDigit()
+
                 if let scanFileProgressText = scanFileProgressText(for: job) {
                     Text(scanFileProgressText)
                         .monospacedDigit()
@@ -401,7 +399,28 @@ struct MenuBarView: View {
     }
 
     private func uploadFileProgressText(for job: BackupJob) -> String {
-        return "Uploaded \(formattedCount(job.filesUploaded)) / \(formattedCount(job.filesTotal)) files"
+        if job.filesTotal > 0 {
+            return "Uploaded \(formattedCount(job.filesUploaded)) / \(formattedCount(job.filesTotal)) files"
+        }
+        return "Uploaded \(formattedCount(job.filesUploaded)) files"
+    }
+
+    private func uploadedOfDiscoveredFileProgressText(for job: BackupJob) -> String {
+        let discoveredCount = max(job.discoveredFiles, 0)
+        if discoveredCount > 0 {
+            let uploadedFromDiscovered = min(max(job.filesUploaded, 0), discoveredCount)
+            return "Uploaded \(formattedCount(uploadedFromDiscovered)) / \(formattedCount(discoveredCount)) discovered files"
+        }
+        return uploadFileProgressText(for: job)
+    }
+
+    private func uploadedOfDiscoveredProgressFraction(for job: BackupJob) -> Double {
+        let discoveredCount = max(job.discoveredFiles, 0)
+        if discoveredCount > 0 {
+            let uploadedFromDiscovered = min(max(job.filesUploaded, 0), discoveredCount)
+            return min(1, Double(uploadedFromDiscovered) / Double(discoveredCount))
+        }
+        return job.fileProgressFraction
     }
 
     private func uploadByteProgressText(for job: BackupJob) -> String {
